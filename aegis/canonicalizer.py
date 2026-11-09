@@ -102,6 +102,22 @@ def looks_windows_path(path: str) -> bool:
     return bool(_WIN_ABS_RE.match(path or ""))
 
 
+def is_inside(abs_path: str, root: str) -> bool:
+    """True when abs_path is root or below it (Windows paths compared case-insensitively)."""
+    if not abs_path or not root:
+        return False
+    if looks_windows_path(root) or looks_windows_path(abs_path):
+        import ntpath
+        a = ntpath.normpath(abs_path).replace("\\", "/").lower().rstrip("/")
+        b = ntpath.normpath(root).replace("\\", "/").lower().rstrip("/")
+        return a == b or a.startswith(b + "/")
+    root_abs = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+    try:
+        return os.path.commonpath([root_abs, abs_path]) == root_abs
+    except ValueError:
+        return False
+
+
 def resolve_path(path: str, base_dir: Optional[str] = None, cwd: Optional[str] = None) -> Tuple[str, Optional[bool], bool]:
     """Resolve path the way the target shell would see it.
 

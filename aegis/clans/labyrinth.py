@@ -11,10 +11,10 @@ Invariants:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from ..core import DecisionLevel, Verdict
-from ..canonicalizer import detect_null_bytes, normalize_text, resolve_path, unquote_recursively
+from ..canonicalizer import detect_null_bytes, is_inside, normalize_text, resolve_path, unquote_recursively
 from ..policy import SENSITIVE_PATH_PATTERNS, classify_sensitive  # noqa: F401  (re-exported)
 
 
@@ -31,6 +31,7 @@ class LabyrinthClan:
         cwd: Optional[str] = None,
         mode: str = "read",
         critical_level: DecisionLevel = DecisionLevel.DENY,
+        extra_roots: Optional[Iterable[str]] = None,
     ) -> Verdict:
         """Evaluate one path argument.
 
@@ -53,6 +54,8 @@ class LabyrinthClan:
 
         # 3. Resolve exactly once with the shared normalizer
         abs_path, confined, unresolved = resolve_path(path_input, base_dir=base_dir, cwd=cwd)
+        if confined is False and extra_roots and any(is_inside(abs_path, r) for r in extra_roots):
+            confined = True
         decoded, multi_encoded = unquote_recursively(normalized)
 
         # 4. Sensitive locations (checked on raw, decoded and resolved spellings)

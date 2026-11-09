@@ -32,6 +32,7 @@ import functools
 import hashlib
 import inspect
 import json
+import os
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -186,7 +187,7 @@ class AegisHarness:
             return SQL
         return role
 
-    def _check(self, tool_name: str, key_path: str, val: str, role: str) -> Optional[Verdict]:
+    def _check(self, tool_name: str, key_path: str, val: str, role: str, windows: bool = False) -> Optional[Verdict]:
         """Return a non-PASS verdict for one string argument, or None if it is fine."""
         found: Optional[Verdict] = None
 
@@ -198,7 +199,7 @@ class AegisHarness:
         if role == CONFIG:
             worse(Verdict(DecisionLevel.ASK, [f"{tool_name} changes connector/device configuration ({key_path})"], "AegisHarness"))
         elif role == COMMAND:
-            worse(TartarusClan.inspect_command(val, base_dir=self.base_dir, policy=self.policy))
+            worse(TartarusClan.inspect_command(val, base_dir=self.base_dir, policy=self.policy, windows=windows))
         elif role == SQL:
             worse(TartarusClan.inspect_sql(val))
         elif role == URL or (role not in (CONTENT, CONFIG) and looks_like_url(val)):
@@ -211,12 +212,16 @@ class AegisHarness:
                 worse(CustodyClan.inspect_url(val))
             else:
                 mode = "write" if role == PATH_WRITE else "read"
-                worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir, mode=mode))
+                worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir, mode=mode,
+                                                 extra_roots=getattr(self.policy, "extra_roots", None)))
         elif role not in (CONTENT, COMMAND, CONFIG) and looks_like_path(val):
-            worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir))
+            worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir,
+                                             extra_roots=getattr(self.policy, "extra_roots", None)))
 
         # Every string: live credentials. Sending one out via a command/URL is exfiltration.
         sec = CustodyClan.inspect_secrets(val)
+        if sec.level >= DecisionLevel.LOCK and getattr(self.policy, "secret_level", "lock") == "ask":
+            sec = Verdict(DecisionLevel.ASK, [r + " (owner approval)" for r in sec.reasons], sec.clan, sec.metadata)
         if sec.level > DecisionLevel.PASS:
             worse(sec)
         return found
@@ -252,11 +257,15 @@ class AegisHarness:
                 return self.gate.record(Verdict(
                     DecisionLevel.ASK, [f"Tool '{tool_name}' has no Aegis schema (strict_tools policy)"], "AegisHarness"))
 
-            # 4. Every string argument, classified by role
+            # 4. Every string argument, classified by role.
+            # cmd/PowerShell parsing: when the call names that shell, or on Windows by default.
+            shell = arguments.get("shell") if isinstance(arguments, dict) else None
+            windows = bool(re.search(r"powershell|pwsh|cmd", shell, re.I)) if isinstance(shell, str) and shell \
+                else os.name == "nt"
             worst: Optional[Verdict] = None
             for key_path, val in walk_arguments(arguments):
                 role = self._role(tool_name, key_path)
-                v = self._check(tool_name, key_path, val, role)
+                v = self._check(tool_name, key_path, val, role, windows=windows)
                 if v is not None and (worst is None or v.level > worst.level):
                     worst = v
                     if v.level >= DecisionLevel.LOCK:

@@ -50,8 +50,9 @@ class TartarusClan:
         base_dir: Optional[str] = None,
         policy: Optional[AegisPolicy] = None,
         cwd: Optional[str] = None,
+        windows: bool = False,
     ) -> Verdict:
-        return analyze_command(command_string, base_dir=base_dir, cwd=cwd, policy=policy)
+        return analyze_command(command_string, base_dir=base_dir, cwd=cwd, policy=policy, windows=windows)
 
     @classmethod
     def inspect_sql(cls, query_string: str) -> Verdict:
