@@ -187,12 +187,19 @@ class AegisHarness:
             return SQL
         return role
 
-    def _check(self, tool_name: str, key_path: str, val: str, role: str, windows: bool = False) -> Optional[Verdict]:
-        """Return a non-PASS verdict for one string argument, or None if it is fine."""
+    def _check(self, tool_name: str, key_path: str, val: str, role: str, windows: bool = False,
+               effects: Optional[set] = None) -> Optional[Verdict]:
+        """Return a non-PASS verdict for one string argument, or None if it is fine.
+
+        Any session effects (read_private, fetch, egress) are added to the ``effects`` set
+        even when the argument itself passes, so Minotaur sees them.
+        """
         found: Optional[Verdict] = None
 
         def worse(v: Verdict) -> None:
             nonlocal found
+            if effects is not None and v.metadata:
+                effects.update(v.metadata.get("effects") or ())
             if v.level > DecisionLevel.PASS and (found is None or v.level > found.level):
                 found = v
 
@@ -273,14 +280,35 @@ class AegisHarness:
             shell = arguments.get("shell") if isinstance(arguments, dict) else None
             windows = bool(re.search(r"powershell|pwsh|cmd", shell, re.I)) if isinstance(shell, str) and shell \
                 else os.name == "nt"
+            minotaur = getattr(self.gate, "minotaur", None)
             worst: Optional[Verdict] = None
+            effects: set = set()
+            sensitive_target: Optional[str] = None
             for key_path, val in walk_arguments(arguments):
+                # Canary token in any argument (a decoy the agent is trying to use) -> LOCK.
+                if minotaur is not None and isinstance(val, str):
+                    trip = minotaur.inspect_content(val)
+                    if trip is not None:
+                        return self.gate.record(trip)
                 role = self._role(tool_name, key_path)
-                v = self._check(tool_name, key_path, val, role, windows=windows)
-                if v is not None and (worst is None or v.level > worst.level):
-                    worst = v
-                    if v.level >= DecisionLevel.LOCK:
-                        break
+                v = self._check(tool_name, key_path, val, role, windows=windows, effects=effects)
+                if v is not None:
+                    meta_fx = v.metadata.get("effects") if v.metadata else None
+                    if "read_private" in (meta_fx or ()) or v.metadata.get("boundary") == "MASTER_SECRET_EXTRACTION":
+                        sensitive_target = v.metadata.get("resolved") or sensitive_target or key_path
+                    if worst is None or v.level > worst.level:
+                        worst = v
+                        if v.level >= DecisionLevel.LOCK:
+                            break
+
+            # 5. Minotaur: session behaviour (data-leak guard, credential hunting).
+            # Subtractive only — it can raise the verdict, never lower it.
+            if minotaur is not None and (worst is None or worst.level < DecisionLevel.LOCK):
+                mv = minotaur.inspect_effects(effects, sensitive_target=sensitive_target)
+                # Minotaur wins ties: its session context (a leak or a hunt) is the headline.
+                if mv.level > DecisionLevel.PASS and (worst is None or mv.level >= worst.level):
+                    worst = mv
+
             if worst is not None:
                 return self.gate.record(worst)
 

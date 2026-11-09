@@ -559,6 +559,7 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             boundary, level, reason = hit
             if level == "LOCK":
                 raise _Lock(reason, boundary)
+            ctx.boundary = boundary
             _add(ctx, L.DENY if level == "DENY" else L.ASK, reason)
             if level == "DENY":
                 return None

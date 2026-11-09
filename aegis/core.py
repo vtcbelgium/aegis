@@ -118,8 +118,24 @@ class AegisGate:
         self.max_violations_per_minute = max_violations_per_minute
         self.violation_window_seconds = violation_window_seconds
         self.approval_callback = approval_callback
-        # Optional: a DecisionLedger (aegis.ledger) and a MinotaurClan (aegis.clans.minotaur)
+        # Optional: a DecisionLedger (aegis.ledger) and a MinotaurClan (aegis.clans.minotaur).
+        # Minotaur is built from the policy when the host did not pass one, so the data-leak
+        # guard and any planted tripwires are on by default for every integration.
         self.ledger = ledger
+        if minotaur is None and getattr(self.policy, "leak_guard", "ask") != "off":
+            try:
+                from .clans.minotaur import MinotaurClan, Tripwires
+                trip = getattr(self.policy, "tripwires", None) or Tripwires.load()
+                minotaur = MinotaurClan(
+                    tripwires=trip,
+                    leak_guard=getattr(self.policy, "leak_guard", "ask"),
+                    probe_threshold=getattr(self.policy, "probe_threshold", 4),
+                    memory_seconds=getattr(self.policy, "memory_seconds", 1800.0),
+                )
+                if getattr(self.policy, "tripwires", None) is None and trip.active:
+                    self.policy.tripwires = trip
+            except Exception:
+                minotaur = None
         self.minotaur = minotaur
         self._current_level: DecisionLevel = DecisionLevel.PASS
         self._audit_log: Deque[Verdict] = collections.deque(maxlen=self.MAX_AUDIT_LOG)

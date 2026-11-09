@@ -165,6 +165,13 @@ class AegisMcpProxy:
         """Return (sanitized_text, verdict_if_anything_was_redacted)."""
         if not isinstance(text, str) or not text:
             return text, None
+        # A canary token in tool output means a decoy was read: LOCK the session.
+        minotaur = getattr(self.gate, "minotaur", None)
+        if minotaur is not None:
+            trip = minotaur.inspect_content(text)
+            if trip is not None:
+                self.gate.record(trip)  # this one DOES escalate: the agent exfiltrated a decoy
+                return "[REDACTED BY AEGIS: decoy credential — session locked]", trip
         matched = normalize_for_matching(text)
         for rx in _INJECTION_RES:
             if rx.search(matched):
