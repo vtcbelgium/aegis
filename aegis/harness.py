@@ -91,6 +91,7 @@ CONTENT_WORDS = {"content", "contents", "text", "body", "data", "patch", "diff",
                  "prompt", "description", "readme", "doc", "docs", "string", "strings",
                  "replacement", "html", "markdown", "md", "json", "note", "notes", "comment",
                  "title", "summary", "pattern", "query", "old", "new", "snippet", "template"}
+_WRITE_CONTENT_TOOLS = {"write_file", "edit_block", "write_pdf", "create_file", "apply_patch"}
 INTERACTIVE_TOOL_RE = re.compile(r"interact|send_input|write_process|terminal|stdin|send_keys", re.I)
 SQL_TOOL_RE = re.compile(r"sql|database|\bdb\b|postgres|mysql|sqlite|supabase|query", re.I)
 
@@ -228,6 +229,12 @@ class AegisHarness:
             worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir,
                                              extra_roots=getattr(self.policy, "extra_roots", None),
                                              policy=self.policy))
+
+        # Code the agent is about to write: advisory OWASP audit (WARN, never blocks).
+        if role == CONTENT and tool_name in _WRITE_CONTENT_TOOLS \
+                and getattr(self.policy, "code_audit", "warn") == "warn":
+            from .audit import audit_code
+            worse(audit_code(val, key_path))
 
         # Every string: live credentials. Sending one out via a command/URL is exfiltration.
         sec = CustodyClan.inspect_secrets(val)

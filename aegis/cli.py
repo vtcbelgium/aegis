@@ -61,6 +61,15 @@ def run_audit(target_path: str) -> int:
                 print(f"  🛑 [{sec_verdict.level.name}] {filepath}: {'; '.join(sec_verdict.reasons)}")
                 gate.record(sec_verdict)
                 issues += 1
+
+            if filepath.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rb", ".php", ".java",
+                                  ".sh", ".yml", ".yaml", ".env", ".toml", ".cjs", ".mjs")):
+                from .audit import audit_code
+                code_verdict = audit_code(content, filepath)
+                if not code_verdict.passed:
+                    for r in code_verdict.reasons:
+                        print(f"  ⚠️  [{code_verdict.level.name}] {filepath}: {r}")
+                    issues += 1
         except Exception as e:
             print(f"  ⚠️  [FAIL_CLOSED] {filepath}: Could not read ({e})")
             issues += 1
@@ -163,31 +172,175 @@ def run_daemon(port: int = 9999, base_dir: str = ".", owner_secret: Optional[str
         print("\nDaemon terminated cleanly.")
 
 
+def run_explain(command: str, base_dir: Optional[str]) -> int:
+    """Show why a shell command gets its verdict (like dcg explain)."""
+    from .shell import analyze_command
+    v = analyze_command(command, base_dir=base_dir or os.getcwd(), policy=None)
+    print(f"Command: {command}")
+    print(f"Verdict: {v.level.name}")
+    if v.metadata.get("boundary"):
+        print(f"Boundary: {v.metadata['boundary']}")
+    if v.metadata.get("effects"):
+        print(f"Effects: {', '.join(v.metadata['effects'])}")
+    if v.metadata.get("impact"):
+        for imp in v.metadata["impact"]:
+            print(f"Impact: {imp['entries']} items, {imp['bytes']} bytes"
+                  + ("+ (stopped early)" if not imp["complete"] else ""))
+    for r in v.reasons:
+        print(f"  - {r}")
+    return 0 if v.level < DecisionLevel.ASK else (2 if v.level >= DecisionLevel.DENY else 1)
+
+
+def run_minotaur(action: str, workspace: Optional[str]) -> int:
+    from .clans.minotaur import MinotaurClan, Tripwires, plant
+    if action == "init":
+        summary = plant(workspace=workspace or os.getcwd())
+        print(f"Planted {len(summary['planted'])} decoy(s), kept {len(summary['kept'])}; "
+              f"registry {summary['registry']}")
+        for p in summary["planted"]:
+            print(f"  + {p}")
+        return 0
+    m = MinotaurClan(tripwires=Tripwires.load())
+    print(json.dumps(m.snapshot(), indent=1))
+    return 0
+
+
+def run_ledger(action: str, n: int) -> int:
+    from .ledger import DecisionLedger, default_ledger_path
+    led = DecisionLedger(default_ledger_path())
+    if action == "verify":
+        r = led.verify()
+        print(f"{'OK' if r.ok else 'FAILED'}: {r.count} entries"
+              + ("" if r.ok else f"; {r.problem} at line {r.line}"))
+        return 0 if r.ok else 1
+    for ev in led.tail(n):
+        print(f"{ev.get('at','')[:19]} {ev.get('level','?'):8} {ev.get('tool','?'):16} "
+              f"{ev.get('boundary') or ''} {ev.get('summary','')}")
+    return 0
+
+
+def run_sandbox(action: str, command: Optional[str], base_dir: Optional[str]) -> int:
+    from . import sandbox
+    if action == "probe":
+        print(json.dumps(sandbox.probe(), indent=1))
+        return 0
+    if action == "run":
+        if not command:
+            print("Error: provide a command to run", file=sys.stderr)
+            return 1
+        ws = base_dir or os.getcwd()
+        try:
+            argv = sandbox.wrap_for_policy(_policy_from_env(), ws, command)
+        except sandbox.SandboxUnavailable as exc:
+            print(f"Sandbox unavailable: {exc}", file=sys.stderr)
+            return 3
+        import subprocess
+        return subprocess.run(argv).returncode
+    return 1
+
+
+def run_pin(action: str, server: str, tools_json: str) -> int:
+    from .pinning import ToolPins
+    try:
+        tools = json.loads(tools_json)
+        if isinstance(tools, dict):
+            tools = tools.get("tools", [])
+    except ValueError:
+        print("Error: tools must be JSON (a list of tool definitions)", file=sys.stderr)
+        return 1
+    pins = ToolPins()
+    if action == "pin":
+        pins.pin(server, tools)
+        print(f"Pinned {len(tools)} tool(s) for '{server}'.")
+        return 0
+    changes = pins.check(server, tools)
+    if not changes:
+        print(f"'{server}': no changes from the pinned catalogue.")
+        return 0
+    for c in changes:
+        print(f"  [{c.kind}] {c.tool}: {c.detail}")
+    return 2
+
+
+def run_learn(n: int) -> int:
+    """Suggest policy tweaks from what has been ASKed most often (you stay in control)."""
+    from collections import Counter
+    from .ledger import default_ledger_path, iter_entries
+    asks: Counter = Counter()
+    for ev in iter_entries(default_ledger_path()):
+        if ev.get("level") == "ASK" and ev.get("binary"):
+            asks[ev["binary"]] += 1
+    if not asks:
+        print("No ASK history yet. Let Aegis run in your work, then try again.")
+        return 0
+    print("Most-asked commands (consider adding safe ones to extra_allowed_binaries):")
+    for binary, count in asks.most_common(n):
+        print(f"  {count:4}  {binary}")
+    return 0
+
+
+def _policy_from_env():
+    from .integrations.generic import load_policy
+    return load_policy()
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aegis: Deterministic Monotonic Negative Security Gate for AI Agents")
-    subparsers = parser.add_subparsers(dest="command")
+    parser = argparse.ArgumentParser(description="Aegis: deterministic negative security gate & firewall for AI agents")
+    sub = parser.add_subparsers(dest="subcommand")
 
-    # Audit command
-    audit_parser = subparsers.add_parser("audit", help="Audit a file or directory")
-    audit_parser.add_argument("path", default=".", nargs="?", help="Path to audit (default: .)")
+    ap = sub.add_parser("audit", help="Scan a file or directory for secrets and OWASP issues")
+    ap.add_argument("path", default=".", nargs="?")
 
-    # Gate command
-    gate_parser = subparsers.add_parser("gate", help="Evaluate a tool call")
-    gate_parser.add_argument("tool", help="Tool name (e.g. bash, write_file)")
-    gate_parser.add_argument("args", help="Arguments in JSON format")
-    gate_parser.add_argument("--base-dir", default=None, help="Approved base directory root for file operations")
+    gp = sub.add_parser("gate", help="Evaluate a tool call (JSON args)")
+    gp.add_argument("tool"); gp.add_argument("args")
+    gp.add_argument("--base-dir", default=None)
 
-    # Serve command
-    serve_parser = subparsers.add_parser("serve", help="Run local security daemon")
-    serve_parser.add_argument("--port", type=int, default=9999, help="Port to listen on (default: 9999)")
-    serve_parser.add_argument("--base-dir", default=".", help="Approved base directory root (default: .)")
+    ep = sub.add_parser("explain", help="Explain the verdict for a shell command")
+    ep.add_argument("command"); ep.add_argument("--base-dir", default=None)
+
+    mp = sub.add_parser("minotaur", help="Tripwires: init (plant decoys) or status")
+    mp.add_argument("action", choices=["init", "status"]); mp.add_argument("--workspace", default=None)
+
+    lp = sub.add_parser("ledger", help="Decision ledger: tail or verify")
+    lp.add_argument("action", choices=["tail", "verify"]); lp.add_argument("-n", type=int, default=20)
+
+    spn = sub.add_parser("sandbox", help="Confinement: probe the host or run a command confined")
+    spn.add_argument("action", choices=["probe", "run"]); spn.add_argument("command", nargs="?")
+    spn.add_argument("--base-dir", default=None)
+
+    pp = sub.add_parser("pin", help="MCP tool pinning: check or pin a server's tools")
+    pp.add_argument("action", choices=["check", "pin"]); pp.add_argument("server"); pp.add_argument("tools")
+
+    lrn = sub.add_parser("learn", help="Suggest policy tweaks from the ledger (you decide)")
+    lrn.add_argument("-n", type=int, default=15)
+
+    hp = sub.add_parser("hook", help="Run as a Claude Code / Gemini CLI hook (reads JSON on stdin)")
+    hp.add_argument("--post", action="store_true", help="PostToolUse mode (scan output for decoys)")
+
+    svp = sub.add_parser("serve", help="Run local security daemon")
+    svp.add_argument("--port", type=int, default=9999); svp.add_argument("--base-dir", default=".")
 
     args = parser.parse_args()
-    if args.command == "audit":
+    if args.subcommand == "audit":
         sys.exit(run_audit(args.path))
-    elif args.command == "gate":
+    elif args.subcommand == "gate":
         sys.exit(run_gate_check(args.tool, args.args, base_dir=args.base_dir))
-    elif args.command == "serve":
+    elif args.subcommand == "explain":
+        sys.exit(run_explain(args.command, args.base_dir))
+    elif args.subcommand == "minotaur":
+        sys.exit(run_minotaur(args.action, args.workspace))
+    elif args.subcommand == "ledger":
+        sys.exit(run_ledger(args.action, args.n))
+    elif args.subcommand == "sandbox":
+        sys.exit(run_sandbox(args.action, args.command, args.base_dir))
+    elif args.subcommand == "pin":
+        sys.exit(run_pin(args.action, args.server, args.tools))
+    elif args.subcommand == "learn":
+        sys.exit(run_learn(args.n))
+    elif args.subcommand == "hook":
+        from .integrations.claude_code import main as hook_main
+        sys.exit(hook_main(["--post"] if args.post else []))
+    elif args.subcommand == "serve":
         run_daemon(args.port, base_dir=args.base_dir)
     else:
         parser.print_help()

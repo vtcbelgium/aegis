@@ -267,3 +267,19 @@ class MinotaurClan:
                 "leakGuard": self.leak_guard,
                 "tripped": self._tripped,
             }
+
+    # -- cross-process session state (for hook integrations) ----------------
+
+    def export_state(self) -> Dict:
+        with self._lock:
+            return {"rp": self._read_private_at, "ru": self._read_untrusted_at,
+                    "probes": list(self._probes), "tripped": self._tripped}
+
+    def import_state(self, state: Dict) -> None:
+        if not state:
+            return
+        with self._lock:
+            self._read_private_at = state.get("rp")
+            self._read_untrusted_at = state.get("ru")
+            self._probes = collections.deque(tuple(p) for p in state.get("probes", []))
+            self._tripped = bool(state.get("tripped"))
