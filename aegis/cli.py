@@ -284,6 +284,26 @@ def _policy_from_env():
     return load_policy()
 
 
+def run_hook(post: bool = False, fmt: str = "claude") -> int:
+    """Vendor-neutral agent hook. Reads one tool call (or tool result) as JSON on stdin."""
+    from .integrations import generic
+    from .integrations.claude_code import run_posttooluse, _read_event
+    event = _read_event()
+    if post or event.get("hook_event_name") == "PostToolUse":
+        # Output scan (decoy canaries) uses the host's post shape; delegate for claude, else json.
+        return run_posttooluse(event)
+    try:
+        d = generic.evaluate(event.get("tool_name") or "", event.get("tool_input") or {},
+                             cwd=event.get("cwd"), session_id=event.get("session_id") or "default")
+    except Exception as exc:   # fail closed: ask a human rather than silently allow
+        d = generic.HookDecision("ask", f"Aegis could not evaluate this call ({type(exc).__name__}); approve manually.",
+                                 "ASK", None)
+    out, code = generic.render(d, fmt=fmt)
+    if out:
+        (sys.stderr if fmt == "exit" else sys.stdout).write(out + "\n")
+    return code
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aegis: deterministic negative security gate & firewall for AI agents")
     sub = parser.add_subparsers(dest="subcommand")
@@ -314,8 +334,10 @@ def main() -> None:
     lrn = sub.add_parser("learn", help="Suggest policy tweaks from the ledger (you decide)")
     lrn.add_argument("-n", type=int, default=15)
 
-    hp = sub.add_parser("hook", help="Run as a Claude Code / Gemini CLI hook (reads JSON on stdin)")
+    hp = sub.add_parser("hook", help="Run as an agent hook (reads a tool call as JSON on stdin)")
     hp.add_argument("--post", action="store_true", help="PostToolUse mode (scan output for decoys)")
+    hp.add_argument("--format", choices=("claude", "json", "exit"), default="claude",
+                    help="Output shape: claude/gemini/copilot JSON (default), plain json, or exit-code only")
 
     svp = sub.add_parser("serve", help="Run local security daemon")
     svp.add_argument("--port", type=int, default=9999); svp.add_argument("--base-dir", default=".")
@@ -338,8 +360,7 @@ def main() -> None:
     elif args.subcommand == "learn":
         sys.exit(run_learn(args.n))
     elif args.subcommand == "hook":
-        from .integrations.claude_code import main as hook_main
-        sys.exit(hook_main(["--post"] if args.post else []))
+        sys.exit(run_hook(post=args.post, fmt=args.format))
     elif args.subcommand == "serve":
         run_daemon(args.port, base_dir=args.base_dir)
     else:

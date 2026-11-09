@@ -124,3 +124,24 @@ def evaluate(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
     decision = _decision_for(verdict.level)
     reason = "; ".join(verdict.reasons) if verdict.reasons else verdict.level.name
     return HookDecision(decision, reason, verdict.level.name, verdict)
+
+
+def render(d: "HookDecision", fmt: str = "claude", event_name: str = "PreToolUse") -> Tuple[str, int]:
+    """Turn a decision into (stdout, exit_code) in one of three vendor shapes.
+
+    - claude : {"hookSpecificOutput": {...}} — Claude Code, Gemini CLI, Copilot CLI (same shape).
+    - json   : {"decision","reason","level"} — any custom integration that reads stdout.
+    - exit   : exit code only (0 allow, 2 block) with the reason on stderr — the lowest common
+               denominator, works with any agent that honours a hook's exit code.
+    """
+    import json as _json
+    reason = f"Aegis {d.level}: {d.reason}"
+    if fmt == "json":
+        return _json.dumps({"decision": d.decision, "reason": reason, "level": d.level}), 0
+    if fmt == "exit":
+        # exit mode cannot express "ask", so a non-allow decision blocks and explains why.
+        return ("" if d.allowed else reason), (0 if d.allowed else 2)
+    return _json.dumps({"hookSpecificOutput": {
+        "hookEventName": event_name,
+        "permissionDecision": d.decision,
+        "permissionDecisionReason": reason}}), 0
