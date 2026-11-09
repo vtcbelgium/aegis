@@ -65,6 +65,13 @@ def test_declared_protected_paths(ws):
     assert locked(v, POLICY_TAMPER)
 
 
+def test_host_identity_keys_are_not_readable_or_approvable(ws):
+    key = ws / "connect" / "trust" / "node.key"
+    pol = AegisPolicy(secret_paths=[str(key)])
+    assert locked(cmd(f"cat {key}", ws, pol), MASTER_SECRET)
+    assert locked(cmd(f"echo replaced > {key}", ws, pol), POLICY_TAMPER)
+
+
 def test_registry_unreadable_ledger_readable(ws):
     pol = AegisPolicy(extra_roots=[str(ws.parent)], log_paths=[str(ws.parent / ".aegis" / "ledger.jsonl")])
     v = cmd("cat ~/.aegis/minotaur.json", ws, pol)

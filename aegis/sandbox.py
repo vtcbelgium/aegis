@@ -58,6 +58,7 @@ class SandboxProfile:
         return cls(workspace=os.path.abspath(workspace), extra_roots=[os.path.abspath(r) for r in roots],
                    network=network,
                    protected_paths=list(getattr(policy, "protected_paths", []) or [])
+                       + list(getattr(policy, "secret_paths", []) or [])
                        + list(getattr(policy, "log_paths", []) or []),
                    backup_paths=list(getattr(policy, "backup_paths", []) or []))
 

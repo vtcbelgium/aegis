@@ -62,6 +62,8 @@ class AegisPolicy:
     # More paths that are part of the guard: the host's mode file, its identity key, its own code.
     # Writing or deleting them is AEGIS_POLICY_TAMPER (LOCK).
     protected_paths: List[str] = field(default_factory=list)
+    # Host identity keys and master-secret stores: reading or uploading always LOCKs.
+    secret_paths: List[str] = field(default_factory=list)
     # Security logs besides the system ones (Aegis's ledger, the host's audit log).
     log_paths: List[str] = field(default_factory=list)
     # Backup and recovery locations besides the ones recognised by name.

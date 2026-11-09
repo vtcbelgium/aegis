@@ -85,7 +85,8 @@ def _any_inside(path: str, roots: Iterable[str]) -> Optional[str]:
 
 def control_paths(policy) -> List[str]:
     """Aegis's own state and code, plus whatever the host declares (Tekton's mode file, identity ...)."""
-    roots = [aegis_home()] + list(getattr(policy, "protected_paths", None) or [])
+    roots = ([aegis_home()] + list(getattr(policy, "protected_paths", None) or [])
+             + list(getattr(policy, "secret_paths", None) or []))
     if getattr(policy, "protect_package", True):
         roots.append(package_dir())
     return roots
@@ -131,6 +132,8 @@ def check_path(abs_path: str, mode: str, policy) -> Optional[Tuple[str, str, str
     if not abs_path:
         return None
     changing = mode in ("write", "delete")
+    if mode in ("read", "upload", "exec") and _any_inside(abs_path, getattr(policy, "secret_paths", None) or []):
+        return MASTER_SECRET, "LOCK", "Hard boundary MASTER_SECRET_EXTRACTION: accesses a host-declared secret store"
     root = _any_inside(abs_path, control_paths(policy))
     if changing and root is None:
         root = next((p for p in control_paths(policy) if _inside(p, abs_path)), None)
