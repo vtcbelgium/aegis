@@ -89,6 +89,15 @@ def canonicalize_ip(host_or_ip: str) -> Tuple[Optional[ipaddress.IPv4Address | i
     except ValueError:
         pass
 
+    # Try octal integer representation (e.g., 017700000001)
+    if cleaned.startswith("0") and not cleaned.startswith("0x") and cleaned.isdigit() and len(cleaned) > 1:
+        try:
+            val = int(cleaned, 8)
+            if 0 <= val <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(val), True
+        except ValueError:
+            pass
+
     # Try hexadecimal integer representation (e.g., 0x7f000001)
     if cleaned.startswith("0x") or cleaned.startswith("0X"):
         try:
@@ -106,5 +115,26 @@ def canonicalize_ip(host_or_ip: str) -> Tuple[Optional[ipaddress.IPv4Address | i
                 return ipaddress.IPv4Address(val), True
         except ValueError:
             pass
+
+    # Try dotted mixed representations (e.g., 0x7f.0.0.1 or 0177.0.0.1)
+    if "." in cleaned:
+        parts = cleaned.split(".")
+        if len(parts) == 4:
+            try:
+                nums = []
+                for p in parts:
+                    if p.startswith("0x") or p.startswith("0X"):
+                        nums.append(int(p, 16))
+                    elif p.startswith("0") and len(p) > 1 and p.isdigit():
+                        nums.append(int(p, 8))
+                    elif p.isdigit():
+                        nums.append(int(p, 10))
+                    else:
+                        break
+                if len(nums) == 4 and all(0 <= n <= 255 for n in nums):
+                    dotted = ".".join(str(n) for n in nums)
+                    return ipaddress.IPv4Address(dotted), True
+            except ValueError:
+                pass
 
     return None, False

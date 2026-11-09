@@ -15,33 +15,39 @@ from ..core import DecisionLevel, Verdict
 from ..canonicalizer import normalize_text
 
 
-# Destructive operating system commands that autonomous agents must never run
+# Destructive operating system commands that autonomous agents must never run (all lowercase)
 DESTRUCTIVE_COMMANDS = {
     "rm -rf /",
     "rm -rf /*",
     ":(){ :|:& };:",   # Fork bomb
     "mkfs",
     "dd if=",
-    "chmod -R 777 /",
-    "chown -R",
+    "chmod -r 777",
+    "chmod 777",
+    "chown -r",
     "format c:",
-    "del /f /s /q c:\\",
+    "del /f /s /q",
+    "shutdown",
+    "reboot",
 }
 
 # Suspicious command injection chains
 SHELL_INJECTION_PATTERNS = [
-    r";\s*(rm|del|shutdown|reboot|curl|wget|nc|bash|sh|powershell)\b",
+    r"(&&|;|\|\|)\s*(rm|del|shutdown|reboot|curl|wget|nc|bash|sh|powershell)\b",
     r"\|\s*(bash|sh|powershell|cmd)\b",
     r"`[^`]+`",                    # Backtick evaluation
     r"\$\([^)]+\)",                # Subshell execution $(...)
     r"&\s*(curl|wget|nc)\b",       # Background exfiltration
+    r"\beval\s+",                  # Arbitrary eval
+    r"/dev/(urandom|random|zero)", # Unbounded device reading
 ]
 
 # High-risk SQL injection signatures
 SQL_INJECTION_PATTERNS = [
-    r"'\s*OR\s*'1'\s*=\s*'1",
-    r"\"\s*OR\s*\"1\"\s*=\s*\"1",
-    r"--\s*$",
+    r"'\s*OR\s*('1'\s*=\s*'1|1\s*=\s*1)",
+    r"\"\s*OR\s*(\"1\"\s*=\s*\"1|1\s*=\s*1)",
+    r"(--\s*$|--\s)",
+    r"/\*.*?\*/|/\*.*$",           # Inline comments like /*
     r";\s*DROP\s+TABLE",
     r";\s*DELETE\s+FROM",
     r"UNION\s+ALL\s+SELECT",

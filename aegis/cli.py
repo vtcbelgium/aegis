@@ -18,6 +18,15 @@ from .core import AegisGate, SUPREME_LAW, DecisionLevel
 from .harness import AegisHarness
 from .clans import LabyrinthClan, TartarusClan, CustodyClan
 
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def run_audit(target_path: str) -> int:
     """Audit a directory or file."""

@@ -39,12 +39,26 @@ class LabyrinthClan:
         if evasion:
             reasons.append("Multi-level URL encoding evasion detected in path")
 
-        # 3. Path traversal relative indicators
+        # 3. Unicode homoglyph / obfuscation check
         normalized = normalize_text(path_input)
+        if normalized != path_input and any(ord(c) > 127 for c in path_input):
+            reasons.append("Unicode homoglyph / fullwidth obfuscation detected in path")
+
+        # 4. Path traversal relative indicators
         if ".." in normalized or "..\\" in normalized or "../" in normalized:
             reasons.append("Relative path traversal sequence (..) detected")
 
-        # 4. Strict base_dir boundary containment
+        # 5. Sensitive OS files target check
+        lower_norm = normalized.lower().replace("\\", "/")
+        sensitive_targets = ("etc/passwd", "etc/shadow", "windows/system32", "system32/config", "sam")
+        if any(target in lower_norm for target in sensitive_targets):
+            reasons.append("Target references sensitive operating system path")
+
+        # 6. Windows Alternate Data Streams or trailing character bypasses
+        if "::$data" in lower_norm or path_input.endswith("....") or path_input.endswith("   "):
+            reasons.append("Windows Alternate Data Stream or trailing normalization bypass detected")
+
+        # 7. Strict base_dir boundary containment
         if base_dir:
             resolved, is_confined = canonicalize_path(base_dir, path_input)
             if not is_confined:

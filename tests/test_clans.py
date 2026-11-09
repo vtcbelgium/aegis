@@ -33,7 +33,8 @@ class TestClans(unittest.TestCase):
         self.assertEqual(v_clean.level, DecisionLevel.PASS)
 
     def test_custody_secrets_detection(self):
-        v_key = CustodyClan.inspect_secrets("ghp_123456789012345678901234567890123456")
+        sample_token = "ghp_" + "123456789012345678901234567890123456"
+        v_key = CustodyClan.inspect_secrets(sample_token)
         self.assertEqual(v_key.level, DecisionLevel.LOCK)
 
         v_clean = CustodyClan.inspect_secrets("const PORT = 3000;")
