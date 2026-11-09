@@ -606,7 +606,23 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             ctx.effects.add("read_private")
     if mode == "upload":
         ctx.effects.add("egress")
+    if mode == "delete":
+        _blast_radius(ctx, abs_path, raw, recursive)
     return abs_path
+
+
+def _blast_radius(ctx: _Ctx, abs_path: str, raw: str, recursive: bool) -> None:
+    """Measure a delete before it runs; above the limit the owner decides (Destructive Action Constitution)."""
+    from . import impact as _impact
+    if looks_windows_path(abs_path) and os.name != "nt":
+        return
+    imp = _impact.measure_delete(abs_path, recursive, ctx.policy.blast_max_entries, ctx.policy.blast_max_bytes)
+    if imp.entries == 0:
+        return
+    ctx.impact.append(imp.to_dict())
+    if imp.exceeded:
+        _add(ctx, L.ASK, f"Deletes {_impact.describe(imp)} in {raw} (more than {ctx.policy.blast_max_entries} items "
+                         f"or {_impact.human_bytes(ctx.policy.blast_max_bytes)}: owner approval)")
 
 
 def _minotaur_path(ctx: _Ctx, abs_path: str, raw: str) -> None:
@@ -1558,6 +1574,11 @@ def _git(args: List[str], ctx: _Ctx) -> None:
         return
     if sub == "push":
         ctx.effects.add("egress")
+        forced = [a for a in sargs if a in ("-f", "--force", "--mirror", "--delete", "-d", "--prune")
+                  or a.startswith(("--force-with-lease", "--force-if-includes")) or
+                  (not a.startswith("-") and (a.startswith(":") or a.startswith("+")))]
+        if forced:
+            _add(ctx, L.ASK, f"git push {forced[0]} rewrites or deletes remote history (owner approval)")
         pos = [a for a in sargs if not a.startswith("-")]
         remote = pos[0] if pos else "origin"
         if "://" in remote or "@" in remote or remote.startswith(("/", ".", "~")):
@@ -1584,6 +1605,9 @@ def _git(args: List[str], ctx: _Ctx) -> None:
             elif sub == "clone" and ("/" in a or a.startswith((".", "~"))):
                 _check_path(ctx, a, "write")
         return
+    lost = _git_discards_work(sub, sargs)
+    if lost:
+        _add(ctx, L.ASK, f"{lost} (owner approval)")
     if sub in ("archive", "bundle", "format-patch", "worktree", "clean", "checkout", "restore",
                "add", "rm", "mv", "apply", "am", "diff", "log", "show", "status", "stash", "reset",
                "switch", "branch", "tag", "merge", "rebase", "cherry-pick", "commit", "init",
@@ -1599,6 +1623,33 @@ def _git(args: List[str], ctx: _Ctx) -> None:
         return
     # unknown git subcommand (possibly an alias)
     _add(ctx, L.ASK, f"Unknown git subcommand or alias '{sub}' (owner approval)")
+
+
+def _git_discards_work(sub: str, sargs: List[str]) -> Optional[str]:
+    """Git commands that throw away uncommitted or unreferenced work, which cannot be undone."""
+    flags = [a for a in sargs if a.startswith("-")]
+    pos = [a for a in sargs if not a.startswith("-")]
+    whole_tree = any(a in (".", ":/", ":(top)", "*") for a in pos)
+    if sub == "reset" and "--hard" in sargs:
+        return "git reset --hard discards uncommitted changes"
+    if sub == "clean" and any(re.match(r"^-[a-zA-Z]*f", a) or a == "--force" for a in flags) \
+            and not any(a in ("-n", "--dry-run") or re.match(r"^-[a-zA-Z]*n", a) for a in flags):
+        return "git clean deletes untracked files"
+    if sub == "checkout" and whole_tree and "-b" not in sargs and "-B" not in sargs:
+        return "git checkout of the whole tree discards uncommitted changes"
+    if sub == "restore" and whole_tree and not ("--staged" in sargs and "--worktree" not in sargs):
+        return "git restore of the whole tree discards uncommitted changes"
+    if sub == "stash" and pos[:1] in (["drop"], ["clear"]):
+        return f"git stash {pos[0]} deletes stashed work"
+    if sub == "branch" and ("-D" in sargs or ("--delete" in sargs and "--force" in sargs)):
+        return "git branch -D deletes a branch that may not be merged"
+    if sub == "reflog" and pos[:1] in (["expire"], ["delete"]):
+        return "git reflog expire removes the safety net for lost commits"
+    if sub == "gc" and any(a.startswith("--prune=now") or a == "--prune=all" for a in sargs):
+        return "git gc --prune=now deletes unreferenced commits immediately"
+    if sub == "update-ref" and "-d" in sargs:
+        return "git update-ref -d deletes a ref"
+    return None
 
 
 CURL_VALUE_OPTS = {
