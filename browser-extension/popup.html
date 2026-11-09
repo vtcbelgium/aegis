@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Aegis AI Shield</title>
+  <style>
+    body {
+      width: 320px;
+      margin: 0;
+      padding: 16px;
+      background: #0f172a;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+    }
+    .title {
+      font-weight: 700;
+      font-size: 15px;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(74, 222, 128, 0.15);
+      color: #4ade80;
+      border: 1px solid rgba(74, 222, 128, 0.3);
+    }
+    .stat-box {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+      margin-bottom: 12px;
+    }
+    .stat-number {
+      font-size: 26px;
+      font-weight: 800;
+      color: #38bdf8;
+      line-height: 1;
+    }
+    .stat-label {
+      font-size: 11px;
+      color: #94a3b8;
+      margin-top: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .law {
+      font-size: 11px;
+      font-style: italic;
+      color: #94a3b8;
+      border-left: 2px solid #38bdf8;
+      padding-left: 8px;
+      margin-bottom: 12px;
+    }
+    .threat-list {
+      max-height: 140px;
+      overflow-y: auto;
+      font-size: 11px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .threat-item {
+      padding: 6px 8px;
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.2);
+      border-radius: 4px;
+      margin-bottom: 6px;
+      color: #fca5a5;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">🛡️ Aegis AI Shield</div>
+    <span class="badge">NEGATIVE GATE</span>
+  </div>
+  <div class="stat-box">
+    <div class="stat-number" id="threatCount">0</div>
+    <div class="stat-label">Injections &amp; Leaks Blocked</div>
+  </div>
+  <div class="law">
+    &ldquo;Aegis may subtract authority. Aegis may never create it.&rdquo;
+  </div>
+  <strong style="font-size: 11px; color: #cbd5e1; display: block; margin-bottom: 6px;">Recent Quarantined Threats:</strong>
+  <ul class="threat-list" id="threatList">
+    <li style="color: #64748b; font-style: italic;">No threats detected on current tab.</li>
+  </ul>
+  <script src="popup.js"></script>
+</body>
+</html>
