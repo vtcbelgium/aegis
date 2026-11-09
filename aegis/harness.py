@@ -232,6 +232,13 @@ class AegisHarness:
 
     def evaluate_tool_call(self, tool_name: str, arguments: Any) -> Verdict:
         """Evaluate an arbitrary tool call before it executes with full recursive coverage."""
+        verdict = self._evaluate(tool_name, arguments)
+        ledger = getattr(self.gate, "ledger", None)
+        if ledger is not None:
+            ledger.record(verdict, tool=tool_name, arguments=arguments)
+        return verdict
+
+    def _evaluate(self, tool_name: str, arguments: Any) -> Verdict:
         try:
             # 1. Check if the session is locked
             if self.gate.current_level >= DecisionLevel.LOCK:

@@ -103,6 +103,8 @@ class AegisGate:
         violation_window_seconds: float = 60.0,
         approval_callback: Optional[Callable[[Verdict], bool]] = None,
         policy: Optional[Any] = None,
+        ledger: Optional[Any] = None,
+        minotaur: Optional[Any] = None,
     ) -> None:
         from .policy import AegisPolicy
 
@@ -116,6 +118,9 @@ class AegisGate:
         self.max_violations_per_minute = max_violations_per_minute
         self.violation_window_seconds = violation_window_seconds
         self.approval_callback = approval_callback
+        # Optional: a DecisionLedger (aegis.ledger) and a MinotaurClan (aegis.clans.minotaur)
+        self.ledger = ledger
+        self.minotaur = minotaur
         self._current_level: DecisionLevel = DecisionLevel.PASS
         self._audit_log: Deque[Verdict] = collections.deque(maxlen=self.MAX_AUDIT_LOG)
         self._total_evaluations = 0
