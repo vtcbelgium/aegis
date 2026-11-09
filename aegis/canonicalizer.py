@@ -140,7 +140,9 @@ def resolve_path(path: str, base_dir: Optional[str] = None, cwd: Optional[str] =
 
     if target_is_win or base_is_win:
         mod = ntpath
-        if mod.isabs(clean) or target_is_win:
+        # Python 3.13 changed ntpath.isabs('/x') to False. Preserve foreign-root
+        # spellings so POSIX destruction/logging rules remain identical on Windows.
+        if mod.isabs(clean) or target_is_win or clean.startswith(("/", "\\")):
             abs_target = mod.normpath(clean)
         else:
             abs_target = mod.normpath(mod.join(start or "", clean))

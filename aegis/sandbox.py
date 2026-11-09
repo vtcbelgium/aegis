@@ -206,10 +206,11 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
 
 
 def _as_command(command, shell: Optional[str]) -> List[str]:
+    import posixpath
     if isinstance(command, (list, tuple)):
         return list(command)
     sh = shell or "/bin/bash"
-    if not os.path.isabs(sh):
+    if not posixpath.isabs(sh):
         raise SandboxUnavailable("sandbox shell must be an absolute path")
     return [sh, "-c", str(command)]
 
