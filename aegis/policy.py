@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import FrozenSet, Optional, Set
+from typing import FrozenSet, List, Optional, Set
 
 
 DEFAULT_ALLOWED_DOMAINS: FrozenSet[str] = frozenset({
@@ -52,6 +52,14 @@ class AegisPolicy:
     extra_allowed_binaries: Set[str] = field(default_factory=set)
     # When True, tools without a declared schema are routed to the owner (ASK)
     strict_tools: bool = False
+    # More directories that count as "inside the workspace" (e.g. Tekton's allowedDirectories)
+    extra_roots: List[str] = field(default_factory=list)
+    # "lock" (default) or "ask": what a live credential in an argument or command leads to.
+    # "ask" lets the owner approve deliberate cases such as writing a key into .env.
+    secret_level: str = "lock"
+
+    def roots(self, base_dir: Optional[str]) -> List[str]:
+        return ([base_dir] if base_dir else []) + [r for r in self.extra_roots if r]
 
     def host_allowed(self, host: str) -> bool:
         host = (host or "").lower().strip(".")

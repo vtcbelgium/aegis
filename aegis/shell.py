@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from .core import DecisionLevel, Verdict
-from .canonicalizer import home_dir, looks_windows_path, normalize_text, resolve_path
+from .canonicalizer import home_dir, is_inside, looks_windows_path, normalize_text, resolve_path
 from .policy import (
     DEFAULT_POLICY,
     AegisPolicy,
@@ -201,6 +201,7 @@ class _Ctx:
     substitutions: Dict[int, str] = field(default_factory=dict)
     safe_substitutions: set = field(default_factory=set)
     variables: Dict[str, str] = field(default_factory=dict)
+    force_windows: bool = False
 
 
 class _Lock(Exception):
@@ -219,10 +220,13 @@ def analyze_command(
     cwd: Optional[str] = None,
     policy: Optional[AegisPolicy] = None,
     _depth: int = 0,
+    windows: bool = False,
 ) -> Verdict:
+    """windows=True forces cmd/PowerShell parsing (backslashes are path separators)."""
     if not command or not command.strip():
         return Verdict(L.PASS, ["Empty command"], NAME)
-    ctx = _Ctx(base_dir=base_dir, cwd=cwd or base_dir, policy=policy or DEFAULT_POLICY, depth=_depth)
+    ctx = _Ctx(base_dir=base_dir, cwd=cwd or base_dir, policy=policy or DEFAULT_POLICY, depth=_depth,
+               force_windows=windows)
     try:
         _analyze(normalize_text(command), ctx)
     except _Lock as lk:
@@ -411,7 +415,8 @@ def _analyze_nested(command: str, ctx: _Ctx, cwd: Optional[str] = None) -> Decis
     if ctx.depth + 1 > MAX_DEPTH:
         _add(ctx, L.ASK, "Command nesting too deep to analyze")
         return L.ASK
-    v = analyze_command(command, base_dir=ctx.base_dir, cwd=cwd or ctx.cwd, policy=ctx.policy, _depth=ctx.depth + 1)
+    v = analyze_command(command, base_dir=ctx.base_dir, cwd=cwd or ctx.cwd, policy=ctx.policy, _depth=ctx.depth + 1,
+                        windows=ctx.force_windows)
     if v.level >= L.LOCK:
         raise _Lock(v.reasons[0])
     for r in v.reasons:
@@ -427,7 +432,10 @@ def _analyze(text: str, ctx: _Ctx) -> None:
     from .clans.custody import CustodyClan     # local import avoids a cycle
     sec = CustodyClan.inspect_secrets(text)
     if sec.level >= L.LOCK:
-        raise _Lock("Command line contains a live credential: " + "; ".join(sec.reasons))
+        if ctx.policy.secret_level == "ask":
+            _add(ctx, L.ASK, "Command line contains a live credential (owner approval): " + "; ".join(sec.reasons))
+        else:
+            raise _Lock("Command line contains a live credential: " + "; ".join(sec.reasons))
 
     if ctx.depth == 0:
         text = text.replace("\ue000", "").replace("\ue001", "")
@@ -440,7 +448,7 @@ def _analyze(text: str, ctx: _Ctx) -> None:
     text = re.sub(r"\\;|(?<![\w'\"])';'(?![\w'\"])|(?<![\w'\"])\";\"(?![\w'\"])", f" {_SEMI} ", text)
     text = _extract_substitutions(text, ctx)
 
-    windows = bool(re.search(r"(?:^|[\s'\"=])[A-Za-z]:\\", text))
+    windows = ctx.force_windows or bool(re.search(r"(?:^|[\s'\"=])[A-Za-z]:\\", text))
     first = (text.strip().split() or [""])[0].strip("'\"").lower()
     if first.endswith(".exe"):
         first = first[:-4]
@@ -517,6 +525,8 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
         raise _Lock(f"Raw block device write: {raw}")
 
     abs_path, confined, unresolved = resolve_path(word, base_dir=ctx.base_dir, cwd=ctx.cwd)
+    if confined is False and ctx.policy.extra_roots and any(is_inside(abs_path, r) for r in ctx.policy.extra_roots):
+        confined = True
     sensitivity = classify_sensitive(word, abs_path)
     if sensitivity == "critical":
         raise _Lock(f"Command accesses a credential or system store: {raw}")
@@ -541,13 +551,14 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
         _add(ctx, L.DENY, f"Command path escapes the workspace: {raw}")
         return None
     if ctx.base_dir is not None and mode == "delete" and recursive:
-        base = os.path.realpath(ctx.base_dir) if not looks_windows_path(ctx.base_dir) else ctx.base_dir.replace("\\", "/")
         target = abs_path
         if "*" in os.path.basename(abs_path):
             target = os.path.dirname(abs_path)
-        if target.rstrip("/").lower() == base.rstrip("/").lower():
-            _add(ctx, L.ASK, f"Recursive delete of the whole workspace: {raw}")
-            return None
+        for root in ctx.policy.roots(ctx.base_dir):
+            base = os.path.realpath(root) if not looks_windows_path(root) else root.replace("\\", "/")
+            if target.replace("\\", "/").rstrip("/").lower() == base.replace("\\", "/").rstrip("/").lower():
+                _add(ctx, L.ASK, f"Recursive delete of a whole workspace root: {raw}")
+                return None
     if sensitivity == "autoexec" and mode != "read":
         _add(ctx, L.ASK, f"Writes a file that runs code automatically later (hook/.envrc): {raw}")
     if sensitivity == "startup":
