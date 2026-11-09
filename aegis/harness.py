@@ -212,11 +212,15 @@ class AegisHarness:
                 worse(CustodyClan.inspect_url(val))
             else:
                 mode = "write" if role == PATH_WRITE else "read"
+                if tool_name == "move_file" and key_path.split("[")[0] == "source":
+                    mode = "delete"          # the source disappears from where it was
                 worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir, mode=mode,
-                                                 extra_roots=getattr(self.policy, "extra_roots", None)))
+                                                 extra_roots=getattr(self.policy, "extra_roots", None),
+                                                 policy=self.policy))
         elif role not in (CONTENT, COMMAND, CONFIG) and looks_like_path(val):
             worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir,
-                                             extra_roots=getattr(self.policy, "extra_roots", None)))
+                                             extra_roots=getattr(self.policy, "extra_roots", None),
+                                             policy=self.policy))
 
         # Every string: live credentials. Sending one out via a command/URL is exfiltration.
         sec = CustodyClan.inspect_secrets(val)

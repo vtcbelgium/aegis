@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from . import boundaries
 from .core import DecisionLevel, Verdict
 from .canonicalizer import home_dir, is_inside, looks_windows_path, normalize_text, resolve_path
 from .policy import (
@@ -202,12 +203,18 @@ class _Ctx:
     safe_substitutions: set = field(default_factory=set)
     variables: Dict[str, str] = field(default_factory=dict)
     force_windows: bool = False
+    # What the command would do, for Minotaur's session view: read_private, fetch, egress ...
+    effects: set = field(default_factory=set)
+    # Blast-radius measurements of deletes (aegis/impact.py)
+    impact: List[dict] = field(default_factory=list)
+    boundary: Optional[str] = None
 
 
 class _Lock(Exception):
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, boundary: Optional[str] = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.boundary = boundary
 
 
 # ---------------------------------------------------------------------------
@@ -227,17 +234,30 @@ def analyze_command(
         return Verdict(L.PASS, ["Empty command"], NAME)
     ctx = _Ctx(base_dir=base_dir, cwd=cwd or base_dir, policy=policy or DEFAULT_POLICY, depth=_depth,
                force_windows=windows)
+    text = normalize_text(command)
     try:
-        _analyze(normalize_text(command), ctx)
+        hit = boundaries.check_text(text)
+        if hit:
+            raise _Lock(hit[1], hit[0])
+        _analyze(text, ctx)
     except _Lock as lk:
-        return Verdict(L.LOCK, [lk.reason], NAME)
+        return Verdict(L.LOCK, [lk.reason], NAME, metadata=_meta(ctx, lk.boundary))
     if ctx.untrusted_download and ctx.exec_after_download:
         ctx.findings.append((L.DENY, "Download-and-execute chain from a non-allowlisted host"))
     if not ctx.findings:
-        return Verdict(L.PASS, ["Command passed Tartarus inspection"], NAME)
+        return Verdict(L.PASS, ["Command passed Tartarus inspection"], NAME, metadata=_meta(ctx))
     top = max(level for level, _ in ctx.findings)
     reasons = list(dict.fromkeys(r for level, r in ctx.findings if level == top))
-    return Verdict(top, reasons, NAME)
+    return Verdict(top, reasons, NAME, metadata=_meta(ctx, ctx.boundary))
+
+
+def _meta(ctx: "_Ctx", boundary: Optional[str] = None) -> dict:
+    meta: dict = {"effects": sorted(ctx.effects)}
+    if boundary:
+        meta["boundary"] = boundary
+    if ctx.impact:
+        meta["impact"] = ctx.impact
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -522,14 +542,29 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
         raise _Lock("Null-byte path truncation in command")
 
     if BLOCK_DEVICE_RE.match(word) and mode in ("write", "delete"):
-        raise _Lock(f"Raw block device write: {raw}")
+        raise _Lock(f"Raw block device write: {raw}", boundaries.SYSTEM_DESTRUCTION)
 
+    # Moving a file away removes it from where it was: a delete for the hard boundaries,
+    # a read for everything else.
+    moving = mode == "move"
+    if moving:
+        mode = "read"
     abs_path, confined, unresolved = resolve_path(word, base_dir=ctx.base_dir, cwd=ctx.cwd)
     if confined is False and ctx.policy.extra_roots and any(is_inside(abs_path, r) for r in ctx.policy.extra_roots):
         confined = True
+    if not unresolved:
+        _minotaur_path(ctx, abs_path, raw)
+        hit = boundaries.check_path(abs_path, "delete" if moving else mode, ctx.policy)
+        if hit:
+            boundary, level, reason = hit
+            if level == "LOCK":
+                raise _Lock(reason, boundary)
+            _add(ctx, L.DENY if level == "DENY" else L.ASK, reason)
+            if level == "DENY":
+                return None
     sensitivity = classify_sensitive(word, abs_path)
     if sensitivity == "critical":
-        raise _Lock(f"Command accesses a credential or system store: {raw}")
+        raise _Lock(f"Command accesses a credential or system store: {raw}", boundaries.MASTER_SECRET)
     if sensitivity == "startup" and mode != "read":
         _add(ctx, L.DENY, f"Command writes a startup/persistence file: {raw}")
         return None
@@ -540,7 +575,7 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             globless = os.path.dirname(abs_path) or "/"
         if is_catastrophic_target(globless, home_dir()):
             if recursive or globless != abs_path or abs_path.rstrip("/\\") in ("", "/"):
-                raise _Lock(f"Catastrophic recursive deletion of root/system path: rm {raw}")
+                raise _Lock(f"Catastrophic recursive deletion of root/system path: rm {raw}", boundaries.SYSTEM_DESTRUCTION)
             _add(ctx, L.DENY, f"Deleting a system/home location: {raw}")
             return None
 
@@ -568,7 +603,17 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             _add(ctx, L.DENY, f"Uploads a secret-bearing file: {raw}")
         elif mode in ("read", "exec"):
             _add(ctx, L.ASK, f"Reads a secret-bearing file (owner approval): {raw}")
+            ctx.effects.add("read_private")
+    if mode == "upload":
+        ctx.effects.add("egress")
     return abs_path
+
+
+def _minotaur_path(ctx: _Ctx, abs_path: str, raw: str) -> None:
+    """A decoy file planted by Minotaur: touching it in any way is a LOCK."""
+    trip = getattr(ctx.policy, "tripwires", None)
+    if trip is not None and trip.match_path(abs_path):
+        raise _Lock(f"Minotaur tripwire: a decoy file was touched ({raw})", "MINOTAUR_TRIPWIRE")
 
 
 def _check_url(ctx: _Ctx, url: str, upload: bool = False, allowlist: bool = True) -> None:
@@ -589,6 +634,11 @@ def _check_url(ctx: _Ctx, url: str, upload: bool = False, allowlist: bool = True
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     scheme = (parsed.scheme or "").lower()
+    # For Minotaur: anything fetched is untrusted content; anything sent, or any request to a
+    # host outside the allowlist (the URL itself can carry data), is egress.
+    ctx.effects.add("fetch")
+    if upload or not ctx.policy.host_allowed(host):
+        ctx.effects.add("egress")
     if not allowlist:
         return
     if upload and is_exfil_sink(host):
@@ -659,6 +709,8 @@ def _analyze_segment(seg: Segment, ctx: _Ctx) -> None:
     assignments: List[Tuple[str, str]] = []
     while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
         name, _, value = words.pop(0).partition("=")
+        if boundaries.GUARD_ENV_RE.match(name):
+            raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
         if name.upper() in DANGEROUS_ENV_OVERRIDES:
             _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
         assignments.append((name, value))
@@ -709,17 +761,20 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
     if name in PRIVILEGE:
         _add(ctx, L.DENY, f"Privilege escalation via {name}")
         return
+    hit = boundaries.check_command(name, args, ctx.policy)
+    if hit:
+        raise _Lock(hit[1], hit[0])
     if name in SYSTEM_LOCK:
-        raise _Lock(f"Destructive system command blocked: {name}")
+        raise _Lock(f"Destructive system command blocked: {name}", boundaries.SYSTEM_DESTRUCTION)
     if name in ("init", "telinit") and args and args[0] in ("0", "6"):
-        raise _Lock("System shutdown/reboot command blocked")
+        raise _Lock("System shutdown/reboot command blocked", boundaries.SYSTEM_DESTRUCTION)
     if name == "systemctl":
         if args and args[0].lower() in {"poweroff", "reboot", "halt", "kexec", "suspend", "hibernate"}:
-            raise _Lock("System shutdown/reboot command blocked")
+            raise _Lock("System shutdown/reboot command blocked", boundaries.SYSTEM_DESTRUCTION)
         _add(ctx, L.ASK, "systemctl changes services (owner approval)")
         return
     if name == "vssadmin" and any(a.lower() == "delete" for a in args):
-        raise _Lock("Shadow copy deletion (ransomware pattern) blocked")
+        raise _Lock("Shadow copy deletion (ransomware pattern) blocked", boundaries.BACKUP_DESTRUCTION)
     if name in DENY_BINARIES:
         _add(ctx, L.DENY, f"Account/kernel administration command blocked: {name}")
         return
@@ -816,6 +871,7 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
     if name in NETWORK_FETCHERS:
         return _fetch(name, args, ctx)
     if name in REMOTE_TOOLS:
+        ctx.effects.update(("fetch", "egress"))
         _add(ctx, L.ASK, f"Remote access / transfer tool requires owner approval: {name}")
         for a in args:
             if not _is_option(a) and ":" not in a and "@" not in a:
@@ -1395,8 +1451,9 @@ def _copy_like(name: str, args: List[str], ctx: _Ctx) -> None:
         pos.append(a)
     if dest is None and len(pos) > 1:
         dest = pos.pop()
+    moving = name in ("mv", "move", "move-item", "mi")
     for src in pos:
-        _check_path(ctx, src, "read")
+        _check_path(ctx, src, "move" if moving else "read")
     if dest is not None:
         _check_path(ctx, dest, "write")
 
@@ -1500,6 +1557,7 @@ def _git(args: List[str], ctx: _Ctx) -> None:
             _add(ctx, L.ASK, "git config change (aliases/hooks/ssh commands can execute code)")
         return
     if sub == "push":
+        ctx.effects.add("egress")
         pos = [a for a in sargs if not a.startswith("-")]
         remote = pos[0] if pos else "origin"
         if "://" in remote or "@" in remote or remote.startswith(("/", ".", "~")):
@@ -1514,6 +1572,7 @@ def _git(args: List[str], ctx: _Ctx) -> None:
         _add(ctx, L.ASK, f"git remote {sargs[0]} changes where pushes go (owner approval)")
         return
     if sub in ("clone", "fetch", "pull", "ls-remote", "submodule"):
+        ctx.effects.add("fetch")
         pos = [a for a in sargs if not a.startswith("-") and a not in ("add", "update", "init")]
         for a in pos:
             if "://" in a:
