@@ -5,7 +5,17 @@ Supports:
     - LangChain / LlamaIndex Tool Callables
     - AutoGen / CrewAI / SWE-bench agent loops
     - OpenAI / Anthropic tool use interception
-    - Tekton / OTHP tool schemas (move_file, edit_block, read_multiple_files)
+    - Tekton / Desktop Commander tools via exact per-tool schemas
+
+Argument classification:
+    1. Known tools use an exact schema: each argument is declared as a path, command,
+       URL, content, or plain value. Nothing is guessed.
+    2. Other tools: the key is split into whole words (data_dir -> data, dir). Path, URL and
+       command words win over content words, so "data_dir" is a path, never content.
+       Substring matching is never used.
+    3. Any string that *looks like* a path or URL is checked even under an unknown key;
+       only declared/recognized content fields (file bodies, code, prose) are exempt from
+       path checks. Every string is scanned for live credentials.
 
 Usage:
     gate = AegisGate(base_dir="/safe/workspace")
@@ -22,9 +32,66 @@ import functools
 import hashlib
 import inspect
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
 from .core import AegisGate, DecisionLevel, Verdict
-from .clans import LabyrinthClan, TartarusClan, CustodyClan, HecatoncheiresClan
+from .canonicalizer import looks_windows_path
+from .clans import CustodyClan, HecatoncheiresClan, LabyrinthClan, TartarusClan
+
+# Argument roles
+PATH_READ, PATH_WRITE, COMMAND, URL, CONTENT, VALUE, SQL, CONFIG = (
+    "path_read", "path_write", "command", "url", "content", "value", "sql", "config")
+
+# Exact schemas for Tekton / Desktop Commander style tools. Keys not listed fall back
+# to word-based classification below.
+TOOL_SCHEMAS: Dict[str, Dict[str, str]] = {
+    "read_file": {"path": PATH_READ, "offset": VALUE, "length": VALUE, "isUrl": VALUE},
+    "read_multiple_files": {"paths": PATH_READ},
+    "write_file": {"path": PATH_WRITE, "content": CONTENT, "mode": VALUE},
+    "write_pdf": {"path": PATH_WRITE, "content": CONTENT, "outputPath": PATH_WRITE, "options": VALUE},
+    "edit_block": {"file_path": PATH_WRITE, "old_string": CONTENT, "new_string": CONTENT,
+                   "expected_replacements": VALUE},
+    "create_directory": {"path": PATH_WRITE},
+    "list_directory": {"path": PATH_READ, "depth": VALUE},
+    "move_file": {"source": PATH_WRITE, "destination": PATH_WRITE},
+    "get_file_info": {"path": PATH_READ},
+    "start_search": {"path": PATH_READ, "pattern": CONTENT, "searchType": VALUE, "filePattern": VALUE,
+                     "ignoreCase": VALUE, "maxResults": VALUE, "includeHidden": VALUE,
+                     "contextLines": VALUE, "timeout_ms": VALUE, "earlyTermination": VALUE,
+                     "literalSearch": VALUE},
+    "search": {"path": PATH_READ, "pattern": CONTENT, "query": CONTENT},
+    "start_process": {"command": COMMAND, "timeout_ms": VALUE, "shell": VALUE, "verbose_timing": VALUE},
+    "interact_with_process": {"pid": VALUE, "input": COMMAND, "timeout_ms": VALUE, "wait_for_prompt": VALUE,
+                              "verbose_timing": VALUE},
+    "read_process_output": {"pid": VALUE, "timeout_ms": VALUE, "offset": VALUE, "length": VALUE},
+    "force_terminate": {"pid": VALUE},
+    "list_processes": {}, "list_sessions": {}, "list_searches": {}, "get_config": {},
+    "get_more_search_results": {"sessionId": VALUE, "offset": VALUE, "length": VALUE},
+    "stop_search": {"sessionId": VALUE},
+    "set_config_value": {"key": CONFIG, "value": CONFIG},
+    # Tekton device management
+    "tekton_list_devices": {}, "tekton_ping": {}, "tekton_profile": {}, "tekton_pair_status": {},
+    "tekton_check_call": {},
+    "tekton_pair_begin": {"access": CONFIG}, "tekton_unpair_device": {"device": CONFIG},
+}
+# Arguments every Tekton tool may carry
+COMMON_KEYS = {"device": VALUE, "approval_id": VALUE}
+
+PATH_WORDS = {"path", "paths", "file", "files", "filename", "filenames", "filepath", "dir", "dirs",
+              "directory", "directories", "folder", "folders", "root", "cwd", "workdir", "src",
+              "source", "sources", "dest", "dst", "destination", "target", "output", "outfile",
+              "infile", "location", "basedir", "workspace", "home"}
+URL_WORDS = {"url", "urls", "uri", "uris", "endpoint", "href", "link", "links", "host", "hostname",
+             "domain", "webhook", "callback", "server", "origin", "address"}
+COMMAND_WORDS = {"command", "commands", "cmd", "cmdline", "shellcommand", "bashcommand"}
+SQL_WORDS = {"sql"}
+CONTENT_WORDS = {"content", "contents", "text", "body", "data", "patch", "diff", "code", "message",
+                 "prompt", "description", "readme", "doc", "docs", "string", "strings",
+                 "replacement", "html", "markdown", "md", "json", "note", "notes", "comment",
+                 "title", "summary", "pattern", "query", "old", "new", "snippet", "template"}
+INTERACTIVE_TOOL_RE = re.compile(r"interact|send_input|write_process|terminal|stdin|send_keys", re.I)
+SQL_TOOL_RE = re.compile(r"sql|database|\bdb\b|postgres|mysql|sqlite|supabase|query", re.I)
 
 
 def walk_arguments(obj: Any, key_path: str = "") -> List[Tuple[str, str]]:
@@ -53,6 +120,44 @@ def make_action_signature(tool_name: str, arguments: Any) -> str:
     return f"{tool_name}:{arg_hash}"
 
 
+def key_words(key_path: str) -> List[str]:
+    """'options.dataDir[0]' -> ['data', 'dir'] (last key segment, split on _ - . and camelCase)."""
+    last = re.sub(r"\[\d+\]", "", key_path).split(".")[-1]
+    last = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", last)
+    return [w for w in re.split(r"[_\-\s]+", last.lower()) if w]
+
+
+def classify_key(key_path: str) -> str:
+    words = key_words(key_path)
+    joined = "".join(words)
+    if any(w in PATH_WORDS for w in words):
+        return PATH_WRITE if any(w in {"dest", "dst", "destination", "output", "outfile", "target"} for w in words) else PATH_READ
+    if any(w in URL_WORDS for w in words):
+        return URL
+    if any(w in COMMAND_WORDS for w in words) or joined in COMMAND_WORDS:
+        return COMMAND
+    if any(w in SQL_WORDS for w in words):
+        return SQL
+    if words and all(w in CONTENT_WORDS for w in words):
+        return CONTENT
+    return VALUE
+
+
+def looks_like_path(val: str) -> bool:
+    if not val or "\n" in val or len(val) > 4096:
+        return False
+    v = val.strip()
+    return (
+        v.startswith(("/", "\\", "~", "./", "../", ".\\", "..\\", "$HOME", "${HOME}", "%USERPROFILE%", "$env:"))
+        or v in (".", "..")
+        or looks_windows_path(v)
+    )
+
+
+def looks_like_url(val: str) -> bool:
+    return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://\S+$", val.strip()))
+
+
 class AegisHarness:
     """Interceptor that gates tool execution in agent harnesses."""
 
@@ -60,6 +165,61 @@ class AegisHarness:
         self.gate = gate or AegisGate(base_dir=base_dir)
         self.base_dir = self.gate.base_dir
         self.hecatoncheires = HecatoncheiresClan()
+
+    @property
+    def policy(self) -> Any:
+        return self.gate.policy
+
+    def _role(self, tool_name: str, key_path: str) -> str:
+        schema = TOOL_SCHEMAS.get(tool_name)
+        top_key = re.sub(r"\[\d+\]", "", key_path).split(".")[0]
+        if schema is not None:
+            if top_key in schema:
+                return schema[top_key]
+            if top_key in COMMON_KEYS:
+                return COMMON_KEYS[top_key]
+        role = classify_key(key_path)
+        if role in (VALUE, CONTENT) and INTERACTIVE_TOOL_RE.search(tool_name) and \
+                any(w in {"input", "stdin", "keys", "data", "text"} for w in key_words(key_path)):
+            return COMMAND
+        if role == CONTENT and "query" in key_words(key_path) and SQL_TOOL_RE.search(tool_name):
+            return SQL
+        return role
+
+    def _check(self, tool_name: str, key_path: str, val: str, role: str) -> Optional[Verdict]:
+        """Return a non-PASS verdict for one string argument, or None if it is fine."""
+        found: Optional[Verdict] = None
+
+        def worse(v: Verdict) -> None:
+            nonlocal found
+            if v.level > DecisionLevel.PASS and (found is None or v.level > found.level):
+                found = v
+
+        if role == CONFIG:
+            worse(Verdict(DecisionLevel.ASK, [f"{tool_name} changes connector/device configuration ({key_path})"], "AegisHarness"))
+        elif role == COMMAND:
+            worse(TartarusClan.inspect_command(val, base_dir=self.base_dir, policy=self.policy))
+        elif role == SQL:
+            worse(TartarusClan.inspect_sql(val))
+        elif role == URL or (role not in (CONTENT, CONFIG) and looks_like_url(val)):
+            if looks_like_url(val) or role == URL:
+                url = val if "://" in val else ("http://" + val if role == URL and "." in val and " " not in val else "")
+                if url:
+                    worse(CustodyClan.inspect_url(url))
+        if role in (PATH_READ, PATH_WRITE):
+            if tool_name == "read_file" and looks_like_url(val):
+                worse(CustodyClan.inspect_url(val))
+            else:
+                mode = "write" if role == PATH_WRITE else "read"
+                worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir, mode=mode))
+        elif role not in (CONTENT, COMMAND, CONFIG) and looks_like_path(val):
+            worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir))
+
+        # Every string: live credentials. Sending one out via a command/URL is exfiltration.
+        sec = CustodyClan.inspect_secrets(val)
+        if sec.level > DecisionLevel.PASS:
+            worse(sec)
+        return found
 
     def evaluate_tool_call(self, tool_name: str, arguments: Any) -> Verdict:
         """Evaluate an arbitrary tool call before it executes with full recursive coverage."""
@@ -87,77 +247,22 @@ class AegisHarness:
             if not loop_verdict.passed:
                 return self.gate.record(loop_verdict)
 
-            # Recursively walk every argument in the structure
-            extracted_items = walk_arguments(arguments)
+            # 3. Unknown tools under strict policy go to the owner
+            if tool_name not in TOOL_SCHEMAS and getattr(self.policy, "strict_tools", False):
+                return self.gate.record(Verdict(
+                    DecisionLevel.ASK, [f"Tool '{tool_name}' has no Aegis schema (strict_tools policy)"], "AegisHarness"))
 
-            # Keys that explicitly carry file content, code, or documentation
-            CONTENT_KEYS = (
-                "content", "text", "body", "data", "patch", "new_string", "old_string",
-                "code", "script_content", "prompt", "message", "diff", "doc", "readme",
-                "replacement", "file_content", "description", "target_content"
-            )
-
-            for key_path, val in extracted_items:
-                clean_key = key_path.lower()
-                is_content_key = any(ck in clean_key for ck in CONTENT_KEYS)
-
-                # 3. Path inspection (covers path, file_path, source, destination, paths[0], etc.)
-                # Content fields (code, markdown, text) are strictly exempt from path inspection
-                # to prevent relative imports ('../lib'), JS rest params ('...args'), and loading dots from false-positive locking.
-                is_path_key = (
-                    not is_content_key
-                    and any(
-                        k in clean_key
-                        for k in ("path", "file_path", "filename", "filepath", "target", "dir", "source", "dest", "destination", "folder", "paths")
-                    )
-                )
-                looks_like_path = (
-                    not is_content_key
-                    and "\n" not in val
-                    and len(val) < 2048
-                    and not any(c in val for c in (";", "{", "}", "(", ")", "="))
-                    and (
-                        val.startswith(("/", "\\", "~", "..", "."))
-                        or (len(val) > 1 and val[1] == ":")
-                    )
-                )
-                if is_path_key or looks_like_path:
-                    path_verdict = LabyrinthClan.inspect_path(val, base_dir=self.base_dir)
-                    if not path_verdict.passed:
-                        return self.gate.record(path_verdict)
-
-                # 4. Command inspection for bash/shell execution tools and interactive processes
-                is_interactive_tool = any(
-                    it in tool_name.lower()
-                    for it in ("interact_with_process", "send_input", "write_process", "terminal", "stdin")
-                )
-                is_cmd_key = any(
-                    k in clean_key
-                    for k in ("command", "cmd", "script", "bash", "shell", "exec", "run", "input", "stdin", "interactive_input")
-                )
-                if is_cmd_key or (is_interactive_tool and not is_content_key):
-                    cmd_verdict = TartarusClan.inspect_command(val, base_dir=self.base_dir)
-                    if not cmd_verdict.passed:
-                        return self.gate.record(cmd_verdict)
-
-                # 5. SQL inspection for database queries
-                if any(k in clean_key for k in ("query", "sql")):
-                    sql_verdict = TartarusClan.inspect_sql(val)
-                    if not sql_verdict.passed:
-                        return self.gate.record(sql_verdict)
-
-                # 6. URL inspection for HTTP/browse tools or string URLs
-                is_url_key = any(k in clean_key for k in ("url", "uri", "endpoint", "host", "domain"))
-                looks_like_url = val.startswith(("http://", "https://", "file://", "gopher://", "dict://"))
-                if is_url_key or looks_like_url:
-                    url_verdict = CustodyClan.inspect_url(val)
-                    if not url_verdict.passed:
-                        return self.gate.record(url_verdict)
-
-                # 7. Secrets inspection in any text/content/string arguments
-                sec_verdict = CustodyClan.inspect_secrets(val)
-                if not sec_verdict.passed:
-                    return self.gate.record(sec_verdict)
+            # 4. Every string argument, classified by role
+            worst: Optional[Verdict] = None
+            for key_path, val in walk_arguments(arguments):
+                role = self._role(tool_name, key_path)
+                v = self._check(tool_name, key_path, val, role)
+                if v is not None and (worst is None or v.level > worst.level):
+                    worst = v
+                    if v.level >= DecisionLevel.LOCK:
+                        break
+            if worst is not None:
+                return self.gate.record(worst)
 
             # All clans passed -> Zero authority added
             return self.gate.record(Verdict(DecisionLevel.PASS, ["Tool call verified safe"], "AegisHarness"))

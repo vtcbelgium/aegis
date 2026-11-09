@@ -1,7 +1,7 @@
 # 🛡️ Aegis: Sovereign Negative Security Gate & Agentic Firewall
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-64%20passed%20(64%2F64)-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-80%20passed%20(80%2F80)-brightgreen.svg)]()
 [![Tokens](https://img.shields.io/badge/token%20spend-%E2%82%AC0%20(zero)-brightgreen.svg)]()
 [![Model](https://img.shields.io/badge/architecture-monotonic%20negative%20gate-blueviolet.svg)]()
 
@@ -20,9 +20,9 @@ Many guardrail implementations rely heavily on **prompting a second LLM to evalu
 ### The Aegis Invariant: Deterministic Negative Gating
 
 Aegis implements a **fast, zero-token deterministic software gate** operating at the tool, syscall, and network boundaries:
-1. **Model-Independent Policy:** Aegis does not negotiate or reason with LLMs. An agent cannot persuade or jailbreak the gate, because evaluation relies on canonicalized paths, recursive argument traversal, tokenized commands, and IP resolution.
-2. **Strict Monotonicity:** Decisions follow a strict mathematical poset: `PASS < OBSERVE < WARN < ASK < RESTRICT < DENY < LOCK`. Once an agent session violates a rule, its privileges escalate upwards and cannot be de-escalated by the agent. Only an authenticated owner secret can reset quarantine.
-3. **Human-in-the-Loop (`ASK`):** Sensitive or ambiguous mutations trigger an `ASK` verdict that routes directly to an owner approval queue (e.g. Tekton).
+1. **Model-Independent Policy:** Aegis does not negotiate or reason with LLMs. An agent cannot persuade or jailbreak the gate, because evaluation relies on per-tool argument schemas, one shared path resolver, a quote-aware shell parser with a binary allowlist, and IP canonicalization.
+2. **Strict Monotonicity:** Decisions follow a strict mathematical poset: `PASS < OBSERVE < WARN < ASK < RESTRICT < DENY < LOCK`. Repeated agent-initiated DENY/LOCK verdicts escalate the session and cannot be de-escalated by the agent; only an authenticated owner secret can reset quarantine. ASK verdicts and findings in tool *output* never lock a session.
+3. **Human-in-the-Loop (`ASK`):** Ambiguous actions (unknown binaries, inline code, non-allowlisted network egress, config changes) return `ASK`. Pass an `approval_callback` to route them to an owner approval queue such as Tekton; without one, ASK blocks.
 4. **Defense-in-Depth Pairing:** String checks provide boundary policy gating. For maximum defense, Aegis is designed to pair with OS sandboxing (containers, Bubblewrap, or seccomp) to contain lower-level execution.
 5. **Zero Token Overhead:** Evaluates payloads in microseconds with zero external dependencies (pure Python standard library).
 
@@ -37,10 +37,10 @@ Aegis implements a **fast, zero-token deterministic software gate** operating at
 ┌─────────────────────────────────────────────────────────────┐
 │                 AEGIS SOVEREIGN NEGATIVE GATE               │
 │                                                             │
-│  🌀 Labyrinth Clan:       Path traversal & directory escape │
-│  🛡️ Tartarus Boundary:    Command injection & destructive ops│
-│  🗝️ Credential Custody:    API keys / SSRF & cloud metadata  │
-│  ⚔️ Hecatoncheires:       Race conditions & loop brakes     │
+│  🌀 Labyrinth Clan:       Path containment & sensitive files│
+│  🛡️ Tartarus Clan:        Allowlist shell analyzer & SQL    │
+│  🗝️ Credential Custody:    Secrets / SSRF & cloud metadata   │
+│  ⚔️ Hecatoncheires:       Loop brake & thread safety        │
 │  🛑 Monotonic Poset:      PASS ➔ ASK ➔ DENY ➔ LOCK          │
 └──────────────────────────────┬──────────────────────────────┘
                                │
@@ -49,17 +49,48 @@ Aegis implements a **fast, zero-token deterministic software gate** operating at
           [ Quarantine ]  [ OS / Tool Execution ]
 ```
 
-1. **🌀 Labyrinth Clan:** Absolute path containment, null-byte truncation defense, recursive multi-level URL unquoting (`%252e%252e`), Windows ADS defense (`::$data`), and sensitive system path protection (`/etc/shadow`, SAM registry).
-2. **🛡️ Tartarus Clan:** Shell chaining detection (`;`, `&&`, `||`, subshells), tokenized command analysis via `shlex`, flag permutation detection (`rm -fr /`, `rm -r -f /`, `find / -delete`), and safe workspace command differentiation.
-3. **🗝️ Credential Custody Clan:** Zero-egress boundary for Cloud Instance Metadata (`169.254.169.254`, `metadata.google.internal`), RFC1918 intranet blocking, BSD short IP / hex / octal normalization (`127.1`, `0x7f.1`), hostname resolution inspection (`nip.io`), and secret scanning (Anthropic, Stripe, GitHub, Slack, Google, and RSA/EC PEM keys).
-4. **⚔️ Hecatoncheires Clan:** Runaway agent loop detection (trips emergency brake when an agent repeats identical tool arguments > threshold), thread-safe shared gate synchronization, and rapid escalation brakes.
+1. **🌀 Labyrinth Clan:** One resolver for every path (`~`, `~user`, `$HOME`, `${HOME}`, `%USERPROFILE%`, `$env:USERPROFILE`, symlinks, Windows paths even on a Linux host). Workspace containment, credential stores (`~/.ssh`, `~/.aws`, `/etc/shadow` …), startup/persistence files, secret-bearing project files (`.env`), and auto-executing files (`.git/hooks`, `.envrc`).
+2. **🛡️ Tartarus Clan:** Quote-aware parsing into segments (`;` `&&` `||` `|` `&`, newlines, subshells, `$(…)`, backticks, heredocs, redirects), shell grammar keywords, variables assigned in the same command, brace and `$IFS` expansion, wrappers (`env`, `xargs`, `timeout` …) and nested shells (`bash -c`, `cmd /c`, `powershell -Command`). Each segment's binary is looked up in an explicit allowlist; unknown binaries go to the owner.
+3. **🗝️ Credential Custody Clan:** Cloud metadata (any encoding: `0xa9fea9fe`, IPv4-mapped IPv6, DNS names resolving to it) → LOCK; loopback, link-local, RFC1918 → DENY; live secrets (Anthropic, OpenAI, Stripe, GitHub, Slack, Google, AWS, PEM keys).
+4. **⚔️ Hecatoncheires Clan:** Runaway loop brake on identical calls, thread-safe shared state, rapid-violation brake (3 agent DENY/LOCK in 60 s → LOCK).
+
+---
+
+## ⚖️ How Decisions Are Made
+
+| Verdict | Examples |
+|---|---|
+| **LOCK** (session quarantined) | `rm -rf ~`, `find / -delete`, `Remove-Item -Recurse C:\Users`, any command touching `~/.ssh` or `~/.aws`, live API key in a command, cloud metadata SSRF, `mkfs`, `shutdown` |
+| **DENY** | paths outside the workspace, `sudo`, pipes into an interpreter (`curl … \| sh`), uploading `.env`, uploads to known paste/exfil sinks, reverse-shell patterns, writing `.bashrc`/autostart/cron |
+| **ASK** (owner decides) | unknown binaries, inline code (`python -c`, `node -e`, heredocs), downloads/uploads to hosts outside the allowlist, `git push` to a non-origin remote, `git config`, global installs, reading `.env`, writing `.git/hooks`, env dumps, local services |
+| **PASS** | normal work: `git`, `npm`/`pip`/`pytest`/`cargo`/`go`, file edits in the workspace, downloads from code hosts and package registries |
+
+Everything that decides *what is allowed* lives in `aegis/policy.py`:
+
+```python
+from aegis import AegisGate
+from aegis.policy import AegisPolicy
+
+policy = AegisPolicy(
+    project_exec="ask",                      # default "allow": running the project's own code
+    allowed_domains={"github.com", "pypi.org", "registry.npmjs.org", "othrys.be"},
+    extra_allowed_binaries={"terraform"},
+    strict_tools=True,                       # tools without a schema -> ASK
+)
+gate = AegisGate(base_dir="/safe/workspace", policy=policy,
+                 approval_callback=lambda verdict: ask_owner(verdict))  # e.g. Tekton approvals
+```
+
+### What Aegis does not stop
+
+String inspection cannot see what code does. If an agent writes `cleanup.py` and then runs `python cleanup.py`, Aegis sees ordinary project work (with `project_exec="ask"` it asks first). The same holds for `npm test`, `make`, or code installed from an allowlisted code host. Response scanning catches common injection phrasings in five languages after normalization, but a determined attacker can paraphrase. **Pair Aegis with an OS sandbox** (container, Bubblewrap, a separate user) so a mistake is contained even when the policy allows it.
 
 ---
 
 ## 🚀 Use Cases & Integration Modes
 
 ### 1. 🪢 Agent Harness Interceptor (SWE-bench, LangChain, AutoGen, CrewAI)
-Wrap any Python tool or agent harness to enforce fail-closed execution with recursive argument traversal and automatic positional argument binding:
+Known Tekton / Desktop Commander tools (`read_file`, `write_file`, `edit_block`, `move_file`, `start_process`, `interact_with_process`, `set_config_value` …) use exact argument schemas. Other tools are classified by whole words in their argument names (`data_dir` is a path, never content), and any value that looks like a path or URL is checked regardless.
 
 ```python
 from aegis import AegisGate, AegisHarness
@@ -69,62 +100,33 @@ harness = AegisHarness(gate)
 
 @harness.protect_tool
 def execute_bash(command: str):
-    # If the agent attempts command injection or path escape,
-    # Aegis raises PermissionError before this function ever runs.
+    # Raises PermissionError before this runs if Aegis blocks or asks.
     return os.system(command)
 ```
 
 ### 2. 🔌 Model Context Protocol (MCP) Security Proxy
-Protect Claude Desktop, Cursor, and Antigravity with request gating and response leak filtering:
+Gates `tools/call` requests and redacts tool output (injection text replaced, secrets masked in place) without escalating the session:
 
 ```python
 from aegis import AegisMcpProxy
 
-proxy = AegisMcpProxy(base_dir="./safe_dir")
+proxy = AegisMcpProxy(base_dir="./safe_dir", approval_callback=tekton_approve)
 should_forward, error_response, verdict = proxy.filter_request(incoming_rpc)
-if not should_forward:
-    send_to_client(error_response)
+ok, sanitized, finding = proxy.filter_response(upstream_response)
 ```
 
 ### 3. 🖥️ Desktop Daemon & Standalone REST API
-Run Aegis as a local background security daemon:
 
 ```bash
 aegis serve --port 9999 --base-dir ./workspace
 ```
 
-* `GET  http://127.0.0.1:9999/status` -> Live monotonic scale & telemetry snapshot
-* `POST http://127.0.0.1:9999/gate`   -> Real-time tool call evaluation
+* `GET  /status` → monotonic level & telemetry
+* `POST /gate`   → tool call evaluation
+* `POST /reset`  → reset with the owner secret printed at startup (or `AEGIS_OWNER_SECRET`)
 
 ### 4. 🌐 Browser Extension ("AdBlocker for AI Agents")
-Available under `browser-extension/`:
-* Manifest V3 extension that intercepts zero-font prompt injections (`font-size: 0px`, opacity 0, background-matching colors) embedded in untrusted web pages.
-
----
-
-## 🛠️ CLI Quickstart
-
-```bash
-# Scan a codebase for OWASP and secret violations
-aegis audit ./my-project
-
-# Test a tool call against the gate
-aegis gate run_command '{"command": "cat ~/.ssh/id_rsa"}' --base-dir ./workspace
-
-# Launch the daemon
-aegis serve --port 9999 --base-dir ./workspace
-```
-
----
-
-## 🧪 Verification & Testing
-
-Aegis is completely self-contained with **zero runtime external dependencies** (uses Python standard library primitives).
-
-```bash
-python -m unittest discover -s tests -t .
-# Ran 48 tests in ~3.6s (includes 1,000+ payload fuzzing battery and 10,000-eval shared gate concurrency hammer)
-```
+`browser-extension/` (Manifest V3): redacts prompt-injection text from pages, including zero-font, invisible and split-across-elements text, replacing only the innermost element so the rest of the page survives. Exfiltration beacons (`?cookie=`, `?session_id=`, `?api_key=` …) are blocked before the request leaves the browser by `declarativeNetRequest` rules in `rules.json`.
 
 ### 5. 🏔️ OTHRYS Native Integration
 Aegis serves as the sovereign Security Authority across the OTHRYS fleet:
@@ -137,25 +139,32 @@ Aegis serves as the sovereign Security Authority across the OTHRYS fleet:
 ## 🛠️ CLI Quickstart
 
 ```bash
-# Scan a codebase for OWASP and secret violations
+# Scan a codebase for hardcoded secrets
 aegis audit ./my-project
 
-# Test a tool call against the gate
-aegis gate run_command '{"command": "rm -rf /"}'
+# Test a tool call against the gate (always pass --base-dir: without it there is no containment)
+aegis gate start_process '{"command": "cat ~/.ssh/id_rsa"}' --base-dir ./workspace
 
 # Launch the daemon
-aegis serve --port 9999
+aegis serve --port 9999 --base-dir ./workspace
+
+# Interactive stress lab (real engine)
+python playground/serve.py
 ```
 
 ---
 
 ## 🧪 Verification & Testing
 
-Aegis is completely self-contained with **zero runtime external dependencies** (uses Python standard library primitives).
+Zero runtime dependencies (Python standard library only).
 
 ```bash
-python -m unittest discover -s tests
-# Ran 19 tests in 0.004s — OK
+python -m unittest discover -s tests -t .
+# Ran 80 tests — includes the 1,484-payload fuzz battery, a shared-gate concurrency hammer,
+# and the red-team regression suites (rounds 1–5: 80+ bypass attempts, 100+ normal-work commands)
+
+# Browser extension (needs jsdom)
+npm install --no-save jsdom && npm run test:extension
 ```
 
 ---

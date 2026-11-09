@@ -120,17 +120,28 @@ class CustodyClan:
         # 3. IP canonicalization (handles dotted-decimal, BSD short 127.1, hex 0x7f.1, octal, dword)
         ip_obj, is_ip = canonicalize_ip(clean_host)
         if is_ip and ip_obj is not None:
-            if ip_obj.is_loopback:
+            mapped = getattr(ip_obj, "ipv4_mapped", None) or ip_obj
+            if str(mapped) in METADATA_HOSTS:
+                return Verdict(
+                    DecisionLevel.LOCK,
+                    [f"Critical SSRF attempt on Cloud Instance Metadata endpoint (encoded as {clean_host})"],
+                    cls.NAME,
+                    metadata={"target": url_string},
+                )
+            if mapped.is_loopback:
                 reasons.append(f"SSRF attempt on Loopback interface: {ip_obj}")
-            elif ip_obj.is_private:
-                reasons.append(f"SSRF attempt on RFC1918 Private Intranet IP: {ip_obj}")
-            elif ip_obj.is_link_local:
+            elif mapped.is_link_local:
                 reasons.append(f"SSRF attempt on Link-local address: {ip_obj}")
+            elif mapped.is_private:
+                reasons.append(f"SSRF attempt on RFC1918 Private Intranet IP: {ip_obj}")
             return Verdict(DecisionLevel.DENY, reasons or ["Non-routable IP address blocked"], cls.NAME, metadata={"host": clean_host})
 
         # 4. Hostname resolution (nip.io, sslip.io, and live DNS check)
         resolved_ips = resolve_host_ips(clean_host)
         for rip in resolved_ips:
+            if str(rip) in METADATA_HOSTS:
+                return Verdict(DecisionLevel.LOCK, [f"Critical SSRF: {clean_host} resolves to a cloud metadata endpoint"],
+                               cls.NAME, metadata={"target": url_string})
             if rip.is_loopback:
                 reasons.append(f"SSRF destination resolves to loopback IP ({rip}): {clean_host}")
             elif rip.is_private:

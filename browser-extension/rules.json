@@ -1,0 +1,13 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": { "type": "block" },
+    "condition": {
+      "regexFilter": "[?&](cookies?|leak|exfil|session_?id|password|passwd|secret|api_?key|access_token|auth_token|private_key)=",
+      "isUrlFilterCaseSensitive": false,
+      "domainType": "thirdParty",
+      "resourceTypes": ["image", "ping", "media", "other", "csp_report"]
+    }
+  }
+]

@@ -82,6 +82,8 @@ def run_gate_check(tool_name: str, args_json: str, base_dir: Optional[str] = Non
         print("Error: Invalid JSON arguments", file=sys.stderr)
         return 1
 
+    if not base_dir:
+        print("Warning: no --base-dir given, so workspace containment is OFF for this check.", file=sys.stderr)
     harness = AegisHarness(base_dir=base_dir)
     verdict = harness.evaluate_tool_call(tool_name, args)
 
