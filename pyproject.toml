@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aegis-gate"
-version = "1.0.0"
+version = "0.9.0"
 description = "Deterministic Monotonic Negative Security Gate & Agentic Firewall for AI Agents."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,7 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Jeroen Pauwels / OTHRYS", email = "jeroen@othrys.be" }]
 keywords = ["ai-security", "llm-guardrails", "agentic-firewall", "owasp", "negative-gate", "mcp-security"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Security",
     "License :: OSI Approved :: Apache Software License",

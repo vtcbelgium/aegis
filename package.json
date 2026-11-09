@@ -1,20 +1,17 @@
 {
   "name": "@othrys/aegis",
-  "version": "1.0.0",
+  "version": "0.9.0-beta",
   "description": "Deterministic Monotonic Negative Security Gate & Agentic Firewall for AI Agents",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "bin": {
-    "aegis": "./bin/aegis.js"
-  },
   "scripts": {
-    "test": "node --test tests/*.test.js"
+    "test": "python -m unittest discover -s tests -t .",
+    "test:stress": "python tests/test_stress.py",
+    "playground": "python playground/serve.py"
   },
   "keywords": [
     "ai-guardrail",
     "agentic-firewall",
     "mcp-security",
-    "prompt-injection",
+    "negative-gate",
     "owasp-llm"
   ],
   "author": "Jeroen Pauwels / OTHRYS <jeroen@othrys.be>",

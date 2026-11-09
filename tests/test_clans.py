@@ -9,8 +9,8 @@ class TestClans(unittest.TestCase):
 
     def test_labyrinth_traversal_detection(self):
         v1 = LabyrinthClan.inspect_path("../../secret.key")
-        self.assertEqual(v1.level, DecisionLevel.WARN)
-        self.assertFalse(v1.passed if v1.level >= DecisionLevel.RESTRICT else False)
+        self.assertEqual(v1.level, DecisionLevel.DENY)
+        self.assertFalse(v1.passed)
 
         v2 = LabyrinthClan.inspect_path("safe.txt\x00.exe")
         self.assertEqual(v2.level, DecisionLevel.LOCK)

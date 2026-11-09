@@ -12,9 +12,10 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import socket
 import unicodedata
 import urllib.parse
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 def normalize_text(text: str) -> str:
@@ -75,13 +76,31 @@ def canonicalize_path(base_dir: str, target_path: str) -> Tuple[str, bool]:
         return "", False
 
 
+def parse_mixed_int(s: str) -> int:
+    """Parse integer that might be hex (0x...), octal (0...), or decimal."""
+    s = s.strip()
+    if s.startswith("0x") or s.startswith("0X"):
+        return int(s, 16)
+    if s.startswith("0") and len(s) > 1 and s.isdigit():
+        return int(s, 8)
+    return int(s, 10)
+
+
 def canonicalize_ip(host_or_ip: str) -> Tuple[Optional[ipaddress.IPv4Address | ipaddress.IPv6Address], bool]:
-    """Canonicalize host/IP strings, converting hex, dword, octal or standard notation.
+    """Canonicalize host/IP strings, converting hex, dword, octal, short notation or standard.
+
+    Supports:
+        - Dotted-decimal: 127.0.0.1
+        - 2-part BSD: 127.1 -> 127.0.0.1
+        - 3-part BSD: 127.0.1 -> 127.0.0.1
+        - Mixed hex/octal: 0x7f.1 -> 127.0.0.1, 0177.0.0.1
+        - Dword integer: 2130706433 -> 127.0.0.1
+        - Hex integer: 0x7f000001 -> 127.0.0.1
 
     Returns:
         (ip_obj, is_valid_ip)
     """
-    cleaned = host_or_ip.strip().strip("[]")
+    cleaned = host_or_ip.strip().strip("[]").lower()
 
     # Try standard parse
     try:
@@ -89,52 +108,76 @@ def canonicalize_ip(host_or_ip: str) -> Tuple[Optional[ipaddress.IPv4Address | i
     except ValueError:
         pass
 
-    # Try octal integer representation (e.g., 017700000001)
-    if cleaned.startswith("0") and not cleaned.startswith("0x") and cleaned.isdigit() and len(cleaned) > 1:
+    # Try single integer representation (decimal, octal, or hex)
+    if cleaned.isdigit() or cleaned.startswith("0x") or (cleaned.startswith("0") and len(cleaned) > 1 and cleaned[1:].isdigit()):
         try:
-            val = int(cleaned, 8)
+            val = parse_mixed_int(cleaned)
             if 0 <= val <= 0xFFFFFFFF:
                 return ipaddress.IPv4Address(val), True
         except ValueError:
             pass
 
-    # Try hexadecimal integer representation (e.g., 0x7f000001)
-    if cleaned.startswith("0x") or cleaned.startswith("0X"):
-        try:
-            val = int(cleaned, 16)
-            if 0 <= val <= 0xFFFFFFFF:
-                return ipaddress.IPv4Address(val), True
-        except ValueError:
-            pass
-
-    # Try decimal integer representation (e.g., 2130706433)
-    if cleaned.isdigit():
-        try:
-            val = int(cleaned, 10)
-            if 0 <= val <= 0xFFFFFFFF:
-                return ipaddress.IPv4Address(val), True
-        except ValueError:
-            pass
-
-    # Try dotted mixed representations (e.g., 0x7f.0.0.1 or 0177.0.0.1)
+    # Try dotted mixed representations (1, 2, 3, or 4 parts according to BSD socket inet_aton rules)
     if "." in cleaned:
         parts = cleaned.split(".")
-        if len(parts) == 4:
+        if 1 <= len(parts) <= 4:
             try:
-                nums = []
-                for p in parts:
-                    if p.startswith("0x") or p.startswith("0X"):
-                        nums.append(int(p, 16))
-                    elif p.startswith("0") and len(p) > 1 and p.isdigit():
-                        nums.append(int(p, 8))
-                    elif p.isdigit():
-                        nums.append(int(p, 10))
-                    else:
-                        break
-                if len(nums) == 4 and all(0 <= n <= 255 for n in nums):
-                    dotted = ".".join(str(n) for n in nums)
-                    return ipaddress.IPv4Address(dotted), True
+                nums = [parse_mixed_int(p) for p in parts]
+                if len(nums) == 4:
+                    if all(0 <= n <= 255 for n in nums):
+                        dotted = ".".join(str(n) for n in nums)
+                        return ipaddress.IPv4Address(dotted), True
+                elif len(nums) == 3:
+                    # a.b.c -> a.b.0.c (where c is 16-bit)
+                    if 0 <= nums[0] <= 255 and 0 <= nums[1] <= 255 and 0 <= nums[2] <= 0xFFFF:
+                        val = (nums[0] << 24) | (nums[1] << 16) | nums[2]
+                        return ipaddress.IPv4Address(val), True
+                elif len(nums) == 2:
+                    # a.b -> a.0.0.b (where b is 24-bit, e.g. 127.1 -> 127.0.0.1)
+                    if 0 <= nums[0] <= 255 and 0 <= nums[1] <= 0xFFFFFF:
+                        val = (nums[0] << 24) | nums[1]
+                        return ipaddress.IPv4Address(val), True
             except ValueError:
                 pass
 
     return None, False
+
+
+def resolve_host_ips(hostname: str) -> List[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve a hostname to its IP addresses to detect DNS rebinding or nip.io/sslip.io evasions."""
+    ips: List[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    clean_host = hostname.strip().lower()
+
+    # Check if host is already an IP address
+    direct_ip, is_ip = canonicalize_ip(clean_host)
+    if is_ip and direct_ip is not None:
+        return [direct_ip]
+
+    # Check nip.io, sslip.io or direct embedded IP in hostname
+    nip_match = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\.(nip|sslip)\.io\b", clean_host)
+    if nip_match:
+        try:
+            return [ipaddress.ip_address(nip_match.group(1))]
+        except ValueError:
+            pass
+
+    if clean_host in {"localhost", "localhost.localdomain"}:
+        return [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")]
+
+    # Live DNS resolution fallback only for domain names with dots
+    if "." in clean_host and not clean_host.endswith(".internal"):
+        try:
+            results = socket.getaddrinfo(clean_host, None)
+            for res in results:
+                sockaddr = res[4]
+                ip_str = sockaddr[0]
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    if ip_obj not in ips:
+                        ips.append(ip_obj)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+
+    return ips

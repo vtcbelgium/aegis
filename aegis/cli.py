@@ -73,7 +73,7 @@ def run_audit(target_path: str) -> int:
         return 1
 
 
-def run_gate_check(tool_name: str, args_json: str) -> int:
+def run_gate_check(tool_name: str, args_json: str, base_dir: Optional[str] = None) -> int:
     """Test a tool call against the gate."""
     try:
         args = json.loads(args_json)
@@ -81,13 +81,14 @@ def run_gate_check(tool_name: str, args_json: str) -> int:
         print("Error: Invalid JSON arguments", file=sys.stderr)
         return 1
 
-    harness = AegisHarness()
+    harness = AegisHarness(base_dir=base_dir)
     verdict = harness.evaluate_tool_call(tool_name, args)
 
-    print(f"Tool:    {tool_name}")
-    print(f"Level:   {verdict.level.name} (Value: {verdict.level.value})")
-    print(f"Passed:  {verdict.passed}")
-    print(f"Reasons: {', '.join(verdict.reasons)}")
+    print(f"Tool:     {tool_name}")
+    print(f"BaseDir:  {base_dir or 'None'}")
+    print(f"Level:    {verdict.level.name} (Value: {verdict.level.value})")
+    print(f"Passed:   {verdict.passed}")
+    print(f"Reasons:  {', '.join(verdict.reasons)}")
     return 0 if verdict.passed else 1
 
 
@@ -153,18 +154,20 @@ def main() -> None:
     gate_parser = subparsers.add_parser("gate", help="Evaluate a tool call")
     gate_parser.add_argument("tool", help="Tool name (e.g. bash, write_file)")
     gate_parser.add_argument("args", help="Arguments in JSON format")
+    gate_parser.add_argument("--base-dir", default=None, help="Approved base directory root for file operations")
 
     # Serve command
     serve_parser = subparsers.add_parser("serve", help="Run local security daemon")
     serve_parser.add_argument("--port", type=int, default=9999, help="Port to listen on (default: 9999)")
+    serve_parser.add_argument("--base-dir", default=".", help="Approved base directory root (default: .)")
 
     args = parser.parse_args()
     if args.command == "audit":
         sys.exit(run_audit(args.path))
     elif args.command == "gate":
-        sys.exit(run_gate_check(args.tool, args.args))
+        sys.exit(run_gate_check(args.tool, args.args, base_dir=args.base_dir))
     elif args.command == "serve":
-        run_daemon(args.port)
+        run_daemon(args.port, base_dir=args.base_dir)
     else:
         parser.print_help()
 

