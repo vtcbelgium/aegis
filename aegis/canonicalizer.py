@@ -147,9 +147,13 @@ def resolve_path(path: str, base_dir: Optional[str] = None, cwd: Optional[str] =
         else:
             abs_target = mod.normpath(mod.join(start or "", clean))
         abs_target = abs_target.replace("\\", "/")
+        if os.name == "nt" and looks_windows_path(abs_target):
+            abs_target = os.path.realpath(abs_target).replace("\\", "/")
         if base_dir is None:
             return abs_target, None, unresolved
         abs_base = mod.normpath(base_dir).replace("\\", "/")
+        if os.name == "nt" and base_is_win:
+            abs_base = os.path.realpath(abs_base).replace("\\", "/")
         if not base_is_win:
             return abs_target, False, unresolved     # Windows path vs POSIX workspace
         a, b = abs_target.lower().rstrip("/"), abs_base.lower().rstrip("/")
