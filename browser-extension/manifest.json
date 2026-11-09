@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Aegis AI Shield",
-  "version": "1.0.0",
-  "description": "Deterministic Negative-Gate AdBlocker & Security Firewall for AI Agents and Browsing Sessions.",
+  "version": "1.1.0",
+  "description": "Redacts prompt-injection text from pages and blocks exfiltration beacons before AI browsing agents read them.",
   "permissions": [
     "storage",
     "declarativeNetRequest"
@@ -19,9 +19,22 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "aegis_beacons",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  }
 }

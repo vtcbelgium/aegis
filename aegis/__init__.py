@@ -9,7 +9,7 @@ from .harness import AegisHarness
 from .mcp_proxy import AegisMcpProxy
 from .clans import LabyrinthClan, TartarusClan, CustodyClan, HecatoncheiresClan
 
-__version__ = "1.0.0"
+__version__ = "0.10.0"
 __all__ = [
     "AegisGate",
     "DecisionLevel",

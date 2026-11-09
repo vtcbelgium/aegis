@@ -1,11 +1,12 @@
 {
   "name": "@othrys/aegis",
-  "version": "0.9.0-beta",
+  "version": "0.10.0-beta",
   "description": "Deterministic Monotonic Negative Security Gate & Agentic Firewall for AI Agents",
   "scripts": {
     "test": "python -m unittest discover -s tests -t .",
     "test:stress": "python tests/test_stress.py",
-    "playground": "python playground/serve.py"
+    "playground": "python playground/serve.py",
+    "test:extension": "node tests/extension/test_content.js browser-extension/content.js"
   },
   "keywords": [
     "ai-guardrail",

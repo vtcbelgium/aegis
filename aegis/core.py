@@ -78,7 +78,20 @@ class Verdict:
 
 
 class AegisGate:
-    """The Sovereign Negative Gate."""
+    """The Sovereign Negative Gate.
+
+    Escalation rules:
+        - Only agent-initiated DENY and LOCK verdicts count toward the rapid-violation brake.
+          ASK (waiting for the owner) and WARN never lock a session on their own.
+        - Findings in tool *responses* (content the agent received, e.g. a web page that
+          mentions prompt injection) are recorded with escalate=False: they are redacted,
+          logged, and never raise the session level. Otherwise any website could lock an agent.
+        - ASK verdicts go to approval_callback when one is configured. The callback runs
+          outside the gate lock, so a slow human approval never blocks other evaluations.
+    """
+
+    MAX_AUDIT_LOG = 10_000
+    MAX_PENDING = 200
 
     def __init__(
         self,
@@ -89,19 +102,25 @@ class AegisGate:
         max_violations_per_minute: int = 3,
         violation_window_seconds: float = 60.0,
         approval_callback: Optional[Callable[[Verdict], bool]] = None,
+        policy: Optional[Any] = None,
     ) -> None:
+        from .policy import AegisPolicy
+
         if strict_mode and base_dir is None:
             self.base_dir = os.path.abspath(os.getcwd())
         else:
             self.base_dir = base_dir
         self.fail_closed = fail_closed
         self.strict_mode = strict_mode
+        self.policy = policy or AegisPolicy(strict_tools=strict_mode)
         self.max_violations_per_minute = max_violations_per_minute
         self.violation_window_seconds = violation_window_seconds
         self.approval_callback = approval_callback
         self._current_level: DecisionLevel = DecisionLevel.PASS
-        self._audit_log: List[Verdict] = []
-        self._pending_approvals: List[Verdict] = []
+        self._audit_log: Deque[Verdict] = collections.deque(maxlen=self.MAX_AUDIT_LOG)
+        self._total_evaluations = 0
+        self._violations_recorded = 0
+        self._pending_approvals: Deque[Verdict] = collections.deque(maxlen=self.MAX_PENDING)
         self._violation_timestamps: Deque[float] = collections.deque()
         self._lock = threading.Lock()
         self._owner_token_hash = (
@@ -141,27 +160,33 @@ class AegisGate:
         with self._lock:
             return [v.to_dict() for v in self._pending_approvals]
 
-    def record(self, verdict: Verdict) -> Verdict:
-        """Record verdict, apply human approval callback if ASK, and enforce escalation poset."""
+    def record(self, verdict: Verdict, escalate: bool = True) -> Verdict:
+        """Record a verdict; route ASK to the approver; apply escalation rules (see class doc)."""
+        # 1. Human-in-the-loop approval, outside the lock
+        if escalate and verdict.level == DecisionLevel.ASK and self.approval_callback:
+            try:
+                approved = bool(self.approval_callback(verdict))
+            except Exception:
+                approved = False
+            if approved:
+                verdict = Verdict(
+                    DecisionLevel.PASS,
+                    [f"Approved by human owner: {'; '.join(verdict.reasons)}"],
+                    verdict.clan,
+                    metadata={**verdict.metadata, "approved": True},
+                )
+
         with self._lock:
-            # Route ASK verdicts through approval callback if configured (Tekton human-in-the-loop)
-            if verdict.level == DecisionLevel.ASK and self.approval_callback:
-                try:
-                    if self.approval_callback(verdict):
-                        verdict = Verdict(
-                            DecisionLevel.PASS,
-                            [f"Approved by human owner: {'; '.join(verdict.reasons)}"],
-                            verdict.clan,
-                            metadata={**verdict.metadata, "approved": True},
-                        )
-                except Exception:
-                    pass
-
-            if verdict.level == DecisionLevel.ASK and not verdict.metadata.get("approved"):
-                self._pending_approvals.append(verdict)
-
             self._audit_log.append(verdict)
+            self._total_evaluations += 1
             if verdict.level >= DecisionLevel.WARN:
+                self._violations_recorded += 1
+            if not escalate:
+                verdict.metadata.setdefault("escalated", False)
+                return verdict
+            if verdict.level == DecisionLevel.ASK:
+                self._pending_approvals.append(verdict)
+            if verdict.level >= DecisionLevel.DENY:
                 now = time.time()
                 self._violation_timestamps.append(now)
                 while self._violation_timestamps and (now - self._violation_timestamps[0] > self.violation_window_seconds):
@@ -180,8 +205,8 @@ class AegisGate:
                 "authorityDelta": "SUBTRACTIVE_ONLY",
                 "currentLevel": self._current_level.name,
                 "currentLevelValue": int(self._current_level),
-                "totalEvaluations": len(self._audit_log),
+                "totalEvaluations": self._total_evaluations,
                 "pendingApprovals": len(self._pending_approvals),
-                "violationsRecorded": sum(1 for v in self._audit_log if v.level >= DecisionLevel.WARN),
-                "history": [v.to_dict() for v in self._audit_log[-20:]],
+                "violationsRecorded": self._violations_recorded,
+                "history": [v.to_dict() for v in list(self._audit_log)[-20:]],
             }

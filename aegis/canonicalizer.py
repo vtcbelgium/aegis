@@ -18,15 +18,139 @@ import urllib.parse
 from typing import List, Optional, Tuple
 
 
+# Invisible characters used to split or smuggle text past pattern matching:
+# zero-width chars, soft hyphen, word joiner, bidi controls, Mongolian vowel separator,
+# and the Unicode "tag" block (ASCII smuggling).
+_INVISIBLE_RE = re.compile(
+    "[\u00AD\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]|[\U000E0000-\U000E007F]"
+)
+
+
 def normalize_text(text: str) -> str:
-    """Normalize text using Unicode NFKC and strip non-printable zero-width control chars."""
+    """Normalize text using Unicode NFKC and strip invisible / bidi / tag characters."""
     if not isinstance(text, str):
         return ""
     # NFKC normalizes fullwidth characters, ligatures, and homoglyphs
     normalized = unicodedata.normalize("NFKC", text)
-    # Strip zero-width spaces used in indirect prompt injection
-    normalized = re.sub(r"[\u200B-\u200D\uFEFF]", "", normalized)
-    return normalized
+    return _INVISIBLE_RE.sub("", normalized)
+
+
+def normalize_for_matching(text: str) -> str:
+    """normalize_text + casefold + collapsed whitespace, for natural-language pattern matching."""
+    return re.sub(r"\s+", " ", normalize_text(text).casefold())
+
+
+# ---------------------------------------------------------------------------
+# Path variable expansion and resolution (one normalizer used everywhere)
+# ---------------------------------------------------------------------------
+
+_HOME_VARS = {"HOME", "USERPROFILE"}
+_TEMP_VARS = {"TMPDIR", "TEMP", "TMP"}
+_WIN_ABS_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[A-Za-z]:$|\\\\|//)")
+_VAR_RE = re.compile(
+    r"\$\{env:(?P<a>[A-Za-z_][A-Za-z0-9_]*)\}"      # ${env:NAME}   (PowerShell)
+    r"|\$env:(?P<b>[A-Za-z_][A-Za-z0-9_]*)"           # $env:NAME     (PowerShell)
+    r"|\$\{(?P<c>[A-Za-z_][A-Za-z0-9_]*)(?P<cmod>[^}]*)\}"  # ${NAME} / ${NAME:-x}
+    r"|\$(?P<d>[A-Za-z_][A-Za-z0-9_]*)"               # $NAME
+    r"|%(?P<e>[A-Za-z_][A-Za-z0-9_]*)%",              # %NAME%        (cmd.exe)
+    re.IGNORECASE,
+)
+
+
+def home_dir() -> str:
+    return os.path.expanduser("~")
+
+
+def expand_path_vars(path: str, cwd: Optional[str] = None) -> Tuple[str, bool]:
+    """Expand ~, home/temp/cwd variables in every shell spelling.
+
+    Returns (expanded, unresolved) where unresolved is True if a variable remains that
+    Aegis cannot know the value of (the caller should then ask the owner).
+    """
+    unresolved = False
+    home = home_dir()
+
+    def repl(m: "re.Match[str]") -> str:
+        nonlocal unresolved
+        name = next(g for g in (m.group("a"), m.group("b"), m.group("c"), m.group("d"), m.group("e")) if g)
+        upper = name.upper()
+        if upper in _HOME_VARS:
+            return home
+        if upper in _TEMP_VARS:
+            import tempfile
+            return tempfile.gettempdir()
+        if upper in {"PWD", "CD"} and cwd:
+            return cwd
+        if upper == "HOMEPATH":
+            return home
+        if upper == "HOMEDRIVE":
+            return ""
+        unresolved = True
+        return m.group(0)
+
+    expanded = _VAR_RE.sub(repl, path)
+    if expanded.startswith("~"):
+        expanded = os.path.expanduser(expanded)
+        if expanded.startswith("~"):          # ~unknownuser
+            parent = os.path.dirname(home)
+            name, _, rest = expanded[1:].partition("/")
+            expanded = os.path.join(parent, name, rest) if name else home
+    return expanded, unresolved
+
+
+def looks_windows_path(path: str) -> bool:
+    return bool(_WIN_ABS_RE.match(path or ""))
+
+
+def resolve_path(path: str, base_dir: Optional[str] = None, cwd: Optional[str] = None) -> Tuple[str, Optional[bool], bool]:
+    """Resolve path the way the target shell would see it.
+
+    Returns (absolute_path, confined, unresolved):
+        confined is None when no base_dir is set, otherwise whether the path stays inside it.
+        unresolved is True when the path contains a variable Aegis cannot expand.
+    Windows-style paths are resolved with ntpath semantics even on a POSIX host,
+    so a gate running on Linux still understands C:\\Users when guarding a Windows machine.
+    """
+    import ntpath
+    import posixpath
+
+    clean, _ = unquote_recursively(normalize_text(path))
+    clean = clean.replace("\x00", "").strip()
+    start = cwd or base_dir
+    clean, unresolved = expand_path_vars(clean, cwd=start)
+
+    base_is_win = bool(base_dir and looks_windows_path(base_dir))
+    target_is_win = looks_windows_path(clean)
+
+    if target_is_win or base_is_win:
+        mod = ntpath
+        if mod.isabs(clean) or target_is_win:
+            abs_target = mod.normpath(clean)
+        else:
+            abs_target = mod.normpath(mod.join(start or "", clean))
+        abs_target = abs_target.replace("\\", "/")
+        if base_dir is None:
+            return abs_target, None, unresolved
+        abs_base = mod.normpath(base_dir).replace("\\", "/")
+        if not base_is_win:
+            return abs_target, False, unresolved     # Windows path vs POSIX workspace
+        a, b = abs_target.lower().rstrip("/"), abs_base.lower().rstrip("/")
+        return abs_target, (a == b or a.startswith(b + "/")), unresolved
+
+    if os.name == "nt":
+        clean = clean.replace("/", "\\")
+    if os.path.isabs(clean):
+        abs_target = os.path.realpath(clean)
+    else:
+        abs_target = os.path.realpath(os.path.join(start or os.getcwd(), clean))
+    if base_dir is None:
+        return abs_target, None, unresolved
+    abs_base = os.path.realpath(os.path.abspath(base_dir))
+    try:
+        confined = os.path.commonpath([abs_base, abs_target]) == abs_base
+    except ValueError:                         # different drives on Windows
+        confined = False
+    return abs_target, confined, unresolved
 
 
 def unquote_recursively(text: str, max_depth: int = 4) -> Tuple[str, bool]:
@@ -58,24 +182,11 @@ def canonicalize_path(base_dir: str, target_path: str) -> Tuple[str, bool]:
         (resolved_path, is_confined)
     """
     try:
-        # Normalize and unquote
-        clean_target, _ = unquote_recursively(normalize_text(target_path))
-        clean_target = clean_target.replace("\x00", "").strip()
-
-        # Expand user home directory (~)
-        clean_target = os.path.expanduser(clean_target)
-        expanded_base = os.path.expanduser(base_dir.strip())
-
-        # Compute absolute paths
-        abs_base = os.path.realpath(os.path.abspath(expanded_base))
-        if os.path.isabs(clean_target):
-            abs_target = os.path.realpath(os.path.abspath(clean_target))
-        else:
-            abs_target = os.path.realpath(os.path.abspath(os.path.join(abs_base, clean_target)))
-
-        # Verify containment using commonpath
-        is_confined = os.path.commonpath([abs_base, abs_target]) == abs_base
-        return abs_target, is_confined
+        expanded_base, _ = expand_path_vars(base_dir.strip())
+        abs_target, confined, unresolved = resolve_path(target_path, base_dir=expanded_base)
+        if unresolved:
+            return abs_target, False
+        return abs_target, bool(confined)
     except Exception:
         return "", False
 

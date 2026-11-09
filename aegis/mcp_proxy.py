@@ -10,20 +10,37 @@ from __future__ import annotations
 import os
 import re
 import secrets
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from .core import AegisGate, DecisionLevel, Verdict
 from .harness import AegisHarness
+from .canonicalizer import normalize_for_matching
 from .clans import CustodyClan
+from .clans.custody import CRITICAL_SECRET_SIGNATURES, MILD_SECRET_SIGNATURES
 
 
+# Patterns run on normalize_for_matching(text): NFKC, invisible characters removed,
+# casefolded, whitespace collapsed. They catch the common phrasings; a determined attacker
+# can always paraphrase, so response scanning is a redaction layer, not a guarantee.
 INDIRECT_INJECTION_PATTERNS = [
-    r"(?i)ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions",
-    r"(?i)system\s+prompt\s*:",
-    r"(?i)you\s+are\s+now\s+in\s+(?:dan|developer|god|unrestricted)\s+mode",
-    r"(?i)new\s+instructions\s+follow\s*:",
-    r"(?i)(?:call|execute)\s+tool\s+(?:execute_bash|run_command|write_file|delete_file)",
-    r"!\[.*?\]\(https?://[^\s'\"|;&]+(?:\?|&)(?:token|cookie|auth|leak|key)=",
+    r"\b(?:ignore|disregard|forget|override|bypass|skip)\b.{0,20}\b(?:all|any|the|your|these|those)?\s*"
+    r"(?:previous|prior|earlier|above|preceding|original|existing|initial)\s+"
+    r"(?:instructions?|guidance|rules|directions|prompts?|context|messages|guidelines|directives)",
+    r"\byour\s+(?:new|real|actual|true)\s+(?:task|instructions?|goal|objective|role|mission)\b",
+    r"\bnew\s+instructions?\s*(?:follow)?\s*:",
+    r"\bfrom\s+now\s+on,?\s+you\s+(?:are|will|must|should)\b",
+    r"\bsystem\s+prompt\s*:",
+    r"\byou\s+are\s+now\s+(?:in\s+)?(?:dan|developer|god|unrestricted|jailbreak(?:ed)?)\s*(?:mode)?\b",
+    r"\b(?:call|execute|run|invoke)\s+(?:the\s+)?(?:tool|function)\s+[a-z_][a-z0-9_]*",
+    r"\b(?:curl|wget|iwr|irm|invoke-webrequest)\b[^\n]{0,200}\|\s*(?:ba|z)?sh\b",
+    r"\b(?:curl|wget|iwr|irm|invoke-webrequest)\b[^\n]{0,200}\|\s*iex\b",
+    r"!\[[^\]]*\]\(https?://[^\s)]+[?&](?:token|cookie|auth|leak|key|session|secret|data|q)=",
+    # Dutch, French, German, Spanish
+    r"\bnegeer\s+(?:alle\s+)?(?:vorige|eerdere|voorgaande)\s+(?:instructies|opdrachten|regels)",
+    r"\bignore[rz]?\s+(?:toutes\s+)?les\s+instructions\s+(?:pr[eé]c[eé]dentes|ant[eé]rieures)",
+    r"\bignorier(?:e|en)?\s+(?:alle\s+)?(?:vorherigen|bisherigen|obigen)\s+(?:anweisungen|instruktionen)",
+    r"\bignora\s+(?:todas\s+)?las\s+instrucciones\s+(?:anteriores|previas)",
 ]
+_INJECTION_RES = [re.compile(p) for p in INDIRECT_INJECTION_PATTERNS]
 
 
 class AegisMcpProxy:
@@ -36,6 +53,8 @@ class AegisMcpProxy:
         strict_mode: bool = False,
         fail_closed: bool = True,
         owner_secret: Optional[str] = None,
+        approval_callback: Optional[Callable[[Verdict], bool]] = None,
+        policy: Optional[Any] = None,
     ) -> None:
         secret = owner_secret or os.environ.get("AEGIS_OWNER_SECRET")
         if not secret:
@@ -47,7 +66,11 @@ class AegisMcpProxy:
             strict_mode=strict_mode,
             fail_closed=fail_closed,
             owner_secret=self.owner_secret,
+            approval_callback=approval_callback,
+            policy=policy,
         )
+        if gate is not None and approval_callback is not None:
+            self.gate.approval_callback = approval_callback
         self.harness = AegisHarness(gate=self.gate, base_dir=self.gate.base_dir)
 
     def filter_request(self, rpc_request: Any) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Verdict]]:
@@ -102,8 +125,9 @@ class AegisMcpProxy:
                                 {
                                     "type": "text",
                                     "text": (
-                                        f"🛑 AEGIS NEGATIVE GATE BLOCKED [{verdict.level.name}]: "
-                                        f"{'; '.join(verdict.reasons)}. "
+                                        ("⏸ AEGIS: OWNER APPROVAL REQUIRED [ASK]: " if verdict.level == DecisionLevel.ASK
+                                         else f"🛑 AEGIS NEGATIVE GATE BLOCKED [{verdict.level.name}]: ")
+                                        + f"{'; '.join(verdict.reasons)}. "
                                         f"Supreme Law: Aegis may subtract authority, never create it."
                                     ),
                                 }
@@ -137,49 +161,83 @@ class AegisMcpProxy:
             }
             return False, error_response, lock_verdict
 
+    def _scan_text(self, text: str) -> Tuple[str, Optional[Verdict]]:
+        """Return (sanitized_text, verdict_if_anything_was_redacted)."""
+        if not isinstance(text, str) or not text:
+            return text, None
+        matched = normalize_for_matching(text)
+        for rx in _INJECTION_RES:
+            if rx.search(matched):
+                return (
+                    "[REDACTED BY AEGIS: Untrusted indirect prompt injection stripped]",
+                    Verdict(DecisionLevel.DENY, [f"Indirect prompt injection in tool output: {rx.pattern[:60]}"],
+                            "McpResponseGuard", metadata={"source": "response"}),
+                )
+        sec = CustodyClan.inspect_secrets(text)
+        if not sec.passed:
+            masked = text
+            for pattern, _label in CRITICAL_SECRET_SIGNATURES + MILD_SECRET_SIGNATURES:
+                masked = re.sub(pattern, "[REDACTED SECRET]", masked)
+            return masked, Verdict(sec.level, sec.reasons, "McpResponseGuard", metadata={"source": "response"})
+        return text, None
+
+    def _scan_structure(self, obj: Any, found: List[Verdict]) -> Any:
+        if isinstance(obj, str):
+            new, v = self._scan_text(obj)
+            if v is not None:
+                found.append(v)
+            return new
+        if isinstance(obj, dict):
+            return {k: self._scan_structure(v, found) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._scan_structure(v, found) for v in obj]
+        return obj
+
     def filter_response(self, rpc_response: Any) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Verdict]]:
-        """Scan tool execution output for indirect prompt injections and credential leaks."""
+        """Scan tool output for indirect prompt injection and leaked credentials.
+
+        Findings are redacted and logged but never escalate the session: the agent did not
+        do anything wrong by *receiving* hostile content, and escalating would let any
+        website lock the agent. Secrets are masked in place; injected text is replaced.
+        """
         try:
             if not isinstance(rpc_response, dict):
                 return True, None, None
-
-            result = rpc_response.get("result", {})
-            if isinstance(result, dict) and "content" in result:
-                content_list = result["content"]
-                if isinstance(content_list, list):
-                    for item in content_list:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            text = item.get("text", "")
-
-                            # 1. Check for indirect prompt injection signatures
-                            for pattern in INDIRECT_INJECTION_PATTERNS:
-                                if re.search(pattern, text):
-                                    inj_verdict = self.gate.record(
-                                        Verdict(
-                                            DecisionLevel.DENY,
-                                            [f"Indirect prompt injection attempt neutralized: {pattern}"],
-                                            "McpResponseGuard",
-                                        )
-                                    )
-                                    item["text"] = "[REDACTED BY AEGIS: Untrusted indirect prompt injection stripped]"
-                                    return False, rpc_response, inj_verdict
-
-                            # 2. Check for leaked credentials in tool output (single atomic record)
-                            sec_verdict = CustodyClan.inspect_secrets(text)
-                            if not sec_verdict.passed:
-                                recorded = self.gate.record(sec_verdict)
-                                item["text"] = "[REDACTED BY AEGIS: Leaked credentials stripped from tool response]"
-                                return False, rpc_response, recorded
-
-            return True, None, None
+            result = rpc_response.get("result")
+            if not isinstance(result, dict):
+                return True, None, None
+            found: List[Verdict] = []
+            content_list = result.get("content")
+            if isinstance(content_list, list):
+                for item in content_list:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "text":
+                        new_text, v = self._scan_text(item.get("text", ""))
+                        if v is not None:
+                            item["text"] = new_text
+                            found.append(v)
+                    elif item.get("type") == "resource" and isinstance(item.get("resource"), dict):
+                        res = item["resource"]
+                        if isinstance(res.get("text"), str):
+                            new_text, v = self._scan_text(res["text"])
+                            if v is not None:
+                                res["text"] = new_text
+                                found.append(v)
+            if "structuredContent" in result:
+                result["structuredContent"] = self._scan_structure(result["structuredContent"], found)
+            if not found:
+                return True, None, None
+            worst = max(found, key=lambda v: v.level)
+            recorded = self.gate.record(worst, escalate=False)
+            return False, rpc_response, recorded
         except Exception as exc:
-            if self.gate.fail_closed:
-                lock_v = self.gate.record(
-                    Verdict(
-                        DecisionLevel.LOCK,
-                        [f"Response filter crashed (fail closed): {exc}"],
-                        "McpResponseGuard",
-                    )
-                )
-                return False, None, lock_v
-            return True, None, None
+            # Fail closed for the content (do not forward unscanned output) without locking the session.
+            v = self.gate.record(
+                Verdict(DecisionLevel.DENY, [f"Response could not be scanned and was withheld: {exc}"],
+                        "McpResponseGuard", metadata={"source": "response"}),
+                escalate=False,
+            )
+            req_id = rpc_response.get("id") if isinstance(rpc_response, dict) else None
+            return False, {"jsonrpc": "2.0", "id": req_id, "result": {"isError": True, "content": [
+                {"type": "text", "text": "[AEGIS: tool output withheld because it could not be scanned]"}]}}, v

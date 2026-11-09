@@ -19,8 +19,13 @@ class TestClans(unittest.TestCase):
         v = TartarusClan.inspect_command("rm -rf / --no-preserve-root")
         self.assertEqual(v.level, DecisionLevel.LOCK)
 
+        # Chaining itself is not an attack; what each segment does is what matters.
         v_chain = TartarusClan.inspect_command("echo hello; rm file.txt")
-        self.assertEqual(v_chain.level, DecisionLevel.DENY)
+        self.assertEqual(v_chain.level, DecisionLevel.PASS)
+        v_chain_bad = TartarusClan.inspect_command("echo hello; rm -rf ~")
+        self.assertEqual(v_chain_bad.level, DecisionLevel.LOCK)
+        v_chain_escape = TartarusClan.inspect_command("echo hello; rm ../file.txt", base_dir="/tmp/aegis_ws")
+        self.assertEqual(v_chain_escape.level, DecisionLevel.DENY)
 
         v_clean = TartarusClan.inspect_command("npm run build")
         self.assertEqual(v_clean.level, DecisionLevel.PASS)
