@@ -52,6 +52,7 @@ def detect_null_bytes(text: str) -> bool:
 
 def canonicalize_path(base_dir: str, target_path: str) -> Tuple[str, bool]:
     """Resolve target_path and verify it remains strictly confined within base_dir.
+    Expands user home directory (~) and normalizes Unicode/URL encoding.
 
     Returns:
         (resolved_path, is_confined)
@@ -59,11 +60,14 @@ def canonicalize_path(base_dir: str, target_path: str) -> Tuple[str, bool]:
     try:
         # Normalize and unquote
         clean_target, _ = unquote_recursively(normalize_text(target_path))
-        clean_target = clean_target.replace("\x00", "")
+        clean_target = clean_target.replace("\x00", "").strip()
+
+        # Expand user home directory (~)
+        clean_target = os.path.expanduser(clean_target)
+        expanded_base = os.path.expanduser(base_dir.strip())
 
         # Compute absolute paths
-        abs_base = os.path.realpath(os.path.abspath(base_dir))
-        # If target is relative, join with base_dir; if absolute, realpath it
+        abs_base = os.path.realpath(os.path.abspath(expanded_base))
         if os.path.isabs(clean_target):
             abs_target = os.path.realpath(os.path.abspath(clean_target))
         else:

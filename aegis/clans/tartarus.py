@@ -53,11 +53,29 @@ SHELL_INJECTION_PATTERNS = [
 ]
 
 
+# High-risk exfiltration endpoints and upload sinks
+EXFILTRATION_DOMAINS: Set[str] = {
+    "transfer.sh", "pastebin.com", "file.io", "webhook.site",
+    "ngrok.io", "requestbin.net", "0x0.st", "temp.sh",
+    "termbin.com", "ix.io", "catbox.moe", "uguu.se", "pipedream.net"
+}
+
+# Interpreters capable of inline execution
+INTERPRETERS: Set[str] = {"python", "python3", "pythonw", "node", "nodejs", "perl", "ruby", "php"}
+
+
 def extract_paths_from_command(cmd: str) -> List[str]:
-    """Extract candidate filesystem paths from a shell command string."""
+    """Extract candidate filesystem paths and redirection targets from a shell command string."""
     found: List[str] = []
-    # Tokenize by whitespace, equals, semicolons and inspect each token
-    tokens = re.split(r"[\s=;,&|]+", cmd)
+    # 1. Extract explicit redirection targets: > file, >> file, < file
+    redirections = re.findall(r"(?:>>|>|<)\s*([^\s;&|]+)", cmd)
+    for r in redirections:
+        clean_r = r.strip("'\"")
+        if clean_r:
+            found.append(clean_r)
+
+    # 2. Tokenize by whitespace, equals, semicolons, pipe, redirect characters
+    tokens = re.split(r"[\s=;,&|<>\"]+", cmd)
     for tok in tokens:
         cleaned = tok.strip("'\"")
         if cleaned.startswith("@"):
@@ -116,6 +134,22 @@ class TartarusClan:
         if re.search(r"\bdel\s+.*(/[fFsqSQ]\s*)*(?:[cC]:\\|[cC]:/\*|\\\*)", lower_cmd):
             return Verdict(DecisionLevel.LOCK, ["Recursive Windows root deletion detected"], cls.NAME)
 
+        # Environment variable dumps -> ASK (prevents dumping all API keys/tokens)
+        if re.search(r"^\s*(?:printenv|env|export\s+-p|set)\s*(?:$|[;&|])", normalized, re.IGNORECASE):
+            return Verdict(
+                DecisionLevel.ASK,
+                ["Unrestricted environment variable dumping detected (potential secret exposure)"],
+                cls.NAME,
+            )
+
+        # Pipe directly into an interpreter (e.g. base64 -d | python3) -> DENY
+        if re.search(r"\|\s*(?:python[0-9.]*|node|perl|ruby|php|bash|sh|powershell|pwsh|cmd)\b", normalized, re.IGNORECASE):
+            return Verdict(
+                DecisionLevel.DENY,
+                ["Untrusted pipeline execution directly into interpreter (base64/curl piping)"],
+                cls.NAME,
+            )
+
         # Shell injection chaining patterns -> DENY
         for pattern in SHELL_INJECTION_PATTERNS:
             if re.search(pattern, normalized, re.IGNORECASE):
@@ -143,12 +177,69 @@ class TartarusClan:
             if binary_name in PRIVILEGE_BINARIES or any(t.lower() in PRIVILEGE_BINARIES for t in tokens[:2]):
                 reasons.append("Unauthorized privilege escalation binary invocation (sudo/su/pkexec)")
 
+            # Check bare interactive shell spawning
+            if binary_name in {"bash", "sh", "powershell", "pwsh", "cmd", "zsh"} and len(tokens) == 1:
+                return Verdict(
+                    DecisionLevel.ASK,
+                    [f"Spawning bare interactive shell session requires owner approval: {binary_name}"],
+                    cls.NAME,
+                )
+
+            # Check inline interpreter execution (python -c, node -e, perl -e, etc.)
+            if binary_name in INTERPRETERS:
+                has_inline = any(t in {"-c", "-e", "-r"} for t in tokens[1:])
+                if has_inline:
+                    # Scan full normalized command for dangerous keywords (handles inner semicolons in scripts)
+                    if any(bad in normalized.lower() for bad in ("rm -rf", "rm -fr", "os.system", "subprocess", "socket", "urllib", "requests")):
+                        return Verdict(
+                            DecisionLevel.LOCK,
+                            [f"Dangerous inline script execution in {binary_name}: {normalized[:60]}..."],
+                            cls.NAME,
+                        )
+                    return Verdict(
+                        DecisionLevel.ASK,
+                        [f"Inline interpreter code execution ({binary_name} -c/-e) requires human owner approval"],
+                        cls.NAME,
+                        metadata={"interpreter": binary_name, "command": normalized[:100]},
+                    )
+
+            # Check PowerShell cmdlets and flags
+            if binary_name in {"powershell", "powershell.exe", "pwsh"}:
+                # -Command / -EncodedCommand / -c
+                if any(t.lower() in {"-command", "-c", "-encodedcommand", "-e"} for t in tokens[1:]):
+                    ps_code = " ".join(tokens[2:]).lower()
+                    if "remove-item" in ps_code and ("-recurse" in ps_code or "-r" in ps_code):
+                        # Check target of Remove-Item
+                        for root_target in CATASTROPHIC_ROOTS:
+                            if root_target in ps_code:
+                                return Verdict(
+                                    DecisionLevel.LOCK,
+                                    [f"Catastrophic PowerShell recursive deletion detected: {ps_code[:60]}..."],
+                                    cls.NAME,
+                                )
+                    return Verdict(
+                        DecisionLevel.ASK,
+                        [f"PowerShell inline execution (-Command) requires human owner approval"],
+                        cls.NAME,
+                    )
+                if any(t.lower() in {"format-volume", "clear-disk", "stop-computer", "restart-computer"} for t in tokens[1:]):
+                    return Verdict(DecisionLevel.LOCK, ["Destructive PowerShell system cmdlet blocked"], cls.NAME)
+
             # Check standalone shutdown / reboot
             if binary_name in {"shutdown", "reboot", "poweroff", "init"}:
                 if binary_name == "init" and len(tokens) > 1 and tokens[1] in {"0", "6"}:
                     return Verdict(DecisionLevel.LOCK, ["System shutdown/reboot command blocked"], cls.NAME)
                 elif binary_name in {"shutdown", "reboot", "poweroff"}:
                     return Verdict(DecisionLevel.LOCK, ["System shutdown/reboot command blocked"], cls.NAME)
+
+            # Check git push to external sinks
+            if binary_name == "git" and len(tokens) > 1 and tokens[1] == "push":
+                if any(t.startswith("http://") or t.startswith("https://") or "@" in t for t in tokens[2:]):
+                    return Verdict(
+                        DecisionLevel.ASK,
+                        ["git push to external remote requires human owner approval"],
+                        cls.NAME,
+                    )
 
             # Check recursive rm commands (handles rm -rf, rm -fr, rm -r -f, rm --recursive --force)
             if binary_name == "rm":
@@ -209,9 +300,18 @@ class TartarusClan:
         if re.search(r"\b(curl|wget)\b.*\|\s*(bash|sh|powershell|cmd)\b", normalized, re.IGNORECASE):
             reasons.append("Untrusted remote script piped directly into shell interpreter")
 
-        # 4. Check for embedded URLs to detect SSRF via curl / wget
+        # 4. Check for embedded URLs to detect SSRF or data exfiltration sinks
         urls = re.findall(r"https?://[^\s'\"|;&]+", normalized)
         for u in urls:
+            # Check known exfiltration upload sinks
+            for exfil_host in EXFILTRATION_DOMAINS:
+                if exfil_host in u.lower():
+                    return Verdict(
+                        DecisionLevel.LOCK,
+                        [f"Data exfiltration upload sink blocked: {exfil_host}"],
+                        cls.NAME,
+                        metadata={"sinkUrl": u},
+                    )
             from .custody import CustodyClan
             url_verdict = CustodyClan.inspect_url(u)
             if not url_verdict.passed:

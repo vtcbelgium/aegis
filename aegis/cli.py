@@ -12,8 +12,9 @@ import argparse
 import http.server
 import json
 import os
+import secrets
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from .core import AegisGate, SUPREME_LAW, DecisionLevel
 from .harness import AegisHarness
 from .clans import LabyrinthClan, TartarusClan, CustodyClan
@@ -92,9 +93,10 @@ def run_gate_check(tool_name: str, args_json: str, base_dir: Optional[str] = Non
     return 0 if verdict.passed else 1
 
 
-def run_daemon(port: int = 9999, base_dir: str = ".") -> None:
+def run_daemon(port: int = 9999, base_dir: str = ".", owner_secret: Optional[str] = None) -> None:
     """Run local desktop daemon REST API."""
-    gate = AegisGate(base_dir=base_dir)
+    secret = owner_secret or os.environ.get("AEGIS_OWNER_SECRET") or secrets.token_hex(16)
+    gate = AegisGate(base_dir=base_dir, owner_secret=secret)
     harness = AegisHarness(gate=gate, base_dir=base_dir)
 
     class DaemonHandler(http.server.BaseHTTPRequestHandler):
@@ -128,6 +130,21 @@ def run_daemon(port: int = 9999, base_dir: str = ".") -> None:
                     self.send_response(400)
                     self.end_headers()
                     self.wfile.write(json.dumps({"error": str(e)}).encode())
+            elif self.path == "/reset" or self.path == "/api/reset":
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                try:
+                    payload = json.loads(body)
+                    token = payload.get("owner_token", "")
+                    success = gate.reset_session(token)
+                    self.send_response(200 if success else 403)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"reset": success, "currentLevel": gate.current_level.name}).encode())
+                except Exception as e:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -135,6 +152,8 @@ def run_daemon(port: int = 9999, base_dir: str = ".") -> None:
     print(f"🛡️  Aegis Security Daemon running on http://127.0.0.1:{port}")
     print(f"   - Status: GET  http://127.0.0.1:{port}/status")
     print(f"   - Gate:   POST http://127.0.0.1:{port}/gate")
+    print(f"   - Reset:  POST http://127.0.0.1:{port}/reset")
+    print(f"🔑 Session Owner Secret: {secret}")
     server = http.server.HTTPServer(("127.0.0.1", port), DaemonHandler)
     try:
         server.serve_forever()

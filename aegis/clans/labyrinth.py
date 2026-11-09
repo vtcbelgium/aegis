@@ -15,13 +15,17 @@ from ..core import DecisionLevel, Verdict
 from ..canonicalizer import canonicalize_path, detect_null_bytes, unquote_recursively, normalize_text
 
 
-# High-risk sensitive operating system paths and credential files
+# High-risk sensitive operating system paths, shell startup scripts, and credential files
 SENSITIVE_PATH_PATTERNS = [
     r"(?:^|[/\\])etc[/\\](?:passwd|shadow|sudoers|master\.passwd)",
     r"(?:^|[/\\])windows[/\\]system32[/\\](?:config[/\\]sam|drivers[/\\]etc[/\\]hosts)?",
     r"(?:^|[/\\])system32[/\\]config[/\\]sam\b",
     r"(?:^|[/\\])sam(?:\.hive)?$",
     r"(?:^|[/\\])(?:\.ssh|\.aws|\.gnupg)[/\\]",
+    r"(?:^|[/\\])\.config[/\\]autostart\b",
+    r"(?:^|[/\\])\.(?:bashrc|zshrc|profile|bash_profile|bash_history)$",
+    r"(?:^|[/\\])\.env(?:\.[a-zA-Z0-9_-]+)?$",
+    r"(?:^|[/\\])\.gitconfig$",
     r"(?:^|[/\\])proc[/\\](?:kcore|self[/\\]environ)",
     r"(?:^|[/\\])dev[/\\](?:mem|kmem)",
 ]
@@ -62,10 +66,11 @@ class LabyrinthClan:
             reasons.append("Relative path traversal sequence (..) detected")
             return Verdict(DecisionLevel.DENY, reasons, cls.NAME, metadata={"target": path_input})
 
-        # 5. Sensitive OS files target check -> Immediate DENY (or LOCK for shadow/credentials)
+        # 5. Sensitive OS files target check -> Immediate DENY
         lower_norm = normalized.lower().replace("\\", "/")
+        expanded = os.path.expanduser(normalized).lower().replace("\\", "/")
         for pat in SENSITIVE_PATH_PATTERNS:
-            if re.search(pat, lower_norm):
+            if re.search(pat, lower_norm) or re.search(pat, expanded):
                 reasons.append(f"Target references sensitive operating system file or directory ({pat})")
                 return Verdict(
                     DecisionLevel.DENY,

@@ -22,7 +22,7 @@ import os
 import threading
 import time
 from enum import IntEnum
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 
 class DecisionLevel(IntEnum):
@@ -88,6 +88,7 @@ class AegisGate:
         owner_secret: Optional[str] = None,
         max_violations_per_minute: int = 3,
         violation_window_seconds: float = 60.0,
+        approval_callback: Optional[Callable[[Verdict], bool]] = None,
     ) -> None:
         if strict_mode and base_dir is None:
             self.base_dir = os.path.abspath(os.getcwd())
@@ -97,8 +98,10 @@ class AegisGate:
         self.strict_mode = strict_mode
         self.max_violations_per_minute = max_violations_per_minute
         self.violation_window_seconds = violation_window_seconds
+        self.approval_callback = approval_callback
         self._current_level: DecisionLevel = DecisionLevel.PASS
         self._audit_log: List[Verdict] = []
+        self._pending_approvals: List[Verdict] = []
         self._violation_timestamps: Deque[float] = collections.deque()
         self._lock = threading.Lock()
         self._owner_token_hash = (
@@ -129,12 +132,34 @@ class AegisGate:
             with self._lock:
                 self._current_level = DecisionLevel.PASS
                 self._violation_timestamps.clear()
+                self._pending_approvals.clear()
             return True
         return False
 
-    def record(self, verdict: Verdict) -> Verdict:
-        """Record verdict and apply monotonic escalation and rapid-violation brake."""
+    def get_pending_approvals(self) -> List[Dict[str, Any]]:
+        """List sensitive actions currently awaiting human owner approval."""
         with self._lock:
+            return [v.to_dict() for v in self._pending_approvals]
+
+    def record(self, verdict: Verdict) -> Verdict:
+        """Record verdict, apply human approval callback if ASK, and enforce escalation poset."""
+        with self._lock:
+            # Route ASK verdicts through approval callback if configured (Tekton human-in-the-loop)
+            if verdict.level == DecisionLevel.ASK and self.approval_callback:
+                try:
+                    if self.approval_callback(verdict):
+                        verdict = Verdict(
+                            DecisionLevel.PASS,
+                            [f"Approved by human owner: {'; '.join(verdict.reasons)}"],
+                            verdict.clan,
+                            metadata={**verdict.metadata, "approved": True},
+                        )
+                except Exception:
+                    pass
+
+            if verdict.level == DecisionLevel.ASK and not verdict.metadata.get("approved"):
+                self._pending_approvals.append(verdict)
+
             self._audit_log.append(verdict)
             if verdict.level >= DecisionLevel.WARN:
                 now = time.time()
@@ -156,6 +181,7 @@ class AegisGate:
                 "currentLevel": self._current_level.name,
                 "currentLevelValue": int(self._current_level),
                 "totalEvaluations": len(self._audit_log),
+                "pendingApprovals": len(self._pending_approvals),
                 "violationsRecorded": sum(1 for v in self._audit_log if v.level >= DecisionLevel.WARN),
                 "history": [v.to_dict() for v in self._audit_log[-20:]],
             }

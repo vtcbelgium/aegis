@@ -2,14 +2,28 @@
 
 Intercepts MCP JSON-RPC requests (tools/call) and validates arguments
 against the Aegis Negative Gate before routing them to the upstream MCP server.
+Also inspects tool responses for indirect prompt injection and leaked credentials.
 """
 
 from __future__ import annotations
 
-import json
+import os
+import re
+import secrets
 from typing import Any, Dict, Optional, Tuple
 from .core import AegisGate, DecisionLevel, Verdict
 from .harness import AegisHarness
+from .clans import CustodyClan
+
+
+INDIRECT_INJECTION_PATTERNS = [
+    r"(?i)ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions",
+    r"(?i)system\s+prompt\s*:",
+    r"(?i)you\s+are\s+now\s+in\s+(?:dan|developer|god|unrestricted)\s+mode",
+    r"(?i)new\s+instructions\s+follow\s*:",
+    r"(?i)(?:call|execute)\s+tool\s+(?:execute_bash|run_command|write_file|delete_file)",
+    r"!\[.*?\]\(https?://[^\s'\"|;&]+(?:\?|&)(?:token|cookie|auth|leak|key)=",
+]
 
 
 class AegisMcpProxy:
@@ -21,8 +35,19 @@ class AegisMcpProxy:
         base_dir: Optional[str] = None,
         strict_mode: bool = False,
         fail_closed: bool = True,
+        owner_secret: Optional[str] = None,
     ) -> None:
-        self.gate = gate or AegisGate(base_dir=base_dir, strict_mode=strict_mode, fail_closed=fail_closed)
+        secret = owner_secret or os.environ.get("AEGIS_OWNER_SECRET")
+        if not secret:
+            secret = secrets.token_hex(16)
+        self.owner_secret = secret
+
+        self.gate = gate or AegisGate(
+            base_dir=base_dir,
+            strict_mode=strict_mode,
+            fail_closed=fail_closed,
+            owner_secret=self.owner_secret,
+        )
         self.harness = AegisHarness(gate=self.gate, base_dir=self.gate.base_dir)
 
     def filter_request(self, rpc_request: Any) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Verdict]]:
@@ -39,14 +64,31 @@ class AegisMcpProxy:
             params = rpc_request.get("params")
             request_id = rpc_request.get("id")
 
-            if params is not None and not isinstance(params, dict):
-                raise ValueError("RPC params must be a dictionary")
-            params = params or {}
-
-            # We only need to gate active tool invocations
             if method == "tools/call":
+                if not isinstance(params, dict):
+                    raise ValueError("RPC params must be a dictionary")
+
                 tool_name = params.get("name", "unknown")
-                arguments = params.get("arguments", {})
+                arguments = params.get("arguments")
+
+                # The MCP specification strictly requires arguments to be a JSON object
+                if not isinstance(arguments, dict):
+                    verdict = self.gate.record(
+                        Verdict(
+                            DecisionLevel.DENY,
+                            ["MCP protocol violation: 'arguments' parameter must be a dictionary object"],
+                            "McpProxyGuard",
+                        )
+                    )
+                    error_response = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Invalid params: 'arguments' must be a JSON object",
+                        },
+                    }
+                    return False, error_response, verdict
 
                 verdict = self.harness.evaluate_tool_call(tool_name, arguments)
                 if not verdict.passed:
@@ -108,15 +150,36 @@ class AegisMcpProxy:
                     for item in content_list:
                         if isinstance(item, dict) and item.get("type") == "text":
                             text = item.get("text", "")
-                            # Check for leaked credentials
-                            sec_verdict = self.harness.gate.record(
-                                self.harness.gate.record(
-                                    __import__("aegis.clans.custody", fromlist=["CustodyClan"]).CustodyClan.inspect_secrets(text)
-                                )
-                            )
+
+                            # 1. Check for indirect prompt injection signatures
+                            for pattern in INDIRECT_INJECTION_PATTERNS:
+                                if re.search(pattern, text):
+                                    inj_verdict = self.gate.record(
+                                        Verdict(
+                                            DecisionLevel.DENY,
+                                            [f"Indirect prompt injection attempt neutralized: {pattern}"],
+                                            "McpResponseGuard",
+                                        )
+                                    )
+                                    item["text"] = "[REDACTED BY AEGIS: Untrusted indirect prompt injection stripped]"
+                                    return False, rpc_response, inj_verdict
+
+                            # 2. Check for leaked credentials in tool output (single atomic record)
+                            sec_verdict = CustodyClan.inspect_secrets(text)
                             if not sec_verdict.passed:
+                                recorded = self.gate.record(sec_verdict)
                                 item["text"] = "[REDACTED BY AEGIS: Leaked credentials stripped from tool response]"
-                                return False, rpc_response, sec_verdict
+                                return False, rpc_response, recorded
+
             return True, None, None
-        except Exception:
+        except Exception as exc:
+            if self.gate.fail_closed:
+                lock_v = self.gate.record(
+                    Verdict(
+                        DecisionLevel.LOCK,
+                        [f"Response filter crashed (fail closed): {exc}"],
+                        "McpResponseGuard",
+                    )
+                )
+                return False, None, lock_v
             return True, None, None

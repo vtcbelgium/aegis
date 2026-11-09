@@ -9,6 +9,7 @@ Invariants:
 from __future__ import annotations
 
 import collections
+import threading
 import time
 from typing import Deque, Dict, List, Optional
 from ..core import DecisionLevel, Verdict
@@ -28,53 +29,56 @@ class HecatoncheiresClan:
         self.max_violations = max_violations_per_minute
         self.loop_threshold = loop_threshold
         self.window_seconds = window_seconds
+        self._lock = threading.Lock()
         self._violation_timestamps: Deque[float] = collections.deque()
         self._action_history: Deque[tuple[str, float]] = collections.deque()
 
     def record_violation(self) -> Verdict:
-        now = time.time()
-        self._violation_timestamps.append(now)
+        with self._lock:
+            now = time.time()
+            self._violation_timestamps.append(now)
 
-        # Evict timestamps older than window
-        while self._violation_timestamps and (now - self._violation_timestamps[0] > self.window_seconds):
-            self._violation_timestamps.popleft()
+            # Evict timestamps older than window
+            while self._violation_timestamps and (now - self._violation_timestamps[0] > self.window_seconds):
+                self._violation_timestamps.popleft()
 
-        if len(self._violation_timestamps) >= self.max_violations:
+            if len(self._violation_timestamps) >= self.max_violations:
+                return Verdict(
+                    DecisionLevel.LOCK,
+                    [
+                        f"Rapid escalation brake tripped: {len(self._violation_timestamps)} violations "
+                        f"within {self.window_seconds}s. Agent session quarantined."
+                    ],
+                    self.NAME,
+                    metadata={"violationsInWindow": len(self._violation_timestamps)},
+                )
+
             return Verdict(
-                DecisionLevel.LOCK,
-                [
-                    f"Rapid escalation brake tripped: {len(self._violation_timestamps)} violations "
-                    f"within {self.window_seconds}s. Agent session quarantined."
-                ],
+                DecisionLevel.WARN,
+                [f"Violation recorded ({len(self._violation_timestamps)} in current window)"],
                 self.NAME,
-                metadata={"violationsInWindow": len(self._violation_timestamps)},
             )
-
-        return Verdict(
-            DecisionLevel.WARN,
-            [f"Violation recorded ({len(self._violation_timestamps)} in current window)"],
-            self.NAME,
-        )
 
     def inspect_loop(self, action_signature: str) -> Verdict:
-        now = time.time()
-        self._action_history.append((action_signature, now))
+        with self._lock:
+            now = time.time()
+            self._action_history.append((action_signature, now))
 
-        # Evict old history
-        while self._action_history and (now - self._action_history[0][1] > self.window_seconds):
-            self._action_history.popleft()
+            # Evict old history
+            while self._action_history and (now - self._action_history[0][1] > self.window_seconds):
+                self._action_history.popleft()
 
-        # Count occurrences of the same action signature
-        matches = sum(1 for sig, _ in self._action_history if sig == action_signature)
-        if matches >= self.loop_threshold:
-            return Verdict(
-                DecisionLevel.DENY,
-                [
-                    f"Runaway loop detected: action '{action_signature}' executed {matches} times "
-                    f"in {self.window_seconds}s. Emergency brake applied to prevent token depletion."
-                ],
-                self.NAME,
-                metadata={"action": action_signature, "occurrences": matches},
-            )
+            # Count occurrences of the same action signature
+            matches = sum(1 for sig, _ in self._action_history if sig == action_signature)
+            if matches >= self.loop_threshold:
+                return Verdict(
+                    DecisionLevel.DENY,
+                    [
+                        f"Runaway loop detected: action '{action_signature}' executed {matches} times "
+                        f"in {self.window_seconds}s. Emergency brake applied to prevent token depletion."
+                    ],
+                    self.NAME,
+                    metadata={"action": action_signature, "occurrences": matches},
+                )
 
-        return Verdict(DecisionLevel.PASS, ["Execution cadence normal"], self.NAME)
+            return Verdict(DecisionLevel.PASS, ["Execution cadence normal"], self.NAME)

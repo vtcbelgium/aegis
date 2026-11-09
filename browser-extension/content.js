@@ -43,18 +43,13 @@
 
   function quarantineElement(el, reason, wasHidden) {
     quarantinedThreats++;
-    console.warn(`[Aegis AI Shield] BLOCKED threat: ${reason}`);
+    console.warn(`[Aegis AI Shield] NEUTRALIZED threat: ${reason}`);
 
-    // Neutralize the threat text
+    // Completely neutralize threat so browsing agents cannot read the malicious prompt
     el.setAttribute("data-aegis-quarantined", "true");
-    el.style.border = "2px dashed #ef4444";
-    el.style.backgroundColor = "rgba(239, 68, 68, 0.15)";
-    el.style.color = "#ef4444";
-    el.style.fontSize = "11px";
-    el.style.display = "block";
-    el.style.visibility = "visible";
-    el.style.opacity = "1";
-    el.title = `🛡️ Aegis Blocked: ${reason}`;
+    el.textContent = "[REDACTED BY AEGIS: In-page prompt injection neutralized]";
+    el.style.display = "none";
+    el.style.visibility = "hidden";
 
     // Send threat notification to extension storage
     if (chrome.runtime?.sendMessage) {
@@ -67,6 +62,18 @@
           timestamp: new Date().toISOString()
         }
       }).catch(() => {});
+    }
+  }
+
+  // Intercept and drop tracking/exfiltration image beacons
+  function scanBeacons() {
+    const images = document.querySelectorAll("img, link[rel='prefetch'], link[rel='prerender']");
+    for (const img of images) {
+      const src = img.src || img.href || "";
+      if (src && /(?:\?|&)(?:cookie|auth|token|leak|keys|session)=/i.test(src)) {
+        console.warn(`[Aegis AI Shield] BLOCKED exfiltration beacon: ${src}`);
+        img.remove();
+      }
     }
   }
 

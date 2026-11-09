@@ -90,31 +90,52 @@ class AegisHarness:
             # Recursively walk every argument in the structure
             extracted_items = walk_arguments(arguments)
 
+            # Keys that explicitly carry file content, code, or documentation
+            CONTENT_KEYS = (
+                "content", "text", "body", "data", "patch", "new_string", "old_string",
+                "code", "script_content", "prompt", "message", "diff", "doc", "readme",
+                "replacement", "file_content", "description", "target_content"
+            )
+
             for key_path, val in extracted_items:
                 clean_key = key_path.lower()
+                is_content_key = any(ck in clean_key for ck in CONTENT_KEYS)
 
                 # 3. Path inspection (covers path, file_path, source, destination, paths[0], etc.)
-                is_path_key = any(
-                    k in clean_key
-                    for k in ("path", "file", "target", "dir", "source", "dest", "destination", "folder")
+                # Content fields (code, markdown, text) are strictly exempt from path inspection
+                # to prevent relative imports ('../lib'), JS rest params ('...args'), and loading dots from false-positive locking.
+                is_path_key = (
+                    not is_content_key
+                    and any(
+                        k in clean_key
+                        for k in ("path", "file_path", "filename", "filepath", "target", "dir", "source", "dest", "destination", "folder", "paths")
+                    )
                 )
                 looks_like_path = (
-                    val.startswith(("/", "\\", "~", "..", "."))
-                    or (len(val) > 1 and val[1] == ":")
-                    or "/" in val
-                    or "\\" in val
+                    not is_content_key
+                    and "\n" not in val
+                    and len(val) < 2048
+                    and not any(c in val for c in (";", "{", "}", "(", ")", "="))
+                    and (
+                        val.startswith(("/", "\\", "~", "..", "."))
+                        or (len(val) > 1 and val[1] == ":")
+                    )
                 )
                 if is_path_key or looks_like_path:
                     path_verdict = LabyrinthClan.inspect_path(val, base_dir=self.base_dir)
                     if not path_verdict.passed:
                         return self.gate.record(path_verdict)
 
-                # 4. Command inspection for bash/shell execution tools
+                # 4. Command inspection for bash/shell execution tools and interactive processes
+                is_interactive_tool = any(
+                    it in tool_name.lower()
+                    for it in ("interact_with_process", "send_input", "write_process", "terminal", "stdin")
+                )
                 is_cmd_key = any(
                     k in clean_key
-                    for k in ("command", "cmd", "script", "bash", "shell", "exec", "run")
+                    for k in ("command", "cmd", "script", "bash", "shell", "exec", "run", "input", "stdin", "interactive_input")
                 )
-                if is_cmd_key:
+                if is_cmd_key or (is_interactive_tool and not is_content_key):
                     cmd_verdict = TartarusClan.inspect_command(val, base_dir=self.base_dir)
                     if not cmd_verdict.passed:
                         return self.gate.record(cmd_verdict)
