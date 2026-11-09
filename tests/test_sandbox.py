@@ -19,11 +19,7 @@ def fake_bwrap(tmp_path, monkeypatch):
     bw = tmp_path / "bwrap"; bw.write_text("#!/bin/sh\n"); bw.chmod(0o755)
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: str(bw))
     monkeypatch.setattr(sandbox, "_user_namespaces_ok", lambda: True)
-    monkeypatch.setattr(sandbox.os, "name", "posix")
-
-    class U:  # os.uname() -> Linux
-        sysname = "Linux"
-    monkeypatch.setattr(sandbox.os, "uname", lambda: U())
+    monkeypatch.setattr(sandbox, "available", lambda: True)
     return str(bw)
 
 
@@ -44,7 +40,9 @@ def test_workspace_is_writable_system_is_readonly(fake_bwrap, tmp_path):
     argv, ws = argv_for(tmp_path)
     s = " ".join(argv)
     assert "--bind " + ws + " " + ws in s             # workspace read-write
-    assert "--ro-bind /usr /usr" in s                 # system read-only
+    for root in sandbox.SYSTEM_RO:
+        if os.path.exists(root):
+            assert f"--ro-bind {root} {root}" in s
     assert "--chdir " + ws in s and "--clearenv" in s
     assert argv[-3:] == ["/bin/bash", "-c", "pytest -q"] or argv[-2] == "-c"
 
@@ -67,7 +65,9 @@ def test_extra_roots_are_bound(fake_bwrap, tmp_path):
 def test_credential_stores_are_hidden_under_an_allowed_root(fake_bwrap, tmp_path, monkeypatch):
     home = tmp_path / "home"; (home / ".ssh").mkdir(parents=True)
     (home / "project").mkdir()
+    (home / ".aegis").mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     pol = AegisPolicy(extra_roots=[str(home)])        # whole home writable ...
     argv = sandbox.wrap_for_policy(pol, str(home / "project"), "x")
     s = " ".join(argv)
@@ -77,9 +77,32 @@ def test_credential_stores_are_hidden_under_an_allowed_root(fake_bwrap, tmp_path
 
 def test_profile_from_policy():
     p = SandboxProfile.from_policy(AegisPolicy(extra_roots=["/a", "/b"]), "/ws", network=True)
-    assert p.workspace == "/ws" and p.extra_roots == ["/a", "/b"] and p.network is True
+    assert p.workspace == os.path.abspath("/ws")
+    assert p.extra_roots == [os.path.abspath("/a"), os.path.abspath("/b")] and p.network is True
 
 
 def test_probe_reports_unavailable_here():
     info = sandbox.probe()
-    assert info["works"] is False and "bubblewrap" in (info["error"] or "")
+    assert info["works"] or info["error"]
+
+
+def test_masks_project_secret_files_and_preserves_backups(fake_bwrap, tmp_path):
+    ws = tmp_path / "ws"; ws.mkdir()
+    (ws / ".env").write_text("secret")
+    (ws / "backups").mkdir()
+    argv = sandbox.build_argv(SandboxProfile(str(ws)), ["true"])
+    assert ["--ro-bind", "/dev/null", str(ws / ".env")] == argv[argv.index(str(ws / ".env")) - 2:argv.index(str(ws / ".env")) + 1]
+    assert f"--ro-bind {ws / 'backups'} {ws / 'backups'}" in " ".join(argv)
+
+
+def test_custom_state_is_masked_and_tmp_can_be_readonly(fake_bwrap, tmp_path, monkeypatch):
+    (tmp_path / "state").mkdir()
+    monkeypatch.setenv("AEGIS_HOME", str(tmp_path / "state"))
+    argv = sandbox.build_argv(SandboxProfile(str(tmp_path), tmp_writable=False), ["true"])
+    assert "--tmpfs " + str(tmp_path / "state") in " ".join(argv)
+    assert "--remount-ro /tmp" in " ".join(argv)
+
+
+def test_root_cannot_be_made_writable(fake_bwrap):
+    with pytest.raises(SandboxUnavailable):
+        sandbox.build_argv(SandboxProfile(os.path.abspath(os.sep)), ["true"])

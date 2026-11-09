@@ -54,8 +54,10 @@ def measure(target: str, max_entries: int = 100, max_bytes: int = 500 * 1024 * 1
     complete = True
     try:
         st = os.lstat(target)
-    except OSError:
+    except FileNotFoundError:
         return Impact(target, 0, 0, False, True)
+    except OSError:
+        return Impact(target, 0, 0, False, False)
     entries = 1
     if not os.path.isdir(target) or os.path.islink(target) or not recursive:
         size = st.st_size if not os.path.isdir(target) else 0

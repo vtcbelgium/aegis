@@ -132,6 +132,8 @@ def check_path(abs_path: str, mode: str, policy) -> Optional[Tuple[str, str, str
         return None
     changing = mode in ("write", "delete")
     root = _any_inside(abs_path, control_paths(policy))
+    if changing and root is None:
+        root = next((p for p in control_paths(policy) if _inside(p, abs_path)), None)
     if root is not None:
         if changing:
             return POLICY_TAMPER, "LOCK", f"Hard boundary {POLICY_TAMPER}: changes Aegis's own policy, state or code ({abs_path})"

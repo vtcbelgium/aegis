@@ -618,10 +618,10 @@ def _blast_radius(ctx: _Ctx, abs_path: str, raw: str, recursive: bool) -> None:
     if looks_windows_path(abs_path) and os.name != "nt":
         return
     imp = _impact.measure_delete(abs_path, recursive, ctx.policy.blast_max_entries, ctx.policy.blast_max_bytes)
-    if imp.entries == 0:
+    if imp.entries == 0 and imp.complete:
         return
     ctx.impact.append(imp.to_dict())
-    if imp.exceeded:
+    if imp.exceeded or not imp.complete:
         _add(ctx, L.ASK, f"Deletes {_impact.describe(imp)} in {raw} (more than {ctx.policy.blast_max_entries} items "
                          f"or {_impact.human_bytes(ctx.policy.blast_max_bytes)}: owner approval)")
 

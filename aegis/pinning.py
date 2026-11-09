@@ -36,7 +36,9 @@ def _digest(value: Any) -> str:
 def tool_fingerprint(tool: Dict[str, Any]) -> str:
     """Stable digest of the parts of a tool definition that change its behaviour."""
     return _digest({"name": tool.get("name"), "description": tool.get("description") or "",
-                    "inputSchema": tool.get("inputSchema") or tool.get("input_schema") or {}})
+                    "inputSchema": tool.get("inputSchema") or tool.get("input_schema") or {},
+                    "outputSchema": tool.get("outputSchema") or {},
+                    "annotations": tool.get("annotations") or {}})
 
 
 @dataclass
@@ -66,11 +68,11 @@ class ToolPins:
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
-                if isinstance(d, dict) and d.get("schema") == SCHEMA:
+                if isinstance(d, dict) and d.get("schema") == SCHEMA and isinstance(d.get("servers"), dict):
                     return d
-        except (OSError, ValueError):
-            pass
-        return {"schema": SCHEMA, "servers": {}}
+        except FileNotFoundError:
+            return {"schema": SCHEMA, "servers": {}}
+        raise ValueError("Invalid tool pin registry")
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -94,6 +96,8 @@ class ToolPins:
 
     def check(self, server: str, tools: List[Dict[str, Any]]) -> List[Change]:
         """Compare a server's current tools against what was pinned. Does not modify state."""
+        self._data = self._load()
+        self._validate_tools(server, tools)
         changes: List[Change] = []
         rec = self._data["servers"].get(server)
         current = {t.get("name", f"tool{i}"): tool_fingerprint(t) for i, t in enumerate(tools)}
@@ -128,11 +132,27 @@ class ToolPins:
 
     def pin(self, server: str, tools: List[Dict[str, Any]]) -> None:
         """Accept a server's current tools as trusted (first run, or after you reviewed a change)."""
-        self._data["servers"][server] = {
-            "tools": {t.get("name", f"tool{i}"): tool_fingerprint(t) for i, t in enumerate(tools)},
-            "pinnedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        self._save()
+        from .ledger import _FileLock
+        self._validate_tools(server, tools)
+        with _FileLock(self.path):
+            self._data = self._load()
+            self._data["servers"][server] = {
+                "tools": {t["name"]: tool_fingerprint(t) for t in tools},
+                "pinnedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            self._save()
+
+    @staticmethod
+    def _validate_tools(server, tools):
+        if not isinstance(server, str) or not server.strip() or not isinstance(tools, list):
+            raise ValueError("Server name and a tool list are required")
+        names = set()
+        for tool in tools:
+            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not tool["name"]:
+                raise ValueError("Invalid tool definition")
+            if tool["name"] in names:
+                raise ValueError("Duplicate tool name")
+            names.add(tool["name"])
 
     def pin_if_new(self, server: str, tools: List[Dict[str, Any]]) -> List[Change]:
         """Check, and pin automatically only when the server is brand new. Returns changes."""

@@ -215,6 +215,15 @@ class AegisHarness:
                 url = val if "://" in val else ("http://" + val if role == URL and "." in val and " " not in val else "")
                 if url:
                     worse(CustodyClan.inspect_url(url))
+                    from urllib.parse import urlparse
+                    host = urlparse(url).hostname or ""
+                    if effects is not None:
+                        effects.add("fetch")
+                        if not self.policy.host_allowed(host):
+                            effects.add("egress")
+                    if not self.policy.host_allowed(host):
+                        worse(Verdict(DecisionLevel.ASK,
+                                      [f"Network access outside the allowlist: {host}"], "Custody"))
         if role in (PATH_READ, PATH_WRITE):
             if tool_name == "read_file" and looks_like_url(val):
                 worse(CustodyClan.inspect_url(val))

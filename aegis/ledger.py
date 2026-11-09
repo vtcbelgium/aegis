@@ -49,6 +49,8 @@ def redact(text: Any, limit: int = MAX_SUMMARY) -> str:
     """Mask credentials and long opaque tokens; never let a raw secret reach the ledger."""
     from .clans.custody import CRITICAL_SECRET_SIGNATURES, MILD_SECRET_SIGNATURES
     s = str(text if text is not None else "")
+    s = re.sub(r"-----BEGIN (?:[A-Z0-9_-]+ )?PRIVATE KEY-----.*?"
+               r"-----END (?:[A-Z0-9_-]+ )?PRIVATE KEY-----", "[PRIVATE KEY]", s, flags=re.S)
     for pattern, _label in CRITICAL_SECRET_SIGNATURES + MILD_SECRET_SIGNATURES:
         s = re.sub(pattern, "[SECRET]", s)
     s = _GENERIC_TOKEN.sub(lambda m: m.group(0)[:4] + "…[" + str(len(m.group(0))) + "]", s)
@@ -90,7 +92,8 @@ class _FileLock:
                 import fcntl
                 fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         except Exception:
-            pass
+            self._fh.close()
+            raise
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -169,7 +172,8 @@ class DecisionLedger:
                 return None
         except OSError:
             return None
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        import uuid
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex
         root, ext = os.path.splitext(self.path)
         rotated = f"{root}.{stamp}{ext or '.jsonl'}"
         os.replace(self.path, rotated)
@@ -199,7 +203,7 @@ class DecisionLedger:
 
     def record(self, verdict: Verdict, *, tool: Optional[str] = None, arguments: Any = None,
                approved: bool = False, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Write one verdict (if at or above min_level). Never raises."""
+        """Write a verdict. Logging failures must stop an enforcing caller."""
         try:
             if verdict.level < self.min_level and not approved:
                 return None
@@ -221,9 +225,18 @@ class DecisionLedger:
                 binary = _binary_of(arguments)
                 if binary:
                     entry["binary"] = binary
+            def scrub(value):
+                if isinstance(value, str):
+                    return redact(value, 4096)
+                if isinstance(value, dict):
+                    return {redact(k): scrub(v) for k, v in value.items()}
+                if isinstance(value, (list, tuple)):
+                    return [scrub(v) for v in value]
+                return value
+            entry = {key: (value if key == "argsDigest" else scrub(value)) for key, value in entry.items()}
             return self.append(entry)
-        except Exception:
-            return None
+        except Exception as exc:
+            raise OSError("Aegis decision could not be recorded") from exc
 
     # -- reading -------------------------------------------------------------
 
@@ -238,8 +251,8 @@ class DecisionLedger:
                 out.pop(0)
         return out
 
-    def verify(self) -> VerifyResult:
-        return verify(self.path)
+    def verify(self, *, expected_tip: Optional[str] = None) -> VerifyResult:
+        return verify(self.path, expected_tip=expected_tip)
 
 
 def _binary_of(arguments: Any) -> Optional[str]:
@@ -264,7 +277,7 @@ def iter_entries(path: str) -> Iterator[Dict[str, Any]]:
         return
 
 
-def verify(path: str, expect_previous: Optional[str] = None) -> VerifyResult:
+def verify(path: str, expect_previous: Optional[str] = None, *, expected_tip: Optional[str] = None) -> VerifyResult:
     """Check that every line's digest is right and points at the line before it.
 
     A rotated-in file starts from the previous file's tip; pass that as expect_previous to
@@ -273,6 +286,8 @@ def verify(path: str, expect_previous: Optional[str] = None) -> VerifyResult:
     previous = expect_previous
     count = 0
     for count, ev in enumerate(iter_entries(path), start=1):
+        if not isinstance(ev, dict):
+            return VerifyResult(False, count, "line is not an event object", count)
         if "_unparseable" in ev:
             return VerifyResult(False, count, "line is not valid JSON", count)
         claimed = ev.get("eventDigest")
@@ -285,7 +300,10 @@ def verify(path: str, expect_previous: Optional[str] = None) -> VerifyResult:
         if previous is not None and ev.get("previousDigest") != previous:
             return VerifyResult(False, count, "chain broken: a line before this one was removed, added or reordered", count)
         previous = claimed
-    return VerifyResult(True, count, None, None, previous or ZERO_DIGEST)
+    tip = previous or ZERO_DIGEST
+    if expected_tip is not None and tip != expected_tip:
+        return VerifyResult(False, count, "tip does not match trusted checkpoint (possible tail truncation)", count, tip)
+    return VerifyResult(True, count, None, None, tip)
 
 
 def default_ledger_path() -> str:

@@ -205,11 +205,11 @@ def run_minotaur(action: str, workspace: Optional[str]) -> int:
     return 0
 
 
-def run_ledger(action: str, n: int) -> int:
+def run_ledger(action: str, n: int, expected_tip: Optional[str] = None) -> int:
     from .ledger import DecisionLedger, default_ledger_path
     led = DecisionLedger(default_ledger_path())
     if action == "verify":
-        r = led.verify()
+        r = led.verify(expected_tip=expected_tip)
         print(f"{'OK' if r.ok else 'FAILED'}: {r.count} entries"
               + ("" if r.ok else f"; {r.problem} at line {r.line}"))
         return 0 if r.ok else 1
@@ -230,12 +230,10 @@ def run_sandbox(action: str, command: Optional[str], base_dir: Optional[str]) ->
             return 1
         ws = base_dir or os.getcwd()
         try:
-            argv = sandbox.wrap_for_policy(_policy_from_env(), ws, command)
+            return sandbox.run(sandbox.SandboxProfile.from_policy(_policy_from_env(), ws), command).returncode
         except sandbox.SandboxUnavailable as exc:
             print(f"Sandbox unavailable: {exc}", file=sys.stderr)
             return 3
-        import subprocess
-        return subprocess.run(argv).returncode
     return 1
 
 
@@ -288,16 +286,15 @@ def run_hook(post: bool = False, fmt: str = "claude") -> int:
     """Vendor-neutral agent hook. Reads one tool call (or tool result) as JSON on stdin."""
     from .integrations import generic
     from .integrations.claude_code import run_posttooluse, _read_event
-    event = _read_event()
-    if post or event.get("hook_event_name") == "PostToolUse":
-        # Output scan (decoy canaries) uses the host's post shape; delegate for claude, else json.
-        return run_posttooluse(event)
     try:
-        d = generic.evaluate(event.get("tool_name") or "", event.get("tool_input") or {},
+        event = _read_event()
+        if post or event.get("hook_event_name") == "PostToolUse":
+            return run_posttooluse(event, fmt=fmt)
+        d = generic.evaluate(event.get("tool_name") or "", event.get("tool_input", {}),
                              cwd=event.get("cwd"), session_id=event.get("session_id") or "default")
     except Exception as exc:   # fail closed: ask a human rather than silently allow
-        d = generic.HookDecision("ask", f"Aegis could not evaluate this call ({type(exc).__name__}); approve manually.",
-                                 "ASK", None)
+        d = generic.HookDecision("deny", f"Aegis could not evaluate this call ({type(exc).__name__}).",
+                                 "LOCK", None)
     out, code = generic.render(d, fmt=fmt)
     if out:
         (sys.stderr if fmt == "exit" else sys.stdout).write(out + "\n")
@@ -323,6 +320,7 @@ def main() -> None:
 
     lp = sub.add_parser("ledger", help="Decision ledger: tail or verify")
     lp.add_argument("action", choices=["tail", "verify"]); lp.add_argument("-n", type=int, default=20)
+    lp.add_argument("--expect-tip", default=None, help="Trusted external digest to detect removed tail entries")
 
     spn = sub.add_parser("sandbox", help="Confinement: probe the host or run a command confined")
     spn.add_argument("action", choices=["probe", "run"]); spn.add_argument("command", nargs="?")
@@ -352,7 +350,7 @@ def main() -> None:
     elif args.subcommand == "minotaur":
         sys.exit(run_minotaur(args.action, args.workspace))
     elif args.subcommand == "ledger":
-        sys.exit(run_ledger(args.action, args.n))
+        sys.exit(run_ledger(args.action, args.n, args.expect_tip))
     elif args.subcommand == "sandbox":
         sys.exit(run_sandbox(args.action, args.command, args.base_dir))
     elif args.subcommand == "pin":

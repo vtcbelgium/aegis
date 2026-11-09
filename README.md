@@ -1,7 +1,7 @@
 # 🛡️ Aegis — a deterministic security gate and firewall for AI agents
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-282%20passing-brightgreen.svg)]()
+[![Security regression](https://github.com/vtcbelgium/aegis/actions/workflows/tests.yml/badge.svg)](https://github.com/vtcbelgium/aegis/actions/workflows/tests.yml)
 [![No LLM](https://img.shields.io/badge/decisions-deterministic%2C%20zero%20tokens-blueviolet.svg)]()
 [![Model-agnostic](https://img.shields.io/badge/works%20with-any%20AI-success.svg)]()
 
@@ -15,7 +15,7 @@ every time.
 
 **It works with any agent.** The engine knows nothing about which model or product is calling.
 Use it through the MCP proxy (any MCP client — Claude, ChatGPT, Cursor, local models), the
-Python harness (any agent loop), a Claude Code / Gemini CLI / Copilot CLI hook, or the `aegis`
+Python harness (any agent loop), a host hook adapter, or the `aegis`
 command line. No integration is a dependency of the others.
 
 ---
@@ -71,8 +71,9 @@ fools the judge. Aegis never negotiates with a model:
 - **Aegis protects itself.** Six hard-boundary classes always LOCK: tampering with Aegis's own
   policy/state, disabling security logs, destroying backups or recovery data, stopping or
   killing the guard, extracting master secrets, and destroying the system.
-- **Decision ledger.** Every decision is one hash-chained, secret-free JSON line. `aegis ledger
-  verify` detects any edited, removed or reordered entry.
+- **Decision ledger.** Every hook decision is a hash-chained JSON line with recognized secrets
+  redacted. `aegis ledger verify` detects edits and broken links. To detect removal of complete
+  tail entries, compare against a digest you stored separately using `--expect-tip DIGEST`.
 - **Blast radius.** A delete is measured before it runs; above 100 items or 500 MB the owner
   decides, and the reason says how much. Destructive git (`reset --hard`, `clean -f`, forced
   push, `branch -D`, …) asks too.
@@ -115,7 +116,7 @@ verdict = harness.evaluate_tool_call("start_process", {"command": "rm -rf /"})
 # verdict.level == DecisionLevel.LOCK
 ```
 
-**Claude Code / Gemini CLI / Copilot CLI** — add one hook (covers every tool):
+**Claude Code** — add one hook (covers every tool):
 
 ```json
 { "hooks": { "PreToolUse":  [{"matcher": "*", "hooks": [{"type": "command", "command": "aegis hook"}]}],
@@ -126,6 +127,15 @@ verdict = harness.evaluate_tool_call("start_process", {"command": "rm -rf /"})
 you ask for: `--format claude` (the JSON above), `--format json` (`{"decision","reason","level"}`),
 or `--format exit` (exit 0 to allow, 2 to block with the reason on stderr — works with anything
 that honours a hook's exit code). Nothing in Aegis is tied to one model or vendor.
+
+Other hosts must adapt their event names, input JSON and decision format to their own hook
+contract. Tool-name normalization is shared; a host's hook configuration is not universal.
+
+**MCP catalogue verification** — explicitly pin a reviewed catalogue, then pass
+`ToolPins()` and a stable `server_id` as `tool_pins` and `server_id` to `AegisMcpProxy`.
+Calls remain blocked until `filter_response` accepts a matching `tools/list` result. A changed,
+unrecognized or suspicious catalogue is withheld and its tools cannot execute through the proxy.
+First-use auto-pinning is a convenience API, not proof that a server is trustworthy.
 
 **Command line:**
 
@@ -148,6 +158,9 @@ Configure through environment variables (so every host configures it the same wa
   it runs. Pair it with the bundled `bubblewrap` confinement (Linux) or another OS sandbox.
 - It is **not a guarantee.** It is one deterministic layer. Run agents with least privilege and
   keep backups. Found a bypass? See [SECURITY.md](SECURITY.md).
+
+See [the enforcement and migration guide](docs/ENFORCEMENT.md) for trust boundaries,
+state persistence, Linux confinement, and upgrading existing hooks.
 
 ## License
 

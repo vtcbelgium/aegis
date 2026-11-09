@@ -23,6 +23,7 @@ on the T590; `probe()` reports whether srt or bwrap is the better backend on thi
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -48,12 +49,17 @@ class SandboxProfile:
     allow_home_read: bool = False
     tmp_writable: bool = True
     hide: List[str] = field(default_factory=lambda: list(HIDE_HOME_SUBPATHS))
+    protected_paths: List[str] = field(default_factory=list)
+    backup_paths: List[str] = field(default_factory=list)
 
     @classmethod
     def from_policy(cls, policy, workspace: str, network: bool = False) -> "SandboxProfile":
         roots = [r for r in (getattr(policy, "extra_roots", None) or []) if r]
         return cls(workspace=os.path.abspath(workspace), extra_roots=[os.path.abspath(r) for r in roots],
-                   network=network)
+                   network=network,
+                   protected_paths=list(getattr(policy, "protected_paths", []) or [])
+                       + list(getattr(policy, "log_paths", []) or []),
+                   backup_paths=list(getattr(policy, "backup_paths", []) or []))
 
 
 def bwrap_path() -> Optional[str]:
@@ -77,13 +83,13 @@ def _user_namespaces_ok() -> bool:
 
 
 def available() -> bool:
-    return os.name == "posix" and os.uname().sysname == "Linux" and bool(bwrap_path()) and _user_namespaces_ok()
+    return platform.system() == "Linux" and bool(bwrap_path()) and _user_namespaces_ok()
 
 
 def probe() -> dict:
     """Report what confinement this host can do, and prove bwrap actually runs."""
     info = {
-        "platform": os.uname().sysname if os.name == "posix" else os.name,
+        "platform": platform.system(),
         "bwrap": bwrap_path(), "srt": srt_path(),
         "userNamespaces": _user_namespaces_ok(), "works": False, "backend": None, "error": None,
     }
@@ -91,10 +97,9 @@ def probe() -> dict:
         info["error"] = "bubblewrap unavailable (needs Linux, bwrap and unprivileged user namespaces)"
         return info
     try:
-        r = subprocess.run([bwrap_path(), "--unshare-all", "--die-with-parent", "--ro-bind", "/usr", "/usr",
-                            "--ro-bind", "/lib", "/lib", "--proc", "/proc", "--dev", "/dev",
-                            "/usr/bin/true" if os.path.exists("/usr/bin/true") else "/bin/true"],
-                           capture_output=True, timeout=10)
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="aegis-probe-") as workspace:
+            r = run(SandboxProfile(workspace), ["/usr/bin/true"], capture_output=True, timeout=10)
         info["works"] = r.returncode == 0
         info["backend"] = "bwrap"
         if r.returncode != 0:
@@ -109,7 +114,7 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
     bw = bwrap_path()
     if not available() or not bw:
         raise SandboxUnavailable("bubblewrap unavailable (needs Linux, bwrap and user namespaces)")
-    ws = os.path.abspath(profile.workspace)
+    ws = os.path.realpath(profile.workspace)
     if not os.path.isdir(ws):
         raise SandboxUnavailable(f"workspace does not exist: {ws}")
 
@@ -117,7 +122,9 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
                        "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup"]
     if not profile.network:
         argv += ["--unshare-net"]
-    argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp" if profile.tmp_writable else "/run/aegis-empty"]
+    argv += ["--cap-drop", "ALL", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    if not profile.tmp_writable:
+        argv += ["--remount-ro", "/tmp"]
 
     for ro in SYSTEM_RO:
         if os.path.exists(ro):
@@ -128,17 +135,65 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
 
     # Writable workspace and declared extra roots.
     seen = set()
-    for root in [ws] + [os.path.abspath(r) for r in profile.extra_roots]:
-        if root and root not in seen and os.path.isdir(root):
+    for root in sorted([ws] + [os.path.realpath(r) for r in profile.extra_roots], key=len):
+        if root in (os.path.abspath(os.sep),) or root in SYSTEM_RO or root in ("/proc", "/dev", "/sys", "/tmp"):
+            raise SandboxUnavailable(f"unsafe writable root: {root}")
+        if not os.path.isdir(root):
+            raise SandboxUnavailable(f"allowed root does not exist: {root}")
+        if root not in seen:
             argv += ["--bind", root, root]
             seen.add(root)
 
     # Hide credential stores / Aegis state even when they sit under an allowed root.
-    home = os.path.abspath(os.path.expanduser("~"))
+    home = os.path.realpath(os.path.expanduser("~"))
+    from .boundaries import aegis_home, is_backup_path, package_dir
+    from .policy import classify_sensitive
+    hidden = set()
     for sub in profile.hide:
-        target = os.path.join(home, sub)
-        if any(target == r or target.startswith(r + "/") for r in seen):
-            argv += ["--tmpfs", target]
+        if os.path.isabs(sub) or ".." in sub.replace("\\", "/").split("/"):
+            raise SandboxUnavailable("hide entries must be home-relative")
+        hidden.add(os.path.join(home, sub))
+    hidden.update([os.path.realpath(aegis_home()), package_dir()])
+    hidden.update(os.path.realpath(p) for p in profile.protected_paths)
+    readonly = {os.path.realpath(p) for p in profile.backup_paths}
+    # Protect secrets and backups inside writable projects as well as in the host home.
+    scanned = 0
+    for root in seen:
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            scanned += 1
+            if scanned > 20000:
+                raise SandboxUnavailable("allowed roots too large to inspect safely")
+            for name in dirs[:] + files:
+                target = os.path.join(directory, name)
+                if classify_sensitive(target) in ("critical", "secret", "startup", "autoexec"):
+                    hidden.add(target)
+                elif is_backup_path(target):
+                    readonly.add(target)
+                if target in hidden or target in readonly:
+                    if name in dirs:
+                        dirs.remove(name)
+    def exposed(target):
+        return any(target == r or target.startswith(r.rstrip(os.sep) + os.sep) for r in seen)
+    for target in sorted(readonly, key=len):
+        if exposed(target) and os.path.exists(target):
+            if os.path.islink(target):
+                raise SandboxUnavailable(f"backup path is a symlink: {target}")
+            argv += ["--ro-bind", target, target]
+    masked = []
+    for target in sorted(hidden, key=len):
+        if not exposed(target) or not os.path.lexists(target):
+            continue
+        if target == ws or ws.startswith(target.rstrip(os.sep) + os.sep):
+            raise SandboxUnavailable("workspace overlaps protected state")
+        if any(target.startswith(p.rstrip(os.sep) + os.sep) for p in masked):
+            continue
+        if os.path.islink(target):
+            raise SandboxUnavailable(f"protected path is a symlink: {target}")
+        if os.path.isdir(target):
+            argv += ["--tmpfs", target, "--remount-ro", target]
+        else:
+            argv += ["--ro-bind", "/dev/null", target]
+        masked.append(target)
 
     argv += ["--chdir", ws, "--clearenv",
              "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -153,7 +208,8 @@ def _as_command(command, shell: Optional[str]) -> List[str]:
     if isinstance(command, (list, tuple)):
         return list(command)
     sh = shell or "/bin/bash"
-    sh = shutil.which(os.path.basename(sh)) or "/bin/sh"
+    if not os.path.isabs(sh):
+        raise SandboxUnavailable("sandbox shell must be an absolute path")
     return [sh, "-c", str(command)]
 
 
@@ -161,6 +217,10 @@ def run(profile: SandboxProfile, command, *, shell: Optional[str] = None, timeou
         **popen_kwargs) -> subprocess.CompletedProcess:
     """Run a command confined by the profile. Raises SandboxUnavailable if it cannot confine."""
     argv = build_argv(profile, command, shell=shell)
+    if popen_kwargs.get("shell") or popen_kwargs.get("pass_fds") or popen_kwargs.get("preexec_fn"):
+        raise SandboxUnavailable("unsafe launcher options")
+    popen_kwargs.update(shell=False, close_fds=True,
+                        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
     return subprocess.run(argv, timeout=timeout, **popen_kwargs)
 
 

@@ -22,6 +22,7 @@ def ws(tmp_path, monkeypatch):
     (work / "src" / "backup_service.py").write_text("x = 1\n")
     (home / "OTHRYS-backups").mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("AEGIS_HOME", str(home / ".aegis"))
     return work
 

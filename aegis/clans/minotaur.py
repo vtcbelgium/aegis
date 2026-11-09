@@ -91,8 +91,10 @@ class Tripwires:
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return cls()
+        if not isinstance(data, dict) or data.get("schema") != REGISTRY_SCHEMA:
+            raise ValueError("Invalid Minotaur registry")
         decoys = frozenset(_norm(d["path"]) for d in data.get("decoys", []) if d.get("path"))
         canaries = tuple(c for c in data.get("canaries", []) if isinstance(c, str))
         return cls(decoy_paths=decoys, canaries=canaries)
@@ -123,6 +125,14 @@ DEFAULT_DECOYS = (
 
 def plant(workspace: Optional[str] = None, home: Optional[str] = None,
           registry_path: Optional[str] = None, specs: Optional[Iterable[Tuple[str, str]]] = None) -> Dict:
+    from ..boundaries import minotaur_registry_path
+    from ..ledger import _FileLock
+    registry_path = registry_path or minotaur_registry_path()
+    with _FileLock(registry_path):
+        return _plant(workspace, home, registry_path, specs)
+
+
+def _plant(workspace, home, registry_path, specs) -> Dict:
     """Write decoy files with canary tokens and save the registry. Returns a summary.
 
     Idempotent per path: an existing decoy keeps its canary. Never overwrites a file Aegis
@@ -139,25 +149,25 @@ def plant(workspace: Optional[str] = None, home: Optional[str] = None,
         with open(registry_path, "r", encoding="utf-8") as fh:
             for d in json.load(fh).get("decoys", []):
                 existing[_norm(d["path"])] = d
-    except (OSError, ValueError):
+    except FileNotFoundError:
         pass
 
-    decoys: List[Dict] = []
-    canaries: List[str] = []
+    decoys: List[Dict] = list(existing.values())
+    canaries: List[str] = [d["canary"] for d in decoys]
     planted, kept = [], []
     for template, kind in (specs or DEFAULT_DECOYS):
         path = os.path.abspath(template.format(home=home, workspace=workspace))
         prior = existing.get(_norm(path))
+        if os.path.realpath(path) != path:
+            continue
         if prior and os.path.exists(path):
-            decoys.append(prior)
-            canaries.append(prior["canary"])
             kept.append(path)
             continue
         canary = _mint_canary(kind)
         content = f"{marker}\n{_decoy_body(kind, canary)}\n"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
+            with open(path, "x", encoding="utf-8") as fh:
                 fh.write(content)
             os.utime(path, (time.time() - 86400 * 30, time.time() - 86400 * 30))  # look old
         except OSError:

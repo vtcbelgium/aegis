@@ -12,10 +12,12 @@ not need this.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import time
 from typing import Any, Dict, Optional
+from contextlib import contextmanager
 
 from .core import DecisionLevel
 from .ledger import _FileLock  # reuse the cross-process lock
@@ -30,36 +32,53 @@ def sessions_dir() -> str:
 
 
 def _path(session_id: str) -> str:
-    sid = _SAFE_ID.sub("_", session_id or "default")[:120]
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("A nonempty session id is required")
+    sid = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
     return os.path.join(sessions_dir(), f"{sid}.json")
 
 
 def load(session_id: str) -> Dict[str, Any]:
     try:
-        with open(_path(session_id), "r", encoding="utf-8") as fh:
+        try:
+            fh = open(_path(session_id), "r", encoding="utf-8")
+        except FileNotFoundError:
+            # Preserve quarantines written by 1.0's original hook implementation.
+            legacy = _SAFE_ID.sub("_", session_id)[:120]
+            fh = open(os.path.join(sessions_dir(), legacy + ".json"), "r", encoding="utf-8")
+        with fh:
             data = json.load(fh)
-        if time.time() - data.get("at", 0) > MAX_AGE_SECONDS:
-            return {}
+        if not isinstance(data, dict) or type(data.get("level")) is not int:
+            raise ValueError("Invalid Aegis session state")
+        DecisionLevel(data["level"])
+        if not isinstance(data.get("minotaur", {}), dict):
+            raise ValueError("Invalid Minotaur state")
         return data
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
 
 
 def save(session_id: str, level: DecisionLevel, minotaur_state: Optional[Dict[str, Any]]) -> None:
     path = _path(session_id)
+    import tempfile
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".session-", dir=os.path.dirname(path))
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with _FileLock(path):
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"at": time.time(), "level": int(level), "minotaur": minotaur_state or {}}, fh)
-            os.replace(tmp, path)
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"at": time.time(), "level": int(level), "minotaur": minotaur_state or {}}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+@contextmanager
+def transaction(session_id: str):
+    """Serialize the entire read/evaluate/write cycle, including post hooks."""
+    with _FileLock(_path(session_id)):
+        yield
 
 
 def apply_to_gate(gate, session_id: str) -> None:
@@ -67,10 +86,7 @@ def apply_to_gate(gate, session_id: str) -> None:
     data = load(session_id)
     if not data:
         return
-    try:
-        gate.escalate(DecisionLevel(int(data.get("level", 0))))
-    except (ValueError, TypeError):
-        pass
+    gate.escalate(DecisionLevel(data["level"]))
     if gate.minotaur is not None and data.get("minotaur"):
         gate.minotaur.import_state(data["minotaur"])
 

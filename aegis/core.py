@@ -4,7 +4,7 @@ Supreme Law:
     "Aegis may subtract authority. Aegis may never create it."
 
 The decision scale is a strict mathematical poset (partially ordered set):
-    PASS (0) < OBSERVE (1) < WARN (2) < RESTRICT (3) < DENY (4) < LOCK (5)
+    PASS (0) < OBSERVE (1) < WARN (2) < ASK (3) < RESTRICT (4) < DENY (5) < LOCK (6)
 
 Properties:
     1. Monotonicity: Decisions can only escalate upwards in severity within a session.
@@ -122,7 +122,7 @@ class AegisGate:
         # Minotaur is built from the policy when the host did not pass one, so the data-leak
         # guard and any planted tripwires are on by default for every integration.
         self.ledger = ledger
-        if minotaur is None and getattr(self.policy, "leak_guard", "ask") != "off":
+        if minotaur is None:
             try:
                 from .clans.minotaur import MinotaurClan, Tripwires
                 trip = getattr(self.policy, "tripwires", None) or Tripwires.load()
@@ -134,8 +134,8 @@ class AegisGate:
                 )
                 if getattr(self.policy, "tripwires", None) is None and trip.active:
                     self.policy.tripwires = trip
-            except Exception:
-                minotaur = None
+            except Exception as exc:
+                raise ValueError("Minotaur could not initialize safely") from exc
         self.minotaur = minotaur
         self._current_level: DecisionLevel = DecisionLevel.PASS
         self._audit_log: Deque[Verdict] = collections.deque(maxlen=self.MAX_AUDIT_LOG)
@@ -198,6 +198,8 @@ class AegisGate:
                 )
 
         with self._lock:
+            if escalate and self._current_level == DecisionLevel.LOCK and verdict.level < DecisionLevel.LOCK:
+                verdict = Verdict(DecisionLevel.LOCK, ["Session was locked during evaluation"], "AegisCore")
             self._audit_log.append(verdict)
             self._total_evaluations += 1
             if verdict.level >= DecisionLevel.WARN:

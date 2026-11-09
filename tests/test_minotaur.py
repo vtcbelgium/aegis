@@ -131,7 +131,11 @@ def test_gate_builds_minotaur_from_policy(tmp_path):
     g = AegisGate(base_dir=str(tmp_path), policy=AegisPolicy())
     assert g.minotaur is not None and g.minotaur.leak_guard == "ask"
     g2 = AegisGate(base_dir=str(tmp_path), policy=AegisPolicy(leak_guard="off"))
-    assert g2.minotaur is None
+    assert g2.minotaur is not None and g2.minotaur.leak_guard == "off"
+    # Turning off one heuristic must not turn off tripwires.
+    trip = Tripwires(canaries=("AG-CANARY-retained-123456",))
+    g3 = AegisGate(policy=AegisPolicy(leak_guard="off", tripwires=trip))
+    assert g3.minotaur.inspect_content(trip.canaries[0]).level == L.LOCK
 
 
 def test_registry_is_not_agent_readable(planted):

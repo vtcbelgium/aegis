@@ -107,20 +107,15 @@ def evaluate(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
 
     workspace = cwd or os.getcwd()
     pol = policy or load_policy(workspace)
-    led = DecisionLedger(default_ledger_path(), min_level=DecisionLevel.ASK) if ledger else None
+    led = DecisionLedger(default_ledger_path()) if ledger else None
     gate = AegisGate(base_dir=workspace, policy=pol, ledger=led)
-    session_store.apply_to_gate(gate, session_id)
-
-    name, args = normalize(tool_name, tool_input)
-    # A plain web fetch: judge the URL through the command path's URL check.
-    if name == "fetch_url" and isinstance(args.get("url"), str):
-        verdict = AegisHarness(gate).evaluate_tool_call("start_process", {"command": f"curl {args['url']}"})
-    elif name == "websearch":
-        verdict = Verdict(DecisionLevel.PASS, ["web search"], "AegisHarness")
-    else:
+    if not isinstance(tool_name, str) or not tool_name.strip() or not isinstance(tool_input, dict):
+        raise ValueError("Tool name and object arguments are required")
+    with session_store.transaction(session_id):
+        session_store.apply_to_gate(gate, session_id)
+        name, args = normalize(tool_name, tool_input)
         verdict = AegisHarness(gate).evaluate_tool_call(name, args)
-
-    session_store.persist_from_gate(gate, session_id)
+        session_store.persist_from_gate(gate, session_id)
     decision = _decision_for(verdict.level)
     reason = "; ".join(verdict.reasons) if verdict.reasons else verdict.level.name
     return HookDecision(decision, reason, verdict.level.name, verdict)
