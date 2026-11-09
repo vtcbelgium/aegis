@@ -108,6 +108,8 @@ def is_inside(abs_path: str, root: str) -> bool:
         return False
     if looks_windows_path(root) or looks_windows_path(abs_path):
         import ntpath
+        if os.name == "nt":
+            abs_path, root = os.path.realpath(abs_path), os.path.realpath(root)
         a = ntpath.normpath(abs_path).replace("\\", "/").lower().rstrip("/")
         b = ntpath.normpath(root).replace("\\", "/").lower().rstrip("/")
         return a == b or a.startswith(b + "/")

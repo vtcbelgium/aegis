@@ -591,7 +591,7 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
         if "*" in os.path.basename(abs_path):
             target = os.path.dirname(abs_path)
         for root in ctx.policy.roots(ctx.base_dir):
-            base = os.path.realpath(root) if not looks_windows_path(root) else root.replace("\\", "/")
+            base = os.path.realpath(root) if os.name == "nt" or not looks_windows_path(root) else root.replace("\\", "/")
             if target.replace("\\", "/").rstrip("/").lower() == base.replace("\\", "/").rstrip("/").lower():
                 _add(ctx, L.ASK, f"Recursive delete of a whole workspace root: {raw}")
                 return None
