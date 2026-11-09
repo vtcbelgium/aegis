@@ -786,8 +786,15 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
     if name in ("init", "telinit") and args and args[0] in ("0", "6"):
         raise _Lock("System shutdown/reboot command blocked", boundaries.SYSTEM_DESTRUCTION)
     if name == "systemctl":
-        if args and args[0].lower() in {"poweroff", "reboot", "halt", "kexec", "suspend", "hibernate"}:
+        verb = next((a.lower() for a in args if not a.startswith("-")), "")
+        if verb in {"poweroff", "reboot", "halt", "kexec", "suspend", "hibernate"}:
             raise _Lock("System shutdown/reboot command blocked", boundaries.SYSTEM_DESTRUCTION)
+        # Read-only queries are not changes (the boundaries layer already caught stop/disable
+        # of the guard or a logging service before this point).
+        if verb in {"status", "is-active", "is-enabled", "is-failed", "show", "cat", "list-units",
+                    "list-unit-files", "list-timers", "list-sockets", "list-dependencies", "get-default",
+                    "show-environment", "", "help", "--version"}:
+            return
         _add(ctx, L.ASK, "systemctl changes services (owner approval)")
         return
     if name == "vssadmin" and any(a.lower() == "delete" for a in args):

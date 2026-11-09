@@ -103,12 +103,22 @@ def is_backup_path(abs_path: str, policy=None, is_dir: Optional[bool] = None) ->
     if not parts:
         return False
     last = parts[-1]
+    exists = True
     if is_dir is None:
         try:
             is_dir = os.path.isdir(abs_path)
+            exists = os.path.exists(abs_path)
         except OSError:
-            is_dir = False
-    candidates = parts[:-1] + ([last] if is_dir else [])
+            is_dir = exists = False
+    elif not is_dir:
+        try:
+            exists = os.path.exists(abs_path)
+        except OSError:
+            exists = False
+    # The parent folders always count. The final name counts when it is a directory, or when
+    # the path does not exist yet — a delete target named "OTHRYS-backups" is judged by its
+    # name, while an existing regular file like "backup_service.py" is not.
+    candidates = parts[:-1] + ([last] if (is_dir or not exists) else [])
     return any(seg in _BACKUP_EXACT or _BACKUP_SEGMENT.search(seg) for seg in candidates)
 
 

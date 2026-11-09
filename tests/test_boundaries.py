@@ -90,9 +90,11 @@ def test_sentinel_takeover(c, windows, ws):
 
 
 def test_guard_service_reads_are_not_takeover(ws):
-    for c in ("systemctl --user status tekton-relay", "pkill node", "taskkill /im notepad.exe"):
+    # Reading the guard's status is fine; killing an unrelated process asks but never locks.
+    assert cmd("systemctl --user status tekton-relay", ws).level == L.PASS
+    for c in ("pkill node", "taskkill /im notepad.exe"):
         v = cmd(c, ws, windows=c.startswith("taskkill"))
-        assert v.level == L.ASK, (c, v)
+        assert L.PASS < v.level < L.LOCK, (c, v)
 
 
 @pytest.mark.parametrize("c,windows", [
