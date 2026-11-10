@@ -1606,7 +1606,7 @@ def _git_in_directory(args: List[str], ctx: _Ctx) -> None:
                   (not a.startswith("-") and (a.startswith(":") or a.startswith("+")))]
         if forced:
             _add(ctx, L.ASK, f"git push {forced[0]} rewrites or deletes remote history (owner approval)")
-            ctx.destructive.append({"operation": "git-push", "target": ctx.cwd or ctx.base_dir or os.getcwd()})
+            _git_destructive_target(ctx, "push")
         pos = [a for a in sargs if not a.startswith("-")]
         remote = pos[0] if pos else "origin"
         if "://" in remote or "@" in remote or remote.startswith(("/", ".", "~")):
@@ -1636,7 +1636,7 @@ def _git_in_directory(args: List[str], ctx: _Ctx) -> None:
     lost = _git_discards_work(sub, sargs)
     if lost:
         _add(ctx, L.ASK, f"{lost} (owner approval)")
-        ctx.destructive.append({"operation": "git-" + sub, "target": ctx.cwd or ctx.base_dir or os.getcwd()})
+        _git_destructive_target(ctx, sub)
     if sub in ("archive", "bundle", "format-patch", "worktree", "clean", "checkout", "restore",
                "add", "rm", "mv", "apply", "am", "diff", "log", "show", "status", "stash", "reset",
                "switch", "branch", "tag", "merge", "rebase", "cherry-pick", "commit", "init",
@@ -1652,6 +1652,19 @@ def _git_in_directory(args: List[str], ctx: _Ctx) -> None:
         return
     # unknown git subcommand (possibly an alias)
     _add(ctx, L.ASK, f"Unknown git subcommand or alias '{sub}' (owner approval)")
+
+
+def _git_destructive_target(ctx: _Ctx, operation: str) -> None:
+    from .approval import git_root
+    target = git_root(ctx.cwd or ctx.base_dir or os.getcwd())
+    if ctx.base_dir and not any(is_inside(target, root) for root in ctx.policy.roots(ctx.base_dir)):
+        _add(ctx, L.DENY, "Destructive Git action affects a repository outside the admitted roots")
+        return
+    if ctx.base_dir and operation in ("reset", "clean", "restore", "checkout"):
+        hit = boundaries.check_path(target, "write", ctx.policy)
+        if hit and hit[1] == "LOCK":
+            raise _Lock(hit[2], hit[0])
+    ctx.destructive.append({"operation": "git-" + operation, "target": target})
 
 
 def _git_discards_work(sub: str, sargs: List[str]) -> Optional[str]:

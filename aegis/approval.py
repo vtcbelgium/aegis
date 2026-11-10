@@ -13,6 +13,18 @@ from .core import DecisionLevel, Verdict
 SCHEMA = "aegis.destructive-confirmation.v1"
 
 
+def git_root(directory: str) -> str:
+    start = os.path.realpath(directory)
+    current = start
+    while True:
+        if os.path.lexists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return start
+        current = parent
+
+
 def observe_git(directory: str) -> dict:
     """Read bounded Git metadata without executing Git or exposing its contents."""
     marker = os.path.join(directory, ".git")
@@ -68,16 +80,14 @@ def bind_confirmation(verdict: Verdict, action: Any) -> Verdict:
     targets = verdict.metadata.get("destructive") or []
     if verdict.level != DecisionLevel.ASK or not targets:
         return verdict
-    observations = verdict.metadata.get("destructive_state")
-    if observations is None:
-        observations = []
-        try:
-            for target in targets:
-                if str(target.get("operation", "")).startswith("git-"):
-                    observations.append(observe_git(target["target"]))
-        except (OSError, ValueError, UnicodeError):
-            return Verdict(DecisionLevel.DENY, ["Git state unavailable; destructive review cannot be bound safely"], verdict.clan)
-        verdict.metadata["destructive_state"] = observations
+    observations = []
+    try:
+        for target in targets:
+            if str(target.get("operation", "")).startswith("git-"):
+                observations.append(observe_git(target["target"]))
+    except (OSError, ValueError, UnicodeError):
+        return Verdict(DecisionLevel.DENY, ["Git state unavailable; destructive review cannot be bound safely"], verdict.clan)
+    verdict.metadata["destructive_state"] = observations
     unique = []
     for target in targets:
         op, path = target.get("operation"), target.get("target")
@@ -94,7 +104,8 @@ def bind_confirmation(verdict: Verdict, action: Any) -> Verdict:
             "observations": observations, "action": action}
     digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
     challenge = {"schema": SCHEMA, "phrase": phrase, "digest": digest,
-                 "targets": unique, "impact": body["impact"]}
+                 "targets": unique, "impact": body["impact"],
+                 "state": [{"repository": o["repository"], "head": o.get("head")} for o in observations]}
     if len(json.dumps(challenge, ensure_ascii=False).encode("utf-8")) > 12000:
         return Verdict(DecisionLevel.DENY, ["Destructive review is too large; split the action"], verdict.clan)
     verdict.metadata["confirmation"] = challenge

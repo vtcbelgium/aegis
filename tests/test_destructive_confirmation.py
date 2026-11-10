@@ -60,3 +60,11 @@ def test_git_c_resolves_the_reviewed_repository(tmp_path):
     nested = tmp_path / "nested"; nested.mkdir()
     a = analyze_command("git -C nested reset --hard", base_dir=str(tmp_path))
     assert a.metadata["confirmation"]["targets"][0]["target"].replace("\\", "/").endswith("/nested")
+
+
+def test_git_from_subdirectory_reviews_the_actual_repository(tmp_path):
+    git = tmp_path / ".git"; git.mkdir(); (git / "HEAD").write_text("a" * 40)
+    sub = tmp_path / "src"; sub.mkdir()
+    a = analyze_command("git -C src reset --hard", base_dir=str(tmp_path))
+    assert a.metadata["confirmation"]["targets"][0]["target"].replace("\\", "/") == str(tmp_path).replace("\\", "/")
+    assert analyze_command("git reset --hard", base_dir=str(sub)).level == L.DENY
