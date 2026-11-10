@@ -58,6 +58,40 @@ class AegisPolicy:
     # "ask" lets the owner approve deliberate cases such as writing a key into .env.
     secret_level: str = "lock"
 
+    # --- Hard boundaries (aegis/boundaries.py) ---
+    # More paths that are part of the guard: the host's mode file, its identity key, its own code.
+    # Writing or deleting them is AEGIS_POLICY_TAMPER (LOCK).
+    protected_paths: List[str] = field(default_factory=list)
+    # Host identity keys and master-secret stores: reading or uploading always LOCKs.
+    secret_paths: List[str] = field(default_factory=list)
+    # Security logs besides the system ones (Aegis's ledger, the host's audit log).
+    log_paths: List[str] = field(default_factory=list)
+    # Backup and recovery locations besides the ones recognised by name.
+    backup_paths: List[str] = field(default_factory=list)
+    # Service, process and task names of the guard (added to the built-in tekton/aegis names).
+    guard_names: Set[str] = field(default_factory=set)
+    # Protect the running Aegis package itself. Turn off only while developing Aegis.
+    protect_package: bool = True
+
+    # --- Minotaur (aegis/clans/minotaur.py) ---
+    # Tripwires loaded from the registry (aegis.clans.minotaur.Tripwires) or None.
+    tripwires: Optional[object] = None
+    # What the data-leak guard does when a session that read private data and untrusted
+    # content tries to send data out: "ask" (default), "deny" or "off".
+    leak_guard: str = "ask"
+    # Distinct sensitive locations probed within the window before Minotaur calls it a hunt.
+    probe_threshold: int = 4
+    # Seconds a session remembers that it read private data or untrusted content.
+    memory_seconds: float = 30 * 60
+
+    # --- Blast radius (aegis/impact.py) ---
+    # A recursive delete larger than this needs the owner (Destructive Action Constitution).
+    blast_max_entries: int = 100
+    blast_max_bytes: int = 500 * 1024 * 1024
+
+    # --- Code audit (aegis/audit.py): "warn" records OWASP findings in written code, "off" skips it.
+    code_audit: str = "warn"
+
     def roots(self, base_dir: Optional[str]) -> List[str]:
         return ([base_dir] if base_dir else []) + [r for r in self.extra_roots if r]
 

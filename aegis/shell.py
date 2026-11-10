@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from . import boundaries
 from .core import DecisionLevel, Verdict
 from .canonicalizer import home_dir, is_inside, looks_windows_path, normalize_text, resolve_path
 from .policy import (
@@ -202,12 +203,18 @@ class _Ctx:
     safe_substitutions: set = field(default_factory=set)
     variables: Dict[str, str] = field(default_factory=dict)
     force_windows: bool = False
+    # What the command would do, for Minotaur's session view: read_private, fetch, egress ...
+    effects: set = field(default_factory=set)
+    # Blast-radius measurements of deletes (aegis/impact.py)
+    impact: List[dict] = field(default_factory=list)
+    boundary: Optional[str] = None
 
 
 class _Lock(Exception):
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, boundary: Optional[str] = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.boundary = boundary
 
 
 # ---------------------------------------------------------------------------
@@ -227,17 +234,30 @@ def analyze_command(
         return Verdict(L.PASS, ["Empty command"], NAME)
     ctx = _Ctx(base_dir=base_dir, cwd=cwd or base_dir, policy=policy or DEFAULT_POLICY, depth=_depth,
                force_windows=windows)
+    text = normalize_text(command)
     try:
-        _analyze(normalize_text(command), ctx)
+        hit = boundaries.check_text(text)
+        if hit:
+            raise _Lock(hit[1], hit[0])
+        _analyze(text, ctx)
     except _Lock as lk:
-        return Verdict(L.LOCK, [lk.reason], NAME)
+        return Verdict(L.LOCK, [lk.reason], NAME, metadata=_meta(ctx, lk.boundary))
     if ctx.untrusted_download and ctx.exec_after_download:
         ctx.findings.append((L.DENY, "Download-and-execute chain from a non-allowlisted host"))
     if not ctx.findings:
-        return Verdict(L.PASS, ["Command passed Tartarus inspection"], NAME)
+        return Verdict(L.PASS, ["Command passed Tartarus inspection"], NAME, metadata=_meta(ctx))
     top = max(level for level, _ in ctx.findings)
     reasons = list(dict.fromkeys(r for level, r in ctx.findings if level == top))
-    return Verdict(top, reasons, NAME)
+    return Verdict(top, reasons, NAME, metadata=_meta(ctx, ctx.boundary))
+
+
+def _meta(ctx: "_Ctx", boundary: Optional[str] = None) -> dict:
+    meta: dict = {"effects": sorted(ctx.effects)}
+    if boundary:
+        meta["boundary"] = boundary
+    if ctx.impact:
+        meta["impact"] = ctx.impact
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -522,14 +542,30 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
         raise _Lock("Null-byte path truncation in command")
 
     if BLOCK_DEVICE_RE.match(word) and mode in ("write", "delete"):
-        raise _Lock(f"Raw block device write: {raw}")
+        raise _Lock(f"Raw block device write: {raw}", boundaries.SYSTEM_DESTRUCTION)
 
+    # Moving a file away removes it from where it was: a delete for the hard boundaries,
+    # a read for everything else.
+    moving = mode == "move"
+    if moving:
+        mode = "read"
     abs_path, confined, unresolved = resolve_path(word, base_dir=ctx.base_dir, cwd=ctx.cwd)
     if confined is False and ctx.policy.extra_roots and any(is_inside(abs_path, r) for r in ctx.policy.extra_roots):
         confined = True
+    if not unresolved:
+        _minotaur_path(ctx, abs_path, raw)
+        hit = boundaries.check_path(abs_path, "delete" if moving else mode, ctx.policy)
+        if hit:
+            boundary, level, reason = hit
+            if level == "LOCK":
+                raise _Lock(reason, boundary)
+            ctx.boundary = boundary
+            _add(ctx, L.DENY if level == "DENY" else L.ASK, reason)
+            if level == "DENY":
+                return None
     sensitivity = classify_sensitive(word, abs_path)
     if sensitivity == "critical":
-        raise _Lock(f"Command accesses a credential or system store: {raw}")
+        raise _Lock(f"Command accesses a credential or system store: {raw}", boundaries.MASTER_SECRET)
     if sensitivity == "startup" and mode != "read":
         _add(ctx, L.DENY, f"Command writes a startup/persistence file: {raw}")
         return None
@@ -540,7 +576,7 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             globless = os.path.dirname(abs_path) or "/"
         if is_catastrophic_target(globless, home_dir()):
             if recursive or globless != abs_path or abs_path.rstrip("/\\") in ("", "/"):
-                raise _Lock(f"Catastrophic recursive deletion of root/system path: rm {raw}")
+                raise _Lock(f"Catastrophic recursive deletion of root/system path: rm {raw}", boundaries.SYSTEM_DESTRUCTION)
             _add(ctx, L.DENY, f"Deleting a system/home location: {raw}")
             return None
 
@@ -555,7 +591,7 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
         if "*" in os.path.basename(abs_path):
             target = os.path.dirname(abs_path)
         for root in ctx.policy.roots(ctx.base_dir):
-            base = os.path.realpath(root) if not looks_windows_path(root) else root.replace("\\", "/")
+            base = os.path.realpath(root) if os.name == "nt" or not looks_windows_path(root) else root.replace("\\", "/")
             if target.replace("\\", "/").rstrip("/").lower() == base.replace("\\", "/").rstrip("/").lower():
                 _add(ctx, L.ASK, f"Recursive delete of a whole workspace root: {raw}")
                 return None
@@ -568,7 +604,33 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             _add(ctx, L.DENY, f"Uploads a secret-bearing file: {raw}")
         elif mode in ("read", "exec"):
             _add(ctx, L.ASK, f"Reads a secret-bearing file (owner approval): {raw}")
+            ctx.effects.add("read_private")
+    if mode == "upload":
+        ctx.effects.add("egress")
+    if mode == "delete":
+        _blast_radius(ctx, abs_path, raw, recursive)
     return abs_path
+
+
+def _blast_radius(ctx: _Ctx, abs_path: str, raw: str, recursive: bool) -> None:
+    """Measure a delete before it runs; above the limit the owner decides (Destructive Action Constitution)."""
+    from . import impact as _impact
+    if looks_windows_path(abs_path) and os.name != "nt":
+        return
+    imp = _impact.measure_delete(abs_path, recursive, ctx.policy.blast_max_entries, ctx.policy.blast_max_bytes)
+    if imp.entries == 0 and imp.complete:
+        return
+    ctx.impact.append(imp.to_dict())
+    if imp.exceeded or not imp.complete:
+        _add(ctx, L.ASK, f"Deletes {_impact.describe(imp)} in {raw} (more than {ctx.policy.blast_max_entries} items "
+                         f"or {_impact.human_bytes(ctx.policy.blast_max_bytes)}: owner approval)")
+
+
+def _minotaur_path(ctx: _Ctx, abs_path: str, raw: str) -> None:
+    """A decoy file planted by Minotaur: touching it in any way is a LOCK."""
+    trip = getattr(ctx.policy, "tripwires", None)
+    if trip is not None and trip.match_path(abs_path):
+        raise _Lock(f"Minotaur tripwire: a decoy file was touched ({raw})", "MINOTAUR_TRIPWIRE")
 
 
 def _check_url(ctx: _Ctx, url: str, upload: bool = False, allowlist: bool = True) -> None:
@@ -589,6 +651,11 @@ def _check_url(ctx: _Ctx, url: str, upload: bool = False, allowlist: bool = True
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     scheme = (parsed.scheme or "").lower()
+    # For Minotaur: anything fetched is untrusted content; anything sent, or any request to a
+    # host outside the allowlist (the URL itself can carry data), is egress.
+    ctx.effects.add("fetch")
+    if upload or not ctx.policy.host_allowed(host):
+        ctx.effects.add("egress")
     if not allowlist:
         return
     if upload and is_exfil_sink(host):
@@ -659,6 +726,8 @@ def _analyze_segment(seg: Segment, ctx: _Ctx) -> None:
     assignments: List[Tuple[str, str]] = []
     while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
         name, _, value = words.pop(0).partition("=")
+        if boundaries.GUARD_ENV_RE.match(name):
+            raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
         if name.upper() in DANGEROUS_ENV_OVERRIDES:
             _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
         assignments.append((name, value))
@@ -709,17 +778,27 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
     if name in PRIVILEGE:
         _add(ctx, L.DENY, f"Privilege escalation via {name}")
         return
+    hit = boundaries.check_command(name, args, ctx.policy)
+    if hit:
+        raise _Lock(hit[1], hit[0])
     if name in SYSTEM_LOCK:
-        raise _Lock(f"Destructive system command blocked: {name}")
+        raise _Lock(f"Destructive system command blocked: {name}", boundaries.SYSTEM_DESTRUCTION)
     if name in ("init", "telinit") and args and args[0] in ("0", "6"):
-        raise _Lock("System shutdown/reboot command blocked")
+        raise _Lock("System shutdown/reboot command blocked", boundaries.SYSTEM_DESTRUCTION)
     if name == "systemctl":
-        if args and args[0].lower() in {"poweroff", "reboot", "halt", "kexec", "suspend", "hibernate"}:
-            raise _Lock("System shutdown/reboot command blocked")
+        verb = next((a.lower() for a in args if not a.startswith("-")), "")
+        if verb in {"poweroff", "reboot", "halt", "kexec", "suspend", "hibernate"}:
+            raise _Lock("System shutdown/reboot command blocked", boundaries.SYSTEM_DESTRUCTION)
+        # Read-only queries are not changes (the boundaries layer already caught stop/disable
+        # of the guard or a logging service before this point).
+        if verb in {"status", "is-active", "is-enabled", "is-failed", "show", "cat", "list-units",
+                    "list-unit-files", "list-timers", "list-sockets", "list-dependencies", "get-default",
+                    "show-environment", "", "help", "--version"}:
+            return
         _add(ctx, L.ASK, "systemctl changes services (owner approval)")
         return
     if name == "vssadmin" and any(a.lower() == "delete" for a in args):
-        raise _Lock("Shadow copy deletion (ransomware pattern) blocked")
+        raise _Lock("Shadow copy deletion (ransomware pattern) blocked", boundaries.BACKUP_DESTRUCTION)
     if name in DENY_BINARIES:
         _add(ctx, L.DENY, f"Account/kernel administration command blocked: {name}")
         return
@@ -816,6 +895,7 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
     if name in NETWORK_FETCHERS:
         return _fetch(name, args, ctx)
     if name in REMOTE_TOOLS:
+        ctx.effects.update(("fetch", "egress"))
         _add(ctx, L.ASK, f"Remote access / transfer tool requires owner approval: {name}")
         for a in args:
             if not _is_option(a) and ":" not in a and "@" not in a:
@@ -1395,8 +1475,9 @@ def _copy_like(name: str, args: List[str], ctx: _Ctx) -> None:
         pos.append(a)
     if dest is None and len(pos) > 1:
         dest = pos.pop()
+    moving = name in ("mv", "move", "move-item", "mi")
     for src in pos:
-        _check_path(ctx, src, "read")
+        _check_path(ctx, src, "move" if moving else "read")
     if dest is not None:
         _check_path(ctx, dest, "write")
 
@@ -1500,6 +1581,12 @@ def _git(args: List[str], ctx: _Ctx) -> None:
             _add(ctx, L.ASK, "git config change (aliases/hooks/ssh commands can execute code)")
         return
     if sub == "push":
+        ctx.effects.add("egress")
+        forced = [a for a in sargs if a in ("-f", "--force", "--mirror", "--delete", "-d", "--prune")
+                  or a.startswith(("--force-with-lease", "--force-if-includes")) or
+                  (not a.startswith("-") and (a.startswith(":") or a.startswith("+")))]
+        if forced:
+            _add(ctx, L.ASK, f"git push {forced[0]} rewrites or deletes remote history (owner approval)")
         pos = [a for a in sargs if not a.startswith("-")]
         remote = pos[0] if pos else "origin"
         if "://" in remote or "@" in remote or remote.startswith(("/", ".", "~")):
@@ -1514,6 +1601,7 @@ def _git(args: List[str], ctx: _Ctx) -> None:
         _add(ctx, L.ASK, f"git remote {sargs[0]} changes where pushes go (owner approval)")
         return
     if sub in ("clone", "fetch", "pull", "ls-remote", "submodule"):
+        ctx.effects.add("fetch")
         pos = [a for a in sargs if not a.startswith("-") and a not in ("add", "update", "init")]
         for a in pos:
             if "://" in a:
@@ -1525,6 +1613,9 @@ def _git(args: List[str], ctx: _Ctx) -> None:
             elif sub == "clone" and ("/" in a or a.startswith((".", "~"))):
                 _check_path(ctx, a, "write")
         return
+    lost = _git_discards_work(sub, sargs)
+    if lost:
+        _add(ctx, L.ASK, f"{lost} (owner approval)")
     if sub in ("archive", "bundle", "format-patch", "worktree", "clean", "checkout", "restore",
                "add", "rm", "mv", "apply", "am", "diff", "log", "show", "status", "stash", "reset",
                "switch", "branch", "tag", "merge", "rebase", "cherry-pick", "commit", "init",
@@ -1540,6 +1631,33 @@ def _git(args: List[str], ctx: _Ctx) -> None:
         return
     # unknown git subcommand (possibly an alias)
     _add(ctx, L.ASK, f"Unknown git subcommand or alias '{sub}' (owner approval)")
+
+
+def _git_discards_work(sub: str, sargs: List[str]) -> Optional[str]:
+    """Git commands that throw away uncommitted or unreferenced work, which cannot be undone."""
+    flags = [a for a in sargs if a.startswith("-")]
+    pos = [a for a in sargs if not a.startswith("-")]
+    whole_tree = any(a in (".", ":/", ":(top)", "*") for a in pos)
+    if sub == "reset" and "--hard" in sargs:
+        return "git reset --hard discards uncommitted changes"
+    if sub == "clean" and any(re.match(r"^-[a-zA-Z]*f", a) or a == "--force" for a in flags) \
+            and not any(a in ("-n", "--dry-run") or re.match(r"^-[a-zA-Z]*n", a) for a in flags):
+        return "git clean deletes untracked files"
+    if sub == "checkout" and whole_tree and "-b" not in sargs and "-B" not in sargs:
+        return "git checkout of the whole tree discards uncommitted changes"
+    if sub == "restore" and whole_tree and not ("--staged" in sargs and "--worktree" not in sargs):
+        return "git restore of the whole tree discards uncommitted changes"
+    if sub == "stash" and pos[:1] in (["drop"], ["clear"]):
+        return f"git stash {pos[0]} deletes stashed work"
+    if sub == "branch" and ("-D" in sargs or ("--delete" in sargs and "--force" in sargs)):
+        return "git branch -D deletes a branch that may not be merged"
+    if sub == "reflog" and pos[:1] in (["expire"], ["delete"]):
+        return "git reflog expire removes the safety net for lost commits"
+    if sub == "gc" and any(a.startswith("--prune=now") or a == "--prune=all" for a in sargs):
+        return "git gc --prune=now deletes unreferenced commits immediately"
+    if sub == "update-ref" and "-d" in sargs:
+        return "git update-ref -d deletes a ref"
+    return None
 
 
 CURL_VALUE_OPTS = {

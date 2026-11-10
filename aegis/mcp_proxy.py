@@ -55,6 +55,8 @@ class AegisMcpProxy:
         owner_secret: Optional[str] = None,
         approval_callback: Optional[Callable[[Verdict], bool]] = None,
         policy: Optional[Any] = None,
+        tool_pins: Optional[Any] = None,
+        server_id: Optional[str] = None,
     ) -> None:
         secret = owner_secret or os.environ.get("AEGIS_OWNER_SECRET")
         if not secret:
@@ -72,6 +74,11 @@ class AegisMcpProxy:
         if gate is not None and approval_callback is not None:
             self.gate.approval_callback = approval_callback
         self.harness = AegisHarness(gate=self.gate, base_dir=self.gate.base_dir)
+        if tool_pins is not None and not server_id:
+            raise ValueError("Pinned MCP proxies require a stable server_id")
+        self.tool_pins = tool_pins
+        self.server_id = server_id
+        self._catalogue_tools = set()
 
     def filter_request(self, rpc_request: Any) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Verdict]]:
         """Filter an incoming MCP JSON-RPC request with fail-closed crash prevention.
@@ -92,6 +99,11 @@ class AegisMcpProxy:
                     raise ValueError("RPC params must be a dictionary")
 
                 tool_name = params.get("name", "unknown")
+                if self.tool_pins is not None and tool_name not in self._catalogue_tools:
+                    verdict = self.gate.record(Verdict(DecisionLevel.DENY,
+                        ["Tool catalogue has not passed fingerprint verification"], "McpToolPins"))
+                    return False, {"jsonrpc": "2.0", "id": request_id, "error": {
+                        "code": -32000, "message": verdict.reasons[0]}}, verdict
                 arguments = params.get("arguments")
 
                 # The MCP specification strictly requires arguments to be a JSON object
@@ -165,6 +177,13 @@ class AegisMcpProxy:
         """Return (sanitized_text, verdict_if_anything_was_redacted)."""
         if not isinstance(text, str) or not text:
             return text, None
+        # A canary token in tool output means a decoy was read: LOCK the session.
+        minotaur = getattr(self.gate, "minotaur", None)
+        if minotaur is not None:
+            trip = minotaur.inspect_content(text)
+            if trip is not None:
+                self.gate.record(trip)  # this one DOES escalate: the agent exfiltrated a decoy
+                return "[REDACTED BY AEGIS: decoy credential — session locked]", trip
         matched = normalize_for_matching(text)
         for rx in _INJECTION_RES:
             if rx.search(matched):
@@ -206,6 +225,16 @@ class AegisMcpProxy:
             result = rpc_response.get("result")
             if not isinstance(result, dict):
                 return True, None, None
+            if self.tool_pins is not None and "tools" in result:
+                self._catalogue_tools.clear()
+                changes = self.tool_pins.check(self.server_id, result["tools"])
+                if changes:
+                    verdict = self.gate.record(Verdict(DecisionLevel.DENY,
+                        [f"MCP tool catalogue requires owner review: {c.kind} ({c.tool})" for c in changes],
+                        "McpToolPins"), escalate=False)
+                    return False, {"jsonrpc": "2.0", "id": rpc_response.get("id"), "error": {
+                        "code": -32000, "message": "Aegis withheld an untrusted tool catalogue"}}, verdict
+                self._catalogue_tools = {tool["name"] for tool in result["tools"]}
             found: List[Verdict] = []
             content_list = result.get("content")
             if isinstance(content_list, list):

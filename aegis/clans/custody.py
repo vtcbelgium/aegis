@@ -23,6 +23,7 @@ CRITICAL_SECRET_SIGNATURES = [
     (r"\bgithub_pat_[0-9a-zA-Z_]{22,}\b", "GitHub Fine-Grained Personal Access Token"),
     (r"\bsk-ant-[a-zA-Z0-9_\-]{20,}\b", "Anthropic Claude API Key"),
     (r"\bsk-[a-zA-Z0-9]{32,}\b", "OpenAI API Key"),
+    (r"\bsk-(?:proj-|svcacct-)[a-zA-Z0-9_-]{20,}\b", "OpenAI scoped API Key"),
     (r"\b(sk_live|rk_live)_[0-9a-zA-Z]{24,}\b", "Stripe Secret / Restricted Key"),
     (r"\bxox[baprs]-[0-9a-zA-Z]{10,}\b", "Slack API Token"),
     (r"\bAIza[0-9A-Za-z\-_]{30,}\b", "Google API Key"),

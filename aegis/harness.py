@@ -91,6 +91,7 @@ CONTENT_WORDS = {"content", "contents", "text", "body", "data", "patch", "diff",
                  "prompt", "description", "readme", "doc", "docs", "string", "strings",
                  "replacement", "html", "markdown", "md", "json", "note", "notes", "comment",
                  "title", "summary", "pattern", "query", "old", "new", "snippet", "template"}
+_WRITE_CONTENT_TOOLS = {"write_file", "edit_block", "write_pdf", "create_file", "apply_patch"}
 INTERACTIVE_TOOL_RE = re.compile(r"interact|send_input|write_process|terminal|stdin|send_keys", re.I)
 SQL_TOOL_RE = re.compile(r"sql|database|\bdb\b|postgres|mysql|sqlite|supabase|query", re.I)
 
@@ -187,12 +188,19 @@ class AegisHarness:
             return SQL
         return role
 
-    def _check(self, tool_name: str, key_path: str, val: str, role: str, windows: bool = False) -> Optional[Verdict]:
-        """Return a non-PASS verdict for one string argument, or None if it is fine."""
+    def _check(self, tool_name: str, key_path: str, val: str, role: str, windows: bool = False,
+               effects: Optional[set] = None) -> Optional[Verdict]:
+        """Return a non-PASS verdict for one string argument, or None if it is fine.
+
+        Any session effects (read_private, fetch, egress) are added to the ``effects`` set
+        even when the argument itself passes, so Minotaur sees them.
+        """
         found: Optional[Verdict] = None
 
         def worse(v: Verdict) -> None:
             nonlocal found
+            if effects is not None and v.metadata:
+                effects.update(v.metadata.get("effects") or ())
             if v.level > DecisionLevel.PASS and (found is None or v.level > found.level):
                 found = v
 
@@ -207,16 +215,35 @@ class AegisHarness:
                 url = val if "://" in val else ("http://" + val if role == URL and "." in val and " " not in val else "")
                 if url:
                     worse(CustodyClan.inspect_url(url))
+                    from urllib.parse import urlparse
+                    host = urlparse(url).hostname or ""
+                    if effects is not None:
+                        effects.add("fetch")
+                        if not self.policy.host_allowed(host):
+                            effects.add("egress")
+                    if not self.policy.host_allowed(host):
+                        worse(Verdict(DecisionLevel.ASK,
+                                      [f"Network access outside the allowlist: {host}"], "Custody"))
         if role in (PATH_READ, PATH_WRITE):
             if tool_name == "read_file" and looks_like_url(val):
                 worse(CustodyClan.inspect_url(val))
             else:
                 mode = "write" if role == PATH_WRITE else "read"
+                if tool_name == "move_file" and key_path.split("[")[0] == "source":
+                    mode = "delete"          # the source disappears from where it was
                 worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir, mode=mode,
-                                                 extra_roots=getattr(self.policy, "extra_roots", None)))
+                                                 extra_roots=getattr(self.policy, "extra_roots", None),
+                                                 policy=self.policy))
         elif role not in (CONTENT, COMMAND, CONFIG) and looks_like_path(val):
             worse(LabyrinthClan.inspect_path(val, base_dir=self.base_dir,
-                                             extra_roots=getattr(self.policy, "extra_roots", None)))
+                                             extra_roots=getattr(self.policy, "extra_roots", None),
+                                             policy=self.policy))
+
+        # Code the agent is about to write: advisory OWASP audit (WARN, never blocks).
+        if role == CONTENT and tool_name in _WRITE_CONTENT_TOOLS \
+                and getattr(self.policy, "code_audit", "warn") == "warn":
+            from .audit import audit_code
+            worse(audit_code(val, key_path))
 
         # Every string: live credentials. Sending one out via a command/URL is exfiltration.
         sec = CustodyClan.inspect_secrets(val)
@@ -228,6 +255,13 @@ class AegisHarness:
 
     def evaluate_tool_call(self, tool_name: str, arguments: Any) -> Verdict:
         """Evaluate an arbitrary tool call before it executes with full recursive coverage."""
+        verdict = self._evaluate(tool_name, arguments)
+        ledger = getattr(self.gate, "ledger", None)
+        if ledger is not None:
+            ledger.record(verdict, tool=tool_name, arguments=arguments)
+        return verdict
+
+    def _evaluate(self, tool_name: str, arguments: Any) -> Verdict:
         try:
             # 1. Check if the session is locked
             if self.gate.current_level >= DecisionLevel.LOCK:
@@ -262,14 +296,35 @@ class AegisHarness:
             shell = arguments.get("shell") if isinstance(arguments, dict) else None
             windows = bool(re.search(r"powershell|pwsh|cmd", shell, re.I)) if isinstance(shell, str) and shell \
                 else os.name == "nt"
+            minotaur = getattr(self.gate, "minotaur", None)
             worst: Optional[Verdict] = None
+            effects: set = set()
+            sensitive_target: Optional[str] = None
             for key_path, val in walk_arguments(arguments):
+                # Canary token in any argument (a decoy the agent is trying to use) -> LOCK.
+                if minotaur is not None and isinstance(val, str):
+                    trip = minotaur.inspect_content(val)
+                    if trip is not None:
+                        return self.gate.record(trip)
                 role = self._role(tool_name, key_path)
-                v = self._check(tool_name, key_path, val, role, windows=windows)
-                if v is not None and (worst is None or v.level > worst.level):
-                    worst = v
-                    if v.level >= DecisionLevel.LOCK:
-                        break
+                v = self._check(tool_name, key_path, val, role, windows=windows, effects=effects)
+                if v is not None:
+                    meta_fx = v.metadata.get("effects") if v.metadata else None
+                    if "read_private" in (meta_fx or ()) or v.metadata.get("boundary") == "MASTER_SECRET_EXTRACTION":
+                        sensitive_target = v.metadata.get("resolved") or sensitive_target or key_path
+                    if worst is None or v.level > worst.level:
+                        worst = v
+                        if v.level >= DecisionLevel.LOCK:
+                            break
+
+            # 5. Minotaur: session behaviour (data-leak guard, credential hunting).
+            # Subtractive only — it can raise the verdict, never lower it.
+            if minotaur is not None and (worst is None or worst.level < DecisionLevel.LOCK):
+                mv = minotaur.inspect_effects(effects, sensitive_target=sensitive_target)
+                # Minotaur wins ties: its session context (a leak or a hunt) is the headline.
+                if mv.level > DecisionLevel.PASS and (worst is None or mv.level >= worst.level):
+                    worst = mv
+
             if worst is not None:
                 return self.gate.record(worst)
 

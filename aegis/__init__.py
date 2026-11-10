@@ -7,9 +7,10 @@ Supreme Law:
 from .core import AegisGate, DecisionLevel, SUPREME_LAW, Verdict
 from .harness import AegisHarness
 from .mcp_proxy import AegisMcpProxy
-from .clans import LabyrinthClan, TartarusClan, CustodyClan, HecatoncheiresClan
+from .clans import LabyrinthClan, TartarusClan, CustodyClan, HecatoncheiresClan, MinotaurClan, Tripwires
+from .ledger import DecisionLedger
 
-__version__ = "0.10.0"
+__version__ = "1.0.0"
 __all__ = [
     "AegisGate",
     "DecisionLevel",
@@ -21,4 +22,7 @@ __all__ = [
     "TartarusClan",
     "CustodyClan",
     "HecatoncheiresClan",
+    "MinotaurClan",
+    "Tripwires",
+    "DecisionLedger",
 ]

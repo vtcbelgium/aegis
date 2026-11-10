@@ -108,6 +108,8 @@ def is_inside(abs_path: str, root: str) -> bool:
         return False
     if looks_windows_path(root) or looks_windows_path(abs_path):
         import ntpath
+        if os.name == "nt":
+            abs_path, root = os.path.realpath(abs_path), os.path.realpath(root)
         a = ntpath.normpath(abs_path).replace("\\", "/").lower().rstrip("/")
         b = ntpath.normpath(root).replace("\\", "/").lower().rstrip("/")
         return a == b or a.startswith(b + "/")
@@ -140,14 +142,20 @@ def resolve_path(path: str, base_dir: Optional[str] = None, cwd: Optional[str] =
 
     if target_is_win or base_is_win:
         mod = ntpath
-        if mod.isabs(clean) or target_is_win:
+        # Python 3.13 changed ntpath.isabs('/x') to False. Preserve foreign-root
+        # spellings so POSIX destruction/logging rules remain identical on Windows.
+        if mod.isabs(clean) or target_is_win or clean.startswith(("/", "\\")):
             abs_target = mod.normpath(clean)
         else:
             abs_target = mod.normpath(mod.join(start or "", clean))
         abs_target = abs_target.replace("\\", "/")
+        if os.name == "nt" and looks_windows_path(abs_target):
+            abs_target = os.path.realpath(abs_target).replace("\\", "/")
         if base_dir is None:
             return abs_target, None, unresolved
         abs_base = mod.normpath(base_dir).replace("\\", "/")
+        if os.name == "nt" and base_is_win:
+            abs_base = os.path.realpath(abs_base).replace("\\", "/")
         if not base_is_win:
             return abs_target, False, unresolved     # Windows path vs POSIX workspace
         a, b = abs_target.lower().rstrip("/"), abs_base.lower().rstrip("/")

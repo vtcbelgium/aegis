@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional
 
+from .. import boundaries
 from ..core import DecisionLevel, Verdict
 from ..canonicalizer import detect_null_bytes, is_inside, normalize_text, resolve_path, unquote_recursively
 from ..policy import SENSITIVE_PATH_PATTERNS, classify_sensitive  # noqa: F401  (re-exported)
@@ -32,6 +33,7 @@ class LabyrinthClan:
         mode: str = "read",
         critical_level: DecisionLevel = DecisionLevel.DENY,
         extra_roots: Optional[Iterable[str]] = None,
+        policy: Optional[object] = None,
     ) -> Verdict:
         """Evaluate one path argument.
 
@@ -58,11 +60,23 @@ class LabyrinthClan:
             confined = True
         decoded, multi_encoded = unquote_recursively(normalized)
 
-        # 4. Sensitive locations (checked on raw, decoded and resolved spellings)
+        # 4. Minotaur decoys and the hard boundaries (Aegis's own state, logs, backups)
+        if not unresolved:
+            trip = getattr(policy, "tripwires", None)
+            if trip is not None and trip.match_path(abs_path):
+                return Verdict(DecisionLevel.LOCK, [f"Minotaur tripwire: a decoy file was touched ({path_input})"],
+                               "Minotaur", metadata={"boundary": "MINOTAUR_TRIPWIRE", "resolved": abs_path})
+            hit = boundaries.check_path(abs_path, mode, policy)
+            if hit:
+                boundary, level, reason = hit
+                return Verdict(DecisionLevel[level], [reason], cls.NAME,
+                               metadata={"boundary": boundary, "resolved": abs_path})
+
+        # 5. Sensitive locations (checked on raw, decoded and resolved spellings)
         sensitivity = classify_sensitive(normalized, decoded, abs_path)
         if sensitivity == "critical":
             return Verdict(critical_level, [f"Target is a credential or system store: {path_input}"], cls.NAME,
-                           metadata={"target": path_input, "resolved": abs_path})
+                           metadata={"target": path_input, "resolved": abs_path, "boundary": boundaries.MASTER_SECRET})
         if sensitivity == "startup" and mode != "read":
             return Verdict(DecisionLevel.DENY, [f"Target is a startup/persistence location: {path_input}"], cls.NAME,
                            metadata={"target": path_input, "resolved": abs_path})
@@ -89,7 +103,8 @@ class LabyrinthClan:
             if mode == "upload":
                 return Verdict(DecisionLevel.DENY, [f"Uploading a secret-bearing file: {path_input}"], cls.NAME)
             if mode in ("read", "exec"):
-                return Verdict(DecisionLevel.ASK, [f"Reading a secret-bearing file requires owner approval: {path_input}"], cls.NAME)
+                return Verdict(DecisionLevel.ASK, [f"Reading a secret-bearing file requires owner approval: {path_input}"], cls.NAME,
+                               metadata={"effects": ["read_private"]})
 
         if sensitivity == "autoexec" and mode != "read":
             return Verdict(DecisionLevel.ASK, [f"Writes a file that runs code automatically later (hook/.envrc): {path_input}"], cls.NAME)
