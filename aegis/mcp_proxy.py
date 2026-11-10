@@ -53,7 +53,7 @@ class AegisMcpProxy:
         strict_mode: bool = False,
         fail_closed: bool = True,
         owner_secret: Optional[str] = None,
-        approval_callback: Optional[Callable[[Verdict], bool]] = None,
+        approval_callback: Optional[Callable[[Verdict], Any]] = None,
         policy: Optional[Any] = None,
         tool_pins: Optional[Any] = None,
         server_id: Optional[str] = None,
