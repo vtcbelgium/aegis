@@ -159,18 +159,25 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
     readonly = {os.path.realpath(p) for p in profile.backup_paths}
     # Protect secrets and backups inside writable projects as well as in the host home.
     scanned = 0
+    entries = 0
+    def scan_error(exc):
+        raise SandboxUnavailable("allowed root could not be inspected safely") from exc
     for root in seen:
-        for directory, dirs, files in os.walk(root, followlinks=False):
+        for directory, dirs, files in os.walk(root, followlinks=False, onerror=scan_error):
             scanned += 1
-            if scanned > 20000:
+            entries += len(dirs) + len(files)
+            if scanned > 20000 or entries > 200000:
                 raise SandboxUnavailable("allowed roots too large to inspect safely")
             for name in dirs[:] + files:
                 target = os.path.join(directory, name)
                 if classify_sensitive(target) in ("critical", "secret", "startup", "autoexec"):
                     hidden.add(target)
-                elif is_backup_path(target):
+                elif not any(target == p or target.startswith(p.rstrip(os.sep) + os.sep)
+                             for p in readonly) and is_backup_path(target):
                     readonly.add(target)
-                if target in hidden or target in readonly:
+                # Backups are immutable, but still need scanning for secrets inside.
+                # Hidden trees need no traversal because their entire contents are masked.
+                if target in hidden:
                     if name in dirs:
                         dirs.remove(name)
     def exposed(target):

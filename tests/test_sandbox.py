@@ -106,3 +106,20 @@ def test_custom_state_is_masked_and_tmp_can_be_readonly(fake_bwrap, tmp_path, mo
 def test_root_cannot_be_made_writable(fake_bwrap):
     with pytest.raises(SandboxUnavailable):
         sandbox.build_argv(SandboxProfile(os.path.abspath(os.sep)), ["true"])
+
+
+def test_unreadable_scan_refuses_execution(fake_bwrap, tmp_path, monkeypatch):
+    def unreadable(*args, **kwargs):
+        if kwargs.get("onerror"):
+            kwargs["onerror"](PermissionError("workspace cannot be inspected"))
+        return iter(())
+    monkeypatch.setattr(sandbox.os, "walk", unreadable)
+    with pytest.raises(SandboxUnavailable, match="inspect"):
+        sandbox.build_argv(SandboxProfile(str(tmp_path)), ["true"])
+
+
+def test_nested_backup_secrets_get_masks(fake_bwrap, tmp_path):
+    backup = tmp_path / "backups"; backup.mkdir()
+    secret = backup / ".env"; secret.write_text("backup secret")
+    argv = sandbox.build_argv(SandboxProfile(str(tmp_path)), ["true"])
+    assert f"--ro-bind /dev/null {secret}" in " ".join(argv)

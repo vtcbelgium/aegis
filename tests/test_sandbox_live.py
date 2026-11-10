@@ -20,6 +20,7 @@ def test_live_workspace_secrets_backup_environment_and_network(confinement, tmp_
     (ws / ".env").write_text("REAL_SECRET_FIXTURE")
     (ws / "backups").mkdir()
     backup = ws / "backups" / "restore.txt"; backup.write_text("restore")
+    (ws / "backups" / ".env").write_text("BACKUP_SECRET_FIXTURE")
     outside = tmp_path / "outside.txt"; outside.write_text("HOST_ONLY")
     monkeypatch.setenv("AEGIS_LIVE_SECRET_FIXTURE", "MUST_NOT_INHERIT")
     code = '''import json, os, socket
@@ -34,7 +35,12 @@ try:
     secret = Path(".env").read_text()
 except PermissionError:
     secret = ""
+try:
+    backup_secret = Path("backups/.env").read_text()
+except PermissionError:
+    backup_secret = ""
 print(json.dumps({"secret": secret, "backupBlocked": blocked,
+                  "backupSecret": backup_secret,
                   "environment": os.environ.get("AEGIS_LIVE_SECRET_FIXTURE"),
                   "interfaces": [name for _, name in socket.if_nameindex()],
                   "outside": Path(os.sys.argv[1]).exists()}))
@@ -43,7 +49,7 @@ print(json.dumps({"secret": secret, "backupBlocked": blocked,
                          capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
-    assert data == {"secret": "", "backupBlocked": True, "environment": None,
+    assert data == {"secret": "", "backupSecret": "", "backupBlocked": True, "environment": None,
                     "interfaces": ["lo"], "outside": False}
     assert (ws / "output.txt").read_text() == "success"
     assert backup.read_text() == "restore"
