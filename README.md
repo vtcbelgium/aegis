@@ -90,6 +90,15 @@ fools the judge. Aegis never negotiates with a model:
   poisoned descriptions and cross-server shadowing — all on your machine.
 - **OWASP code audit.** Advisory scan of code the agent writes, and `aegis audit <path>`.
 
+- **Exact destructive confirmation.** Actions requiring destructive review include resolved
+  targets and measured impact. The owner must type `APPROVE DESTRUCTIVE: <operation> :: <target>`
+  exactly; generic consent and boolean approval callbacks cannot approve these requests.
+  Confirmations bind the full call and observed impact. Wildcard deletion is refused;
+  bounded ordinary deletes below the configured review threshold retain their existing policy.
+- **Restored Dojo.** All six historical knowledge packs and the registry are preserved with
+  provenance. `aegis dojo --mission "local regression"` runs bounded offline policy simulations.
+  See [Dojo coverage and limits](docs/dojo/COVERAGE.md).
+
 ## Install
 
 ```bash

@@ -163,9 +163,11 @@ def looks_like_url(val: str) -> bool:
 class AegisHarness:
     """Interceptor that gates tool execution in agent harnesses."""
 
-    def __init__(self, gate: Optional[AegisGate] = None, base_dir: Optional[str] = None) -> None:
+    def __init__(self, gate: Optional[AegisGate] = None, base_dir: Optional[str] = None,
+                 cwd: Optional[str] = None) -> None:
         self.gate = gate or AegisGate(base_dir=base_dir)
         self.base_dir = self.gate.base_dir
+        self.cwd = cwd
         self.hecatoncheires = HecatoncheiresClan()
 
     @property
@@ -207,7 +209,8 @@ class AegisHarness:
         if role == CONFIG:
             worse(Verdict(DecisionLevel.ASK, [f"{tool_name} changes connector/device configuration ({key_path})"], "AegisHarness"))
         elif role == COMMAND:
-            worse(TartarusClan.inspect_command(val, base_dir=self.base_dir, policy=self.policy, windows=windows))
+            worse(TartarusClan.inspect_command(val, base_dir=self.base_dir, cwd=self.cwd,
+                                              policy=self.policy, windows=windows))
         elif role == SQL:
             worse(TartarusClan.inspect_sql(val))
         elif role == URL or (role not in (CONTENT, CONFIG) and looks_like_url(val)):
@@ -281,6 +284,14 @@ class AegisHarness:
                     arguments = {"__arg__": arguments}
 
             # 2. Runaway loop detection: hashes argument VALUES rather than keys
+            for key, role in TOOL_SCHEMAS.get(tool_name, {}).items():
+                if key not in arguments or role not in (PATH_READ, PATH_WRITE, COMMAND, URL, SQL):
+                    continue
+                value = arguments[key]
+                paths = role == PATH_READ and key == "paths" and isinstance(value, list) and all(isinstance(p, str) for p in value)
+                if not isinstance(value, str) and not paths:
+                    return self.gate.record(Verdict(DecisionLevel.DENY,
+                        [f"Invalid {role} argument: {key} must contain text"], "AegisHarness"))
             loop_sig = make_action_signature(tool_name, arguments)
             loop_verdict = self.hecatoncheires.inspect_loop(loop_sig)
             if not loop_verdict.passed:
@@ -300,6 +311,8 @@ class AegisHarness:
             worst: Optional[Verdict] = None
             effects: set = set()
             sensitive_target: Optional[str] = None
+            destructive = []
+            impact = []
             for key_path, val in walk_arguments(arguments):
                 # Canary token in any argument (a decoy the agent is trying to use) -> LOCK.
                 if minotaur is not None and isinstance(val, str):
@@ -309,6 +322,8 @@ class AegisHarness:
                 role = self._role(tool_name, key_path)
                 v = self._check(tool_name, key_path, val, role, windows=windows, effects=effects)
                 if v is not None:
+                    destructive.extend(v.metadata.get("destructive") or [])
+                    impact.extend(v.metadata.get("impact") or [])
                     meta_fx = v.metadata.get("effects") if v.metadata else None
                     if "read_private" in (meta_fx or ()) or v.metadata.get("boundary") == "MASTER_SECRET_EXTRACTION":
                         sensitive_target = v.metadata.get("resolved") or sensitive_target or key_path
@@ -326,6 +341,10 @@ class AegisHarness:
                     worst = mv
 
             if worst is not None:
+                if destructive and worst.level == DecisionLevel.ASK:
+                    from .approval import bind_confirmation
+                    worst.metadata.update(destructive=destructive, impact=impact)
+                    worst = bind_confirmation(worst, {"tool": tool_name, "arguments": arguments})
                 return self.gate.record(worst)
 
             # All clans passed -> Zero authority added

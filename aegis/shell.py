@@ -207,6 +207,7 @@ class _Ctx:
     effects: set = field(default_factory=set)
     # Blast-radius measurements of deletes (aegis/impact.py)
     impact: List[dict] = field(default_factory=list)
+    destructive: List[dict] = field(default_factory=list)
     boundary: Optional[str] = None
 
 
@@ -248,7 +249,9 @@ def analyze_command(
         return Verdict(L.PASS, ["Command passed Tartarus inspection"], NAME, metadata=_meta(ctx))
     top = max(level for level, _ in ctx.findings)
     reasons = list(dict.fromkeys(r for level, r in ctx.findings if level == top))
-    return Verdict(top, reasons, NAME, metadata=_meta(ctx, ctx.boundary))
+    from .approval import bind_confirmation
+    return bind_confirmation(Verdict(top, reasons, NAME, metadata=_meta(ctx, ctx.boundary)),
+                             {"command": command, "cwd": ctx.cwd, "windows": windows})
 
 
 def _meta(ctx: "_Ctx", boundary: Optional[str] = None) -> dict:
@@ -257,6 +260,8 @@ def _meta(ctx: "_Ctx", boundary: Optional[str] = None) -> dict:
         meta["boundary"] = boundary
     if ctx.impact:
         meta["impact"] = ctx.impact
+    if ctx.destructive:
+        meta["destructive"] = ctx.destructive
     return meta
 
 
@@ -571,6 +576,7 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
         return None
 
     if mode == "delete" and not unresolved:
+        ctx.destructive.append({"operation": "delete", "target": abs_path})
         globless = abs_path
         if "*" in os.path.basename(abs_path) or "?" in os.path.basename(abs_path):
             globless = os.path.dirname(abs_path) or "/"
@@ -578,6 +584,9 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             if recursive or globless != abs_path or abs_path.rstrip("/\\") in ("", "/"):
                 raise _Lock(f"Catastrophic recursive deletion of root/system path: rm {raw}", boundaries.SYSTEM_DESTRUCTION)
             _add(ctx, L.DENY, f"Deleting a system/home location: {raw}")
+            return None
+        if any(c in abs_path for c in "*?[]"):
+            _add(ctx, L.DENY, "Destructive targets must be exact; wildcard deletion is refused")
             return None
 
     if unresolved:
@@ -1554,11 +1563,21 @@ def _rsync(args: List[str], ctx: _Ctx) -> None:
 
 
 def _git(args: List[str], ctx: _Ctx) -> None:
+    original_cwd = ctx.cwd
+    try:
+        _git_in_directory(args, ctx)
+    finally:
+        ctx.cwd = original_cwd
+
+
+def _git_in_directory(args: List[str], ctx: _Ctx) -> None:
     rest = list(args)
     while rest and rest[0].startswith("-"):
         opt = rest.pop(0)
         if opt in ("-C",) and rest:
-            _check_path(ctx, rest.pop(0), "cd")
+            directory = _check_path(ctx, rest.pop(0), "cd")
+            if directory:
+                ctx.cwd = directory
         elif opt.startswith(("--git-dir", "--work-tree")):
             val = opt.split("=", 1)[1] if "=" in opt else (rest.pop(0) if rest else "")
             _check_path(ctx, val, "write")
@@ -1587,6 +1606,7 @@ def _git(args: List[str], ctx: _Ctx) -> None:
                   (not a.startswith("-") and (a.startswith(":") or a.startswith("+")))]
         if forced:
             _add(ctx, L.ASK, f"git push {forced[0]} rewrites or deletes remote history (owner approval)")
+            ctx.destructive.append({"operation": "git-push", "target": ctx.cwd or ctx.base_dir or os.getcwd()})
         pos = [a for a in sargs if not a.startswith("-")]
         remote = pos[0] if pos else "origin"
         if "://" in remote or "@" in remote or remote.startswith(("/", ".", "~")):
@@ -1616,6 +1636,7 @@ def _git(args: List[str], ctx: _Ctx) -> None:
     lost = _git_discards_work(sub, sargs)
     if lost:
         _add(ctx, L.ASK, f"{lost} (owner approval)")
+        ctx.destructive.append({"operation": "git-" + sub, "target": ctx.cwd or ctx.base_dir or os.getcwd()})
     if sub in ("archive", "bundle", "format-patch", "worktree", "clean", "checkout", "restore",
                "add", "rm", "mv", "apply", "am", "diff", "log", "show", "status", "stash", "reset",
                "switch", "branch", "tag", "merge", "rebase", "cherry-pick", "commit", "init",
