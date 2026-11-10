@@ -43,3 +43,20 @@ def test_changed_delete_impact_invalidates_confirmation(tmp_path):
 
 def test_wildcard_targets_are_never_exact_approvals(tmp_path):
     assert analyze_command("rm -rf *.txt", base_dir=str(tmp_path)).level == L.DENY
+
+
+def test_changed_git_head_invalidates_the_same_command(tmp_path):
+    git = tmp_path / ".git"; git.mkdir()
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    (git / "refs" / "heads").mkdir(parents=True)
+    ref = git / "refs" / "heads" / "main"; ref.write_text("a" * 40)
+    a = analyze_command("git reset --hard", base_dir=str(tmp_path))
+    ref.write_text("b" * 40)
+    b = analyze_command("git reset --hard", base_dir=str(tmp_path))
+    assert not confirms(b, a.metadata["confirmation"]["phrase"], a.metadata["confirmation"]["digest"])
+
+
+def test_git_c_resolves_the_reviewed_repository(tmp_path):
+    nested = tmp_path / "nested"; nested.mkdir()
+    a = analyze_command("git -C nested reset --hard", base_dir=str(tmp_path))
+    assert a.metadata["confirmation"]["targets"][0]["target"].replace("\\", "/").endswith("/nested")
