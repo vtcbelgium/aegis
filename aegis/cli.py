@@ -304,6 +304,9 @@ def run_hook(post: bool = False, fmt: str = "claude") -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aegis: deterministic negative security gate & firewall for AI agents")
     sub = parser.add_subparsers(dest="subcommand")
+    dojo = sub.add_parser("dojo", help="Run bounded offline simulations from the six legacy knowledge packs")
+    dojo.add_argument("--mission", required=True)
+    dojo.add_argument("--pack", choices=("all", "01", "02", "03", "04", "05", "06"), default="all")
 
     ap = sub.add_parser("audit", help="Scan a file or directory for secrets and OWASP issues")
     ap.add_argument("path", default=".", nargs="?")
@@ -341,7 +344,12 @@ def main() -> None:
     svp.add_argument("--port", type=int, default=9999); svp.add_argument("--base-dir", default=".")
 
     args = parser.parse_args()
-    if args.subcommand == "audit":
+    if args.subcommand == "dojo":
+        from .dojo import run_dojo
+        report = run_dojo(mission=args.mission, pack=args.pack)
+        print(json.dumps(report, indent=2))
+        sys.exit(0 if report["passed"] else 1)
+    elif args.subcommand == "audit":
         sys.exit(run_audit(args.path))
     elif args.subcommand == "gate":
         sys.exit(run_gate_check(args.tool, args.args, base_dir=args.base_dir))

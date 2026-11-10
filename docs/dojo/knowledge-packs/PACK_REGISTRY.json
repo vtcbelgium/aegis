@@ -1,0 +1,46 @@
+{
+  "schema": "othrys.aegis.knowledge-pack-registry.v1",
+  "source": {
+    "id": "ceh-v9-study-guide-2016",
+    "classification": "FOUNDATIONAL_LEGACY_SECURITY_SOURCE",
+    "authority": "REFERENCE_ONLY"
+  },
+  "packs": [
+    {
+      "id": "CEH-AEGIS-01",
+      "file": "01-ATTACK-METHODOLOGY.md",
+      "consumer": "aegis-dojo",
+      "status": "HARVESTED_OVERVIEW"
+    },
+    {
+      "id": "CEH-AEGIS-02",
+      "file": "02-CRYPTO-IDENTITY.md",
+      "consumer": "aegis-seal/keymaster",
+      "status": "HARVESTED_OVERVIEW"
+    },
+    {
+      "id": "CEH-AEGIS-03",
+      "file": "03-DETECTION-EVASION.md",
+      "consumer": "minotaur/hecatoncheires",
+      "status": "HARVESTED_OVERVIEW"
+    },
+    {
+      "id": "CEH-AEGIS-04",
+      "file": "04-CONTAINMENT-INCIDENT-RESPONSE.md",
+      "consumer": "aegis/tartarus/sentinel",
+      "status": "HARVESTED_OVERVIEW"
+    },
+    {
+      "id": "CEH-AEGIS-05",
+      "file": "05-RECON-ATTACK-SURFACE.md",
+      "consumer": "labyrinth/inventory",
+      "status": "HARVESTED_OVERVIEW"
+    },
+    {
+      "id": "CEH-AEGIS-06",
+      "file": "06-APPLICATION-INFRASTRUCTURE-ATTACKS.md",
+      "consumer": "aegis-dojo/self-test",
+      "status": "HARVESTED_OVERVIEW"
+    }
+  ]
+}

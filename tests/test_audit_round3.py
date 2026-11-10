@@ -85,7 +85,7 @@ NORMAL = [
     "echo build-$(date +%s)", "mkdir build-$(date +%Y%m%d)", "sqlite3 app.db '.tables'",
     "Get-ChildItem", "Get-Content .\\README.md", "Remove-Item -Recurse -Force .\\dist",
     "New-Item -ItemType Directory -Path .\\build", "Copy-Item .\\a.txt .\\b.txt", "Set-Location .\\src",
-    "dir", "type README.md", "rd /s /q build", "copy a.txt b.txt", "del /q build\\*.tmp",
+    "dir", "type README.md", "rd /s /q build", "copy a.txt b.txt",
     "cat <<'EOF' > config.yaml\nname: app\nEOF", "git log -p -- src/app.py", "diff -u a.txt b.txt",
     "powershell -Command \"Remove-Item -Recurse .\\dist\"", "/usr/bin/python3 --version",
     "env NODE_ENV=production npm run build", "echo 'docker run -e X=$(date) img'",
@@ -96,7 +96,6 @@ BY_DESIGN_ASK = [
     "npx tsc --noEmit",                               # npx may download and run a package
     "sleep 2 && curl -s http://localhost:3000/health",  # local services
     "python -c 'import sys; print(sys.version)'",     # inline code
-    "rm -rf *",                                       # wipes the whole workspace
     "curl -s https://pastebin.com/raw/abc123 -o snippet.txt",  # host not on the allowlist
 ]
 

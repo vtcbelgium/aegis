@@ -101,7 +101,7 @@ class AegisGate:
         owner_secret: Optional[str] = None,
         max_violations_per_minute: int = 3,
         violation_window_seconds: float = 60.0,
-        approval_callback: Optional[Callable[[Verdict], bool]] = None,
+        approval_callback: Optional[Callable[[Verdict], Any]] = None,
         policy: Optional[Any] = None,
         ledger: Optional[Any] = None,
         minotaur: Optional[Any] = None,
@@ -186,7 +186,12 @@ class AegisGate:
         # 1. Human-in-the-loop approval, outside the lock
         if escalate and verdict.level == DecisionLevel.ASK and self.approval_callback:
             try:
-                approved = bool(self.approval_callback(verdict))
+                response = self.approval_callback(verdict)
+                if verdict.metadata.get("confirmation"):
+                    from .approval import confirms
+                    approved = confirms(verdict, response)
+                else:
+                    approved = response is True
             except Exception:
                 approved = False
             if approved:

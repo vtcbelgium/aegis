@@ -31,21 +31,21 @@ def sessions_dir() -> str:
     return os.path.join(aegis_home(), "sessions")
 
 
-def _path(session_id: str) -> str:
+def _path(session_id: str, directory: Optional[str] = None) -> str:
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("A nonempty session id is required")
     sid = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-    return os.path.join(sessions_dir(), f"{sid}.json")
+    return os.path.join(directory or sessions_dir(), f"{sid}.json")
 
 
-def load(session_id: str) -> Dict[str, Any]:
+def load(session_id: str, *, directory: Optional[str] = None) -> Dict[str, Any]:
     try:
         try:
-            fh = open(_path(session_id), "r", encoding="utf-8")
+            fh = open(_path(session_id, directory), "r", encoding="utf-8")
         except FileNotFoundError:
             # Preserve quarantines written by 1.0's original hook implementation.
             legacy = _SAFE_ID.sub("_", session_id)[:120]
-            fh = open(os.path.join(sessions_dir(), legacy + ".json"), "r", encoding="utf-8")
+            fh = open(os.path.join(directory or sessions_dir(), legacy + ".json"), "r", encoding="utf-8")
         with fh:
             data = json.load(fh)
         if not isinstance(data, dict) or type(data.get("level")) is not int:
@@ -58,8 +58,9 @@ def load(session_id: str) -> Dict[str, Any]:
         return {}
 
 
-def save(session_id: str, level: DecisionLevel, minotaur_state: Optional[Dict[str, Any]]) -> None:
-    path = _path(session_id)
+def save(session_id: str, level: DecisionLevel, minotaur_state: Optional[Dict[str, Any]], *,
+         directory: Optional[str] = None) -> None:
+    path = _path(session_id, directory)
     import tempfile
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".session-", dir=os.path.dirname(path))
@@ -75,15 +76,15 @@ def save(session_id: str, level: DecisionLevel, minotaur_state: Optional[Dict[st
 
 
 @contextmanager
-def transaction(session_id: str):
+def transaction(session_id: str, *, directory: Optional[str] = None):
     """Serialize the entire read/evaluate/write cycle, including post hooks."""
-    with _FileLock(_path(session_id)):
+    with _FileLock(_path(session_id, directory)):
         yield
 
 
-def apply_to_gate(gate, session_id: str) -> None:
+def apply_to_gate(gate, session_id: str, *, directory: Optional[str] = None) -> None:
     """Rehydrate a gate from the stored session (level + Minotaur memory)."""
-    data = load(session_id)
+    data = load(session_id, directory=directory)
     if not data:
         return
     gate.escalate(DecisionLevel(data["level"]))
@@ -91,6 +92,6 @@ def apply_to_gate(gate, session_id: str) -> None:
         gate.minotaur.import_state(data["minotaur"])
 
 
-def persist_from_gate(gate, session_id: str) -> None:
+def persist_from_gate(gate, session_id: str, *, directory: Optional[str] = None) -> None:
     minotaur_state = gate.minotaur.export_state() if gate.minotaur is not None else None
-    save(session_id, gate.current_level, minotaur_state)
+    save(session_id, gate.current_level, minotaur_state, directory=directory)

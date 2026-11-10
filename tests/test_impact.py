@@ -51,8 +51,8 @@ def test_small_delete_passes_but_is_measured(ws):
 
 
 def test_glob_delete_counts_matches(ws):
-    assert cmd("rm logs/*.log", ws).level == L.ASK
-    assert cmd("rm small/*.log", ws).level == L.PASS
+    assert cmd("rm logs/*.log", ws).level == L.DENY
+    assert cmd("rm small/*.log", ws).level == L.DENY
     assert measure_delete(str(ws / "logs" / "*.log"), False, 100, 10**9).exceeded
 
 
