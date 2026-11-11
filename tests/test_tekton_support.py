@@ -46,6 +46,23 @@ class TestTektonSupport(unittest.TestCase):
         # credential *stores* still lock: secret_level only covers secrets in arguments
         self.assertEqual(h.evaluate_tool_call("start_process", {"command": "cat ~/.ssh/id_rsa"}).level, L.LOCK)
 
+    def test_powershell_computer_info_is_read_only_but_unknown_and_destructive_stay_guarded(self):
+        h = self.harness()
+        query = "Get-ComputerInfo | Select-Object CsName, OsName"
+        self.assertEqual(
+            h.evaluate_tool_call("start_process", {"command": query, "shell": "powershell"}).level,
+            L.PASS,
+        )
+        self.assertEqual(
+            h.evaluate_tool_call("start_process", {"command": "MadeUp-ShellCommand", "shell": "powershell"}).level,
+            L.ASK,
+        )
+        destructive = "Get-ComputerInfo; Remove-Item -Recurse -Force C:\\Users"
+        self.assertEqual(
+            h.evaluate_tool_call("start_process", {"command": destructive, "shell": "powershell"}).level,
+            L.LOCK,
+        )
+
     def test_shell_hint_forces_windows_parsing(self):
         cmd = "Remove-Item -Recurse -Force C:\\Users\\me"
         self.assertEqual(TartarusClan.inspect_command(cmd, windows=True).level, L.LOCK)
