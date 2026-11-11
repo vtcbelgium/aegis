@@ -57,6 +57,13 @@ class AegisPolicy:
     # "lock" (default) or "ask": what a live credential in an argument or command leads to.
     # "ask" lets the owner approve deliberate cases such as writing a key into .env.
     secret_level: str = "lock"
+    # "ask" (default) or "allow": inline interpreter code (-c/-e/heredoc/piped stdin) inside an
+    # admitted workspace. Hard boundaries, secrets, reverse shells, destructive patterns, embedded
+    # URLs, and out-of-workspace / sensitive paths remain strictly enforced.
+    inline_exec: str = "ask"
+    # Local loopback ports (localhost / 127.0.0.1 / ::1) explicitly trusted by the owner (e.g. 11434).
+    # Cloud metadata (169.254.169.254) and non-allowlisted ports remain blocked/guarded.
+    allowed_loopback_ports: Set[int] = field(default_factory=set)
 
     # --- Hard boundaries (aegis/boundaries.py) ---
     # More paths that are part of the guard: the host's mode file, its identity key, its own code.
@@ -94,6 +101,9 @@ class AegisPolicy:
 
     def roots(self, base_dir: Optional[str]) -> List[str]:
         return ([base_dir] if base_dir else []) + [r for r in self.extra_roots if r]
+
+    def loopback_port_allowed(self, port: Optional[int]) -> bool:
+        return bool(port is not None and port in self.allowed_loopback_ports)
 
     def host_allowed(self, host: str) -> bool:
         host = (host or "").lower().strip(".")

@@ -47,8 +47,12 @@ NO_PATH_BINARIES = {
     "write-output", "write-host", "write", "get-date", "get-location", "gl",
     "get-process", "gps", "get-computerinfo", "get-command", "gcm", "get-help", "help", "measure-object", "measure",
     "select-object", "select", "sort-object", "where-object", "foreach-object",
-    "format-table", "ft", "format-list", "fl", "out-string", "out-null", "convertto-json",
-    "convertfrom-json", "split-path", "join-path", "get-host", "cls", "ver", "systeminfo",
+    "format-table", "ft", "format-list", "fl", "out-string", "out-null", "out-default",
+    "convertto-json", "convertfrom-json", "convertto-csv", "convertfrom-csv",
+    "split-path", "join-path", "get-host", "cls", "ver", "systeminfo",
+    "get-service", "gsv", "get-nettcpconnection", "test-netconnection", "tnc",
+    "get-volume", "get-disk", "get-pnpdevice", "get-ciminstance", "gcim",
+    "nvidia-smi", "lscpu", "lspci", "lsblk", "lsusb",
 }
 
 READ_BINARIES = {
@@ -58,7 +62,8 @@ READ_BINARIES = {
     "strings", "base64", "tac", "rev", "fold", "fmt", "expand", "unexpand", "iconv", "zcat",
     "bat", "fd", "exa", "eza", "lsof", "type",
     # PowerShell / cmd read-only
-    "get-childitem", "gci", "dir", "get-content", "gc", "get-item", "gi", "test-path",
+    "get-childitem", "gci", "dir", "get-content", "gc", "get-item", "gi", "get-itemproperty",
+    "gp", "test-path",
     "resolve-path", "get-filehash", "get-acl", "findstr", "where", "fc", "comp", "certutil-hash",
 }
 
@@ -478,7 +483,8 @@ def _analyze(text: str, ctx: _Ctx) -> None:
     if first.endswith(".exe"):
         first = first[:-4]
     ps_like = re.match(r"^([a-z]+)-[a-z]+$", first)
-    if first in CMD_BUILTINS or (ps_like and ps_like.group(1) in PS_VERBS) or first in POWERSHELLS or first == "cmd":
+    ps_var = bool(re.match(r"^\$(?:env:)?[a-z_][a-z0-9_]*=?$", first))
+    if first in CMD_BUILTINS or (ps_like and ps_like.group(1) in PS_VERBS) or first in POWERSHELLS or first == "cmd" or ps_var:
         windows = True
     try:
         tokens = _lex(text, windows)
@@ -649,17 +655,24 @@ def _check_url(ctx: _Ctx, url: str, upload: bool = False, allowlist: bool = True
         return
     if "://" not in url:
         url = "http://" + url
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "").lower()
     v = CustodyClan.inspect_url(url)
     if v.level >= L.LOCK:
         raise _Lock(v.reasons[0])
     if not v.passed:
         loopback_only = all("loopback" in r.lower() for r in v.reasons)
+        if (
+            loopback_only
+            and host in {"localhost", "127.0.0.1", "::1"}
+            and hasattr(ctx.policy, "loopback_port_allowed")
+            and ctx.policy.loopback_port_allowed(parsed.port)
+        ):
+            return
         _add(ctx, L.ASK if loopback_only else v.level,
              ("Local service access (owner approval): " if loopback_only else "") + "; ".join(v.reasons))
         return
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    scheme = (parsed.scheme or "").lower()
     # For Minotaur: anything fetched is untrusted content; anything sent, or any request to a
     # host outside the allowlist (the URL itself can carry data), is egress.
     ctx.effects.add("fetch")
@@ -731,15 +744,57 @@ def _analyze_segment(seg: Segment, ctx: _Ctx) -> None:
     if not words:
         return
 
-    # Leading VAR=value assignments (a segment of only assignments sets shell variables)
+    # Leading VAR=value or PowerShell $var = value / $env:VAR = value assignments
     assignments: List[Tuple[str, str]] = []
-    while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
-        name, _, value = words.pop(0).partition("=")
-        if boundaries.GUARD_ENV_RE.match(name):
-            raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
-        if name.upper() in DANGEROUS_ENV_OVERRIDES:
-            _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
-        assignments.append((name, value))
+    while words:
+        m_ps_inline = re.match(r"^\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", words[0], re.I)
+        m_ps_spaced = (
+            re.match(r"^\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)$", words[0], re.I)
+            if len(words) >= 2 and words[1] == "="
+            else None
+        )
+        if m_ps_inline:
+            name, value = m_ps_inline.group(1), m_ps_inline.group(2)
+            words.pop(0)
+            if boundaries.GUARD_ENV_RE.match(name):
+                raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
+            if name.upper() in DANGEROUS_ENV_OVERRIDES:
+                _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
+            if value:
+                words.insert(0, value)
+            else:
+                assignments.append((name, ""))
+            # If the RHS is a single scalar literal (not a command), record the variable and finish segment
+            if len(words) == 1 and not _has_subst(words[0]) and not any(c in words[0] for c in "/\\") \
+                    and not _is_known_command_word(_canon_binary(words[0])):
+                ctx.variables[name] = _expand_vars(words[0], ctx)
+                return
+            break
+        if m_ps_spaced:
+            name = m_ps_spaced.group(1)
+            words.pop(0)
+            words.pop(0)
+            if boundaries.GUARD_ENV_RE.match(name):
+                raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
+            if name.upper() in DANGEROUS_ENV_OVERRIDES:
+                _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
+            if not words:
+                assignments.append((name, ""))
+                break
+            if len(words) == 1 and not _has_subst(words[0]) and not any(c in words[0] for c in "/\\") \
+                    and not _is_known_command_word(_canon_binary(words[0])):
+                ctx.variables[name] = _expand_vars(words[0], ctx)
+                return
+            break
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+            name, _, value = words.pop(0).partition("=")
+            if boundaries.GUARD_ENV_RE.match(name):
+                raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
+            if name.upper() in DANGEROUS_ENV_OVERRIDES:
+                _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
+            assignments.append((name, value))
+            continue
+        break
     if not words:
         for name, value in assignments:
             ctx.variables[name] = _expand_vars(value, ctx)
@@ -752,6 +807,29 @@ def _analyze_segment(seg: Segment, ctx: _Ctx) -> None:
         words = m_brace.group(1).split(",") + words[1:]
 
     _dispatch(words, seg, ctx)
+
+
+def _is_known_command_word(name: str) -> bool:
+    return (
+        name in NO_PATH_BINARIES
+        or name in READ_BINARIES
+        or name in PATTERN_FIRST
+        or name in WRITE_BINARIES
+        or name in DELETE_BINARIES
+        or name in SHELLS
+        or name in POWERSHELLS
+        or name in INTERPRETERS
+        or name in PROJECT_TOOLS
+        or name in NETWORK_FETCHERS
+        or name in REMOTE_TOOLS
+        or name in SYSTEM_LOCK
+        or name in PRIVILEGE
+        or name in DENY_BINARIES
+        or name in ASK_BINARIES
+        or name in WRAPPERS
+        or name in CMD_BUILTINS
+        or name in {"git", "ollama", "cmd", "env", "xargs", "cd", "pushd", "chdir", "set-location", "sl", "popd", "source", ".", "eval", "awk", "gawk", "mawk", "nawk", "systemctl", "vssadmin"}
+    )
 
 
 def _expand_vars(word: str, ctx: _Ctx) -> str:
@@ -914,13 +992,12 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
     if name in ("iex", "invoke-expression") and seg.piped_in:
         _add(ctx, L.DENY, "Untrusted pipeline executed directly by Invoke-Expression")
         return
+    if name == "ollama":
+        return _ollama(args, ctx)
     if name in ASK_BINARIES:
         if name == "docker" and args and args[0] in {"ps", "images", "version", "info", "logs"}:
             return
-        if name == "gh" and len(args) >= 2 and (args[0], args[1]) in {
-            ("pr", "list"), ("pr", "view"), ("pr", "status"), ("pr", "checks"), ("pr", "diff"),
-            ("issue", "list"), ("issue", "view"), ("repo", "view"), ("run", "list"),
-            ("run", "view"), ("auth", "status")}:
+        if name == "gh" and _gh_safe(args, ctx):
             return
         if name == "kubectl" and args and args[0] in {"get", "describe", "logs", "version"}:
             return
@@ -1128,18 +1205,98 @@ def _powershell(args: List[str], seg: Segment, ctx: _Ctx) -> None:
     _add(ctx, L.ASK, "Spawning bare PowerShell session requires owner approval")
 
 
+def _ollama(args: List[str], ctx: _Ctx) -> None:
+    rest = [a for a in args if not a.startswith("-")]
+    if not args or args[0].lower() in ("-v", "--version", "-h", "--help", "help"):
+        return
+    if not rest:
+        return
+    sub = rest[0].lower()
+    if sub in ("list", "ls", "ps", "show", "run", "stop", "pull", "cp", "rm"):
+        return
+    if sub == "create":
+        it = list(args)
+        while it:
+            tok = it.pop(0)
+            if tok in ("-f", "--file") and it:
+                _check_path(ctx, it.pop(0), "read")
+            elif tok.startswith("--file="):
+                _check_path(ctx, tok.split("=", 1)[1], "read")
+        return
+    _add(ctx, L.ASK, f"ollama {sub} requires owner approval")
+
+
+def _gh_safe(args: List[str], ctx: _Ctx) -> bool:
+    pos = [a for a in args if not a.startswith("-")]
+    if not pos:
+        return False
+    if pos[0] in ("status", "version"):
+        return True
+    if len(pos) < 2:
+        return False
+    pair = (pos[0], pos[1])
+    if pair in {
+        ("pr", "list"), ("pr", "view"), ("pr", "status"), ("pr", "checks"), ("pr", "diff"),
+        ("pr", "create"), ("pr", "edit"), ("pr", "comment"), ("pr", "close"), ("pr", "reopen"),
+        ("pr", "ready"), ("pr", "merge"),
+        ("issue", "list"), ("issue", "view"), ("issue", "status"), ("issue", "create"),
+        ("issue", "edit"), ("issue", "comment"), ("issue", "close"), ("issue", "reopen"),
+        ("repo", "view"), ("repo", "list"),
+        ("run", "list"), ("run", "view"), ("run", "watch"), ("run", "rerun"),
+        ("workflow", "list"), ("workflow", "view"), ("workflow", "run"),
+        ("release", "list"), ("release", "view"),
+        ("auth", "status"),
+    }:
+        return True
+    if pair == ("repo", "clone"):
+        # gh repo clone <repo> [<directory>] [-- <gitflags>...]
+        if len(pos) >= 3:
+            _check_path(ctx, pos[2], "write")
+        return True
+    return False
+
+
+_INLINE_FS_ROOT_RE = re.compile(
+    r"^/(?:etc|root|home|Users|var|usr|opt|tmp|proc|sys|boot|mnt|media|srv|run|private|Library|System|Volumes)(?:/|$)"
+)
+
+
+def _looks_inline_fs_path(lit: str) -> bool:
+    if not lit or "://" in lit or "\n" in lit or len(lit) > 1024:
+        return False
+    if lit in ("~", "..", ".env") or lit.startswith(("~/", "~\\", "../", "..\\")):
+        return True
+    if looks_windows_path(lit):
+        return True
+    if _INLINE_FS_ROOT_RE.match(lit):
+        return True
+    if classify_sensitive(lit, lit) in ("critical", "secret", "startup"):
+        return True
+    return False
+
+
 def _inline_code(ctx: _Ctx, interpreter: str, code: str) -> None:
-    """Inline code (-c/-e/heredoc): find embedded shell commands, else ask the owner."""
-    for lit in re.findall(r"'([^'\n]{3,})'|\"([^\"\n]{3,})\"", code):
+    """Inline code (-c/-e/heredoc): find embedded shell commands, else ask the owner (unless policy allows)."""
+    for lit in re.findall(r"'([^'\n]{2,})'|\"([^\"\n]{2,})\"", code):
         s = lit[0] or lit[1]
-        first = _canon_binary((s.strip().split() or [""])[0])
-        if first in DELETE_BINARIES | SYSTEM_LOCK | NETWORK_FETCHERS | SHELLS | POWERSHELLS | {"find", "dd", "chmod", "mv", "cp", "git", "tar", "rsync"}:
-            _analyze_nested(s, ctx)
+        if len(s) >= 3:
+            first = _canon_binary((s.strip().split() or [""])[0])
+            if first in DELETE_BINARIES | SYSTEM_LOCK | NETWORK_FETCHERS | SHELLS | POWERSHELLS | {"find", "dd", "chmod", "mv", "cp", "git", "tar", "rsync"}:
+                _analyze_nested(s, ctx)
+                continue
+        s_clean = s.strip()
+        if re.match(r"^https?://\S+$", s_clean, re.I):
+            _check_url(ctx, s_clean)
+        elif _looks_inline_fs_path(s_clean):
+            _check_path(ctx, s_clean, "read")
     if REVERSE_SHELL_RE.search(code) and re.search(r"subprocess|pty\.spawn|os\.dup2|/bin/(?:ba)?sh|child_process|exec\(", code):
         _add(ctx, L.DENY, f"Reverse-shell pattern in inline {interpreter} code (socket + process)")
         return
     if DESTRUCTIVE_CODE_RE.search(code):
         _add(ctx, L.DENY, f"Destructive operation in inline {interpreter} code")
+        return
+    if getattr(ctx.policy, "inline_exec", "ask") == "allow" and ctx.base_dir is not None:
+        _project_exec(ctx, f"inline {interpreter}")
         return
     _add(ctx, L.ASK, f"Inline interpreter code execution ({interpreter}) requires human owner approval")
 
@@ -1206,6 +1363,9 @@ def _interpreter(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
     if seg.heredoc is not None or seg.herestring is not None:
         return _inline_code(ctx, name, seg.heredoc if seg.heredoc is not None else seg.herestring)
     if seg.piped_in:
+        if getattr(ctx.policy, "inline_exec", "ask") == "allow" and ctx.base_dir is not None and not ctx.untrusted_download:
+            _project_exec(ctx, f"piped {name}")
+            return
         _add(ctx, L.DENY, f"Untrusted pipeline execution directly into interpreter ({name})")
         return
     _add(ctx, L.ASK, f"Interactive {name} session requires owner approval")
@@ -1570,6 +1730,28 @@ def _git(args: List[str], ctx: _Ctx) -> None:
         ctx.cwd = original_cwd
 
 
+_SAFE_GIT_CONFIG_KEYS = {
+    "core.autocrlf", "core.safecrlf", "core.eol", "core.quotepath", "core.longpaths",
+    "core.filemode", "core.symlinks", "core.ignorecase",
+    "user.name", "user.email", "init.defaultbranch",
+    "pull.rebase", "pull.ff", "fetch.prune", "merge.ff", "rebase.autostash",
+    "http.postbuffer", "http.version", "safe.directory",
+    "diff.renames", "diff.algorithm", "status.showuntrackedfiles",
+    "commit.gpgsign", "tag.gpgsign", "gc.auto", "pack.threads",
+}
+
+
+def _git_config_key_safe(raw_kv: str) -> bool:
+    key = (raw_kv or "").split("=", 1)[0].strip().lower()
+    if not key:
+        return False
+    if key in _SAFE_GIT_CONFIG_KEYS:
+        return True
+    if key.startswith(("color.", "advice.")):
+        return True
+    return False
+
+
 def _git_in_directory(args: List[str], ctx: _Ctx) -> None:
     rest = list(args)
     while rest and rest[0].startswith("-"):
@@ -1581,9 +1763,13 @@ def _git_in_directory(args: List[str], ctx: _Ctx) -> None:
         elif opt.startswith(("--git-dir", "--work-tree")):
             val = opt.split("=", 1)[1] if "=" in opt else (rest.pop(0) if rest else "")
             _check_path(ctx, val, "write")
-        elif opt in ("-c", "--config-env") or opt.startswith("--exec-path"):
+        elif opt == "-c" or (opt.startswith("-c") and len(opt) > 2 and not opt.startswith("--")):
+            cfg = opt[2:] if len(opt) > 2 else (rest.pop(0) if rest else "")
+            if not _git_config_key_safe(cfg):
+                _add(ctx, L.ASK, "git -c / --exec-path can run arbitrary programs (owner approval)")
+        elif opt == "--config-env" or opt.startswith(("--config-env=", "--exec-path")):
             _add(ctx, L.ASK, "git -c / --exec-path can run arbitrary programs (owner approval)")
-            if opt in ("-c", "--config-env") and rest:
+            if opt == "--config-env" and rest:
                 rest.pop(0)
     if not rest:
         return

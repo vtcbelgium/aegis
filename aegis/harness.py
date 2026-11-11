@@ -55,18 +55,23 @@ TOOL_SCHEMAS: Dict[str, Dict[str, str]] = {
                    "expected_replacements": VALUE},
     "create_directory": {"path": PATH_WRITE},
     "list_directory": {"path": PATH_READ, "depth": VALUE},
-    "move_file": {"source": PATH_WRITE, "destination": PATH_WRITE},
+    "move_file": {"source": PATH_WRITE, "destination": PATH_WRITE, "overwrite": VALUE},
     "get_file_info": {"path": PATH_READ},
     "start_search": {"path": PATH_READ, "pattern": CONTENT, "searchType": VALUE, "filePattern": VALUE,
                      "ignoreCase": VALUE, "maxResults": VALUE, "includeHidden": VALUE,
                      "contextLines": VALUE, "timeout_ms": VALUE, "earlyTermination": VALUE,
                      "literalSearch": VALUE},
-    "search": {"path": PATH_READ, "pattern": CONTENT, "query": CONTENT},
-    "start_process": {"command": COMMAND, "timeout_ms": VALUE, "shell": VALUE, "verbose_timing": VALUE},
+    "search": {"path": PATH_READ, "pattern": CONTENT, "query": CONTENT, "searchType": VALUE,
+               "filePattern": VALUE, "ignoreCase": VALUE, "maxResults": VALUE, "includeHidden": VALUE,
+               "contextLines": VALUE, "timeout_ms": VALUE, "earlyTermination": VALUE,
+               "literalSearch": VALUE},
+    "start_process": {"command": COMMAND, "cwd": PATH_READ, "timeout_ms": VALUE, "shell": VALUE,
+                      "verbose_timing": VALUE},
     "interact_with_process": {"pid": VALUE, "input": COMMAND, "timeout_ms": VALUE, "wait_for_prompt": VALUE,
                               "verbose_timing": VALUE},
     "read_process_output": {"pid": VALUE, "timeout_ms": VALUE, "offset": VALUE, "length": VALUE},
     "force_terminate": {"pid": VALUE},
+    "kill_process": {"pid": VALUE},
     "list_processes": {}, "list_sessions": {}, "list_searches": {}, "get_config": {},
     "get_more_search_results": {"sessionId": VALUE, "offset": VALUE, "length": VALUE},
     "stop_search": {"sessionId": VALUE},
@@ -191,7 +196,7 @@ class AegisHarness:
         return role
 
     def _check(self, tool_name: str, key_path: str, val: str, role: str, windows: bool = False,
-               effects: Optional[set] = None) -> Optional[Verdict]:
+               effects: Optional[set] = None, cmd_cwd: Optional[str] = None) -> Optional[Verdict]:
         """Return a non-PASS verdict for one string argument, or None if it is fine.
 
         Any session effects (read_private, fetch, egress) are added to the ``effects`` set
@@ -209,7 +214,7 @@ class AegisHarness:
         if role == CONFIG:
             worse(Verdict(DecisionLevel.ASK, [f"{tool_name} changes connector/device configuration ({key_path})"], "AegisHarness"))
         elif role == COMMAND:
-            worse(TartarusClan.inspect_command(val, base_dir=self.base_dir, cwd=self.cwd,
+            worse(TartarusClan.inspect_command(val, base_dir=self.base_dir, cwd=cmd_cwd or self.cwd,
                                               policy=self.policy, windows=windows))
         elif role == SQL:
             worse(TartarusClan.inspect_sql(val))
@@ -217,19 +222,42 @@ class AegisHarness:
             if looks_like_url(val) or role == URL:
                 url = val if "://" in val else ("http://" + val if role == URL and "." in val and " " not in val else "")
                 if url:
-                    worse(CustodyClan.inspect_url(url))
                     from urllib.parse import urlparse
-                    host = urlparse(url).hostname or ""
-                    if effects is not None:
-                        effects.add("fetch")
+                    parsed = urlparse(url)
+                    host = (parsed.hostname or "").lower()
+                    uv = CustodyClan.inspect_url(url)
+                    loopback_allowed = (
+                        not uv.passed
+                        and uv.level < DecisionLevel.LOCK
+                        and host in {"localhost", "127.0.0.1", "::1"}
+                        and all("loopback" in r.lower() for r in uv.reasons)
+                        and hasattr(self.policy, "loopback_port_allowed")
+                        and self.policy.loopback_port_allowed(parsed.port)
+                    )
+                    if not loopback_allowed:
+                        worse(uv)
+                        if effects is not None:
+                            effects.add("fetch")
+                            if not self.policy.host_allowed(host):
+                                effects.add("egress")
                         if not self.policy.host_allowed(host):
-                            effects.add("egress")
-                    if not self.policy.host_allowed(host):
-                        worse(Verdict(DecisionLevel.ASK,
-                                      [f"Network access outside the allowlist: {host}"], "Custody"))
+                            worse(Verdict(DecisionLevel.ASK,
+                                          [f"Network access outside the allowlist: {host}"], "Custody"))
         if role in (PATH_READ, PATH_WRITE):
             if tool_name == "read_file" and looks_like_url(val):
-                worse(CustodyClan.inspect_url(val))
+                from urllib.parse import urlparse
+                parsed = urlparse(val)
+                host = (parsed.hostname or "").lower()
+                uv = CustodyClan.inspect_url(val)
+                if not (
+                    not uv.passed
+                    and uv.level < DecisionLevel.LOCK
+                    and host in {"localhost", "127.0.0.1", "::1"}
+                    and all("loopback" in r.lower() for r in uv.reasons)
+                    and hasattr(self.policy, "loopback_port_allowed")
+                    and self.policy.loopback_port_allowed(parsed.port)
+                ):
+                    worse(uv)
             else:
                 mode = "write" if role == PATH_WRITE else "read"
                 if tool_name == "move_file" and key_path.split("[")[0] == "source":
@@ -307,6 +335,8 @@ class AegisHarness:
             shell = arguments.get("shell") if isinstance(arguments, dict) else None
             windows = bool(re.search(r"powershell|pwsh|cmd", shell, re.I)) if isinstance(shell, str) and shell \
                 else os.name == "nt"
+            arg_cwd = arguments.get("cwd") if isinstance(arguments, dict) else None
+            cmd_cwd = arg_cwd if isinstance(arg_cwd, str) and arg_cwd.strip() else self.cwd
             minotaur = getattr(self.gate, "minotaur", None)
             worst: Optional[Verdict] = None
             effects: set = set()
@@ -320,7 +350,7 @@ class AegisHarness:
                     if trip is not None:
                         return self.gate.record(trip)
                 role = self._role(tool_name, key_path)
-                v = self._check(tool_name, key_path, val, role, windows=windows, effects=effects)
+                v = self._check(tool_name, key_path, val, role, windows=windows, effects=effects, cmd_cwd=cmd_cwd)
                 if v is not None:
                     destructive.extend(v.metadata.get("destructive") or [])
                     impact.extend(v.metadata.get("impact") or [])
