@@ -45,7 +45,7 @@ NO_PATH_BINARIES = {
     "fg", "bg", "alias", "unalias", "shopt", "umask", "ulimit", "trap", "local", "readonly",
     "unset", "hash", "getconf", "arch", "cal", "yes", "free", "ps", "top", "htop", "df",
     "write-output", "write-host", "write", "get-date", "get-location", "gl",
-    "get-process", "gps", "get-command", "gcm", "get-help", "help", "measure-object", "measure",
+    "get-process", "gps", "get-computerinfo", "get-command", "gcm", "get-help", "help", "measure-object", "measure",
     "select-object", "select", "sort-object", "where-object", "foreach-object",
     "format-table", "ft", "format-list", "fl", "out-string", "out-null", "convertto-json",
     "convertfrom-json", "split-path", "join-path", "get-host", "cls", "ver", "systeminfo",
