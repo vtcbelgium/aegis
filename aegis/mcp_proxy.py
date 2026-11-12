@@ -270,3 +270,108 @@ class AegisMcpProxy:
             req_id = rpc_response.get("id") if isinstance(rpc_response, dict) else None
             return False, {"jsonrpc": "2.0", "id": req_id, "result": {"isError": True, "content": [
                 {"type": "text", "text": "[AEGIS: tool output withheld because it could not be scanned]"}]}}, v
+
+
+def run_mcp_proxy_stdio(
+    command: List[str],
+    server_id: Optional[str] = None,
+    base_dir: Optional[str] = None,
+    pins_path: Optional[str] = None,
+    auto_pin_new: bool = True,
+) -> int:
+    """Run Aegis as a stdio proxy between an agent host and an upstream MCP server subprocess."""
+    import json
+    import subprocess
+    import sys
+    import threading
+    from .pinning import ToolPins
+
+    if not command:
+        sys.stderr.write("Error: no command provided for upstream MCP server\n")
+        return 1
+
+    pins = None
+    if server_id:
+        pins_file = pins_path or os.path.expanduser("~/.aegis/pins.json")
+        pins = ToolPins(pins_file)
+
+    proxy = AegisMcpProxy(base_dir=base_dir, tool_pins=pins, server_id=server_id)
+
+    # Launch upstream MCP server subprocess communicating via stdio pipes
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        text=True,
+        bufsize=1,
+    )
+
+    def host_to_upstream():
+        try:
+            for line in sys.stdin:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                try:
+                    rpc = json.loads(line_str)
+                except Exception:
+                    # Non-JSON or malformed line passed as-is
+                    if proc.stdin:
+                        proc.stdin.write(line_str + "\n")
+                        proc.stdin.flush()
+                    continue
+
+                should_forward, error_resp, _verdict = proxy.filter_request(rpc)
+                if should_forward:
+                    if proc.stdin:
+                        proc.stdin.write(json.dumps(rpc) + "\n")
+                        proc.stdin.flush()
+                else:
+                    if error_resp:
+                        sys.stdout.write(json.dumps(error_resp) + "\n")
+                        sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+    def upstream_to_host():
+        try:
+            if not proc.stdout:
+                return
+            for line in proc.stdout:
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                try:
+                    rpc = json.loads(line_str)
+                except Exception:
+                    sys.stdout.write(line_str + "\n")
+                    sys.stdout.flush()
+                    continue
+
+                # Auto-pin newly observed server tools on tools/list response
+                if auto_pin_new and pins and server_id and isinstance(rpc, dict):
+                    result = rpc.get("result")
+                    if isinstance(result, dict) and "tools" in result and isinstance(result["tools"], list):
+                        pins.pin_if_new(server_id, result["tools"])
+
+                should_forward, filtered_resp, _verdict = proxy.filter_response(rpc)
+                to_send = filtered_resp if filtered_resp is not None else (rpc if should_forward else None)
+                if to_send is not None:
+                    sys.stdout.write(json.dumps(to_send) + "\n")
+                    sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    t_in = threading.Thread(target=host_to_upstream, daemon=True)
+    t_in.start()
+
+    upstream_to_host()
+    proc.wait()
+    return proc.returncode or 0
