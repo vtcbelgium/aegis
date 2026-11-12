@@ -329,6 +329,12 @@ def main() -> None:
     spn.add_argument("action", choices=["probe", "run"]); spn.add_argument("command", nargs="?")
     spn.add_argument("--base-dir", default=None)
 
+    mcpp = sub.add_parser("mcp-proxy", help="Transparent stdio MCP security proxy wrapping an upstream server command")
+    mcpp.add_argument("--server-id", default=None, help="Stable identifier for MCP tool pinning & fingerprinting")
+    mcpp.add_argument("--base-dir", default=None, help="Base directory for path confinement & workspace policies")
+    mcpp.add_argument("--pins-file", default=None, help="Custom path for pins.json")
+    mcpp.add_argument("command", nargs=argparse.REMAINDER, help="Upstream MCP server command (e.g. -- npx -y @modelcontextprotocol/server-filesystem /tmp)")
+
     pp = sub.add_parser("pin", help="MCP tool pinning: check or pin a server's tools")
     pp.add_argument("action", choices=["check", "pin"]); pp.add_argument("server"); pp.add_argument("tools")
 
@@ -361,6 +367,12 @@ def main() -> None:
         sys.exit(run_ledger(args.action, args.n, args.expect_tip))
     elif args.subcommand == "sandbox":
         sys.exit(run_sandbox(args.action, args.command, args.base_dir))
+    elif args.subcommand == "mcp-proxy":
+        from .mcp_proxy import run_mcp_proxy_stdio
+        cmd = args.command
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        sys.exit(run_mcp_proxy_stdio(cmd, server_id=args.server_id, base_dir=args.base_dir, pins_path=args.pins_file))
     elif args.subcommand == "pin":
         sys.exit(run_pin(args.action, args.server, args.tools))
     elif args.subcommand == "learn":
