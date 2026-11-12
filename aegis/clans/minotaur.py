@@ -110,8 +110,8 @@ def _mint_canary(kind: str) -> str:
         "github": "ghp_" + b62[:36],
         "openai": "sk-" + b62[:44],
         "stripe": "sk_live_" + b62[:24],
-        "generic": "AG-CANARY-" + body,
-    }.get(kind, "AG-CANARY-" + body)
+        "generic": "sec_live_" + b62[:32],
+    }.get(kind, "sec_live_" + b62[:32])
 
 
 DEFAULT_DECOYS = (
