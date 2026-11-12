@@ -184,6 +184,10 @@ SENSITIVE_AUTOEXEC = [
     r"/\.husky/",
     r"/\.envrc/",
     r"/\.vscode/tasks\.json/",
+    r"/\.github/workflows/",
+    r"/sitecustomize\.py/",
+    r"/usercustomize\.py/",
+    r"/conftest\.py/",
 ]
 
 SENSITIVE_PATH_PATTERNS = SENSITIVE_CRITICAL + SENSITIVE_STARTUP + SENSITIVE_SECRET_FILE + SENSITIVE_AUTOEXEC

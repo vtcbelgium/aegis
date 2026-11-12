@@ -282,8 +282,12 @@ def canonicalize_ip(host_or_ip: str) -> Tuple[Optional[ipaddress.IPv4Address | i
     return None, False
 
 
-def resolve_host_ips(hostname: str) -> List[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    """Resolve a hostname to its IP addresses to detect DNS rebinding or nip.io/sslip.io evasions."""
+def resolve_host_ips(hostname: str, *, allow_live_dns: bool = False) -> List[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve a hostname to its IP addresses to detect DNS rebinding or nip.io/sslip.io evasions.
+
+    Purely deterministic & offline by default to eliminate synchronous DNS side-channels
+    and TTL=0 rebinding TOCTOU during sub-millisecond gate evaluation.
+    """
     ips: List[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     clean_host = hostname.strip().lower()
 
@@ -303,8 +307,8 @@ def resolve_host_ips(hostname: str) -> List[ipaddress.IPv4Address | ipaddress.IP
     if clean_host in {"localhost", "localhost.localdomain"}:
         return [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")]
 
-    # Live DNS resolution fallback only for domain names with dots
-    if "." in clean_host and not clean_host.endswith(".internal"):
+    # Optional live DNS resolution fallback (disabled by default for 0-network deterministic evaluation)
+    if allow_live_dns and "." in clean_host and not clean_host.endswith(".internal"):
         try:
             results = socket.getaddrinfo(clean_host, None)
             for res in results:
