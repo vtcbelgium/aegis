@@ -146,6 +146,99 @@ class TestTektonSupport(unittest.TestCase):
         # PowerShell guard env tamper still LOCKs
         self.assertEqual(eval_fresh("$env:AEGIS_MODE = 'off'").level, L.LOCK)
 
+    def test_powershell_safe_formatting_and_readonly_property_chains(self):
+        h = self.harness(extra_roots=[self.b], strict_tools=True)
+        safe_cmds = [
+            "(Get-Date).ToString('o')",
+            "Write-Output 'TEKTON_SMOKE_OK'; (Get-Date).ToString('o')",
+            "(Get-Date).ToUniversalTime().ToString('o')",
+            "$PSVersionTable.PSVersion.ToString()",
+            "[DateTime]::UtcNow.ToString('o')",
+            "[Environment]::OSVersion.VersionString",
+            "Write-Output 'ok'; ($PSVersionTable.PSVersion).ToString()",
+        ]
+        for cmd in safe_cmds:
+            v = h.evaluate_tool_call("start_process", {"command": cmd, "shell": "powershell"})
+            self.assertEqual(v.level, L.PASS, f"Expected PASS for {cmd!r}, got {v.level}: {v.reasons}")
+
+        # Dangerous inner commands or unsafe methods/types must stay guarded
+        self.assertEqual(
+            h.evaluate_tool_call(
+                "start_process",
+                {"command": "(Remove-Item C:\\Windows\\win.ini).ToString('o')", "shell": "powershell"},
+            ).level,
+            L.DENY,
+        )
+        self.assertEqual(
+            h.evaluate_tool_call(
+                "start_process",
+                {"command": "(Get-Item foo).Delete()", "shell": "powershell"},
+            ).level,
+            L.ASK,
+        )
+        self.assertIn(
+            h.evaluate_tool_call(
+                "start_process",
+                {"command": "[System.IO.File]::ReadAllText('C:\\Windows\\win.ini')", "shell": "powershell"},
+            ).level,
+            (L.ASK, L.DENY),
+        )
+        self.assertEqual(
+            h.evaluate_tool_call(
+                "start_process",
+                {"command": "[System.IO.File]::ReadAllText('notes.txt')", "shell": "powershell"},
+            ).level,
+            L.ASK,
+        )
+        self.assertEqual(
+            h.evaluate_tool_call(
+                "start_process",
+                {"command": "$unknownCmd", "shell": "powershell"},
+            ).level,
+            L.ASK,
+        )
+        self.assertEqual(
+            h.evaluate_tool_call(
+                "start_process",
+                {"command": "(Get-Date).ToString('o') > C:\\Windows\\win.ini", "shell": "powershell"},
+            ).level,
+            L.DENY,
+        )
+
+    def test_concurrent_ledger_and_session_transaction_thread_safety(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from aegis import session
+        from aegis.core import Verdict
+        from aegis.ledger import DecisionLedger
+
+        ledger_path = os.path.join(self.a, "decisions.jsonl")
+        sess_dir = os.path.join(self.a, "sessions")
+        errors = []
+
+        def worker(idx: int) -> None:
+            try:
+                sess_id = f"concurrent-sess-{idx % 3}"
+                with session.transaction(sess_id, directory=sess_dir):
+                    gate = AegisGate(base_dir=self.a, policy=AegisPolicy())
+                    session.apply_to_gate(gate, sess_id, directory=sess_dir)
+                    ledger = DecisionLedger(ledger_path, session=sess_id)
+                    ledger.record(
+                        Verdict(L.PASS, ["ok"], "Tartarus"),
+                        tool="start_process",
+                        arguments={"command": f"echo {idx}"},
+                    )
+                    session.persist_from_gate(gate, sess_id, directory=sess_dir)
+            except Exception as exc:
+                errors.append(exc)
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            list(pool.map(worker, range(36)))
+
+        self.assertEqual(errors, [])
+        res = DecisionLedger(ledger_path).verify()
+        self.assertTrue(res.ok, res.problem)
+        self.assertEqual(res.count, 36)
+
 
 if __name__ == "__main__":
     unittest.main()

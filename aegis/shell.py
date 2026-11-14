@@ -156,6 +156,31 @@ SAFE_PY_MODULES = {"pip", "venv", "virtualenv", "pytest", "unittest", "doctest",
                    "build", "mypy", "black", "ruff", "flake8", "pylint", "isort", "coverage",
                    "tox", "nox", "pydoc", "site", "sysconfig", "platform", "this", "pyflakes"}
 
+SAFE_PS_MEMBERS = frozenset({
+    "tostring", "touniversaltime", "tolocaltime", "toshortdatestring", "tolongdatestring",
+    "toshorttimestring", "tolongtimestring", "tofiletime", "tofiletimeutc",
+    "tounixtimeseconds", "tounixtimemilliseconds", "trim", "trimstart", "trimend",
+    "tolower", "toupper", "tolowerinvariant", "toupperinvariant", "substring",
+    "replace", "split", "contains", "startswith", "endswith", "indexof",
+    "padleft", "padright", "length", "count", "path", "fullname", "name",
+    "basename", "extension", "directoryname", "exists", "psversion", "psedition",
+    "version", "versionstring", "major", "minor", "build", "revision",
+    "year", "month", "day", "hour", "minute", "second", "millisecond",
+    "dayofweek", "dayofyear", "date", "timeofday", "ticks", "totalmilliseconds",
+    "totalseconds", "totalminutes", "totalhours", "totaldays", "keys", "values", "value",
+})
+SAFE_PS_AUTO_VARS = frozenset({
+    "$psversiontable", "$pwd", "$pid", "$psculture", "$psuiculture",
+    "$iswindows", "$islinux", "$ismacos", "$true", "$false", "$null",
+})
+SAFE_PS_STATIC_ROOTS = frozenset({
+    "[datetime]::now", "[datetime]::utcnow", "[datetime]::today",
+    "[datetimeoffset]::now", "[datetimeoffset]::utcnow",
+    "[guid]::newguid", "[environment]::osversion", "[environment]::processorcount",
+    "[environment]::version", "[environment]::is64bitos",
+    "[environment]::is64bitprocess", "[environment]::newline",
+})
+
 DANGEROUS_ENV_OVERRIDES = {"PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
                            "DYLD_LIBRARY_PATH", "PYTHONPATH", "PYTHONSTARTUP", "NODE_OPTIONS",
                            "BASH_ENV", "ENV", "PROMPT_COMMAND", "GIT_SSH_COMMAND", "GIT_SSH",
@@ -403,6 +428,114 @@ def _lex(text: str, windows: bool) -> List[str]:
     return list(lex)
 
 
+def _is_safe_ps_arg_token(tok: str) -> bool:
+    if not tok or len(tok) > 128:
+        return False
+    if all(c in "<>&|;()\n" for c in tok):
+        return False
+    if "$" in tok or _has_subst(tok) or "/" in tok or "\\" in tok:
+        return False
+    return True
+
+
+def _is_safe_member_chain(chain: str) -> bool:
+    if not chain.startswith("."):
+        return False
+    parts = chain[1:].split(".")
+    return bool(parts) and all(
+        bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", p)) and p.lower() in SAFE_PS_MEMBERS
+        for p in parts
+    )
+
+
+def _consume_safe_ps_call_args(tokens: List[str], idx: int) -> Optional[int]:
+    """If tokens[idx:] starts with '()' or '( <safe args> )', return index after closing ')'."""
+    n = len(tokens)
+    if idx >= n:
+        return None
+    if tokens[idx] == "()":
+        return idx + 1
+    if tokens[idx] != "(":
+        return None
+    k = idx + 1
+    while k < n:
+        tok = tokens[k]
+        if tok == ")":
+            return k + 1
+        if tok != "," and not _is_safe_ps_arg_token(tok):
+            return None
+        k += 1
+    return None
+
+
+def _is_seg_start_op(tok: str) -> bool:
+    return tok == _SEMI or (bool(tok) and all(c in ";&|(\n" for c in tok))
+
+
+def _is_seg_end_op(tok: str) -> bool:
+    return tok == _SEMI or (bool(tok) and all(c in "<>&|;)\n" for c in tok))
+
+
+def _split_ps_root_token(tok: str) -> Tuple[str, str]:
+    if "::" in tok:
+        idx = tok.find(".", tok.find("::") + 2)
+    else:
+        idx = tok.find(".")
+    if idx == -1:
+        return tok, ""
+    return tok[:idx], tok[idx:]
+
+
+def _consume_safe_member_suffix(tokens: List[str], j: int) -> int:
+    n = len(tokens)
+    while j < n and _is_safe_member_chain(tokens[j]):
+        next_idx = _consume_safe_ps_call_args(tokens, j + 1)
+        if next_idx is not None:
+            j = next_idx
+            continue
+        if j + 1 < n and tokens[j + 1].startswith("("):
+            break
+        j += 1
+    return j
+
+
+def _strip_safe_ps_member_chains(tokens: List[str]) -> List[str]:
+    """Strip safe read-only PowerShell formatting/member tails while preserving inner commands."""
+    out: List[str] = []
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok.endswith(")") and all(c == ")" for c in tok) and tok != "()":
+            out.append(tok)
+            i = _consume_safe_member_suffix(tokens, i + 1)
+            continue
+
+        at_seg_start = i == 0 or _is_seg_start_op(tokens[i - 1])
+        if at_seg_start:
+            root, member_rest = _split_ps_root_token(tok)
+            low_root = root.lower()
+            if (low_root in SAFE_PS_AUTO_VARS or low_root in SAFE_PS_STATIC_ROOTS) and (
+                not member_rest or _is_safe_member_chain(member_rest)
+            ):
+                j = i + 1
+                after_args = _consume_safe_ps_call_args(tokens, j)
+                if after_args is not None:
+                    j = after_args
+                elif j < n and tokens[j].startswith("("):
+                    out.append(tok)
+                    i += 1
+                    continue
+                j = _consume_safe_member_suffix(tokens, j)
+                if j >= n or _is_seg_end_op(tokens[j]):
+                    out.append("true")
+                    i = j
+                    continue
+
+        out.append(tok)
+        i += 1
+    return out
+
+
 def _split_segments(tokens: List[str]) -> List[Segment]:
     segments: List[Segment] = []
     cur = Segment()
@@ -484,10 +617,24 @@ def _analyze(text: str, ctx: _Ctx) -> None:
         first = first[:-4]
     ps_like = re.match(r"^([a-z]+)-[a-z]+$", first)
     ps_var = bool(re.match(r"^\$(?:env:)?[a-z_][a-z0-9_]*=?$", first))
-    if first in CMD_BUILTINS or (ps_like and ps_like.group(1) in PS_VERBS) or first in POWERSHELLS or first == "cmd" or ps_var:
+    ps_expr = text.lstrip().startswith(("(", "[", "$")) and bool(
+        re.search(
+            r"(?:\.(?:tostring|touniversaltime|tolocaltime|psversion)\b|::(?:now|utcnow|today|newguid|osversion|version|newline)\b|\$psversiontable\b|\bget-date\b)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if (
+        first in CMD_BUILTINS
+        or (ps_like and ps_like.group(1) in PS_VERBS)
+        or first in POWERSHELLS
+        or first == "cmd"
+        or ps_var
+        or ps_expr
+    ):
         windows = True
     try:
-        tokens = _lex(text, windows)
+        tokens = _strip_safe_ps_member_chains(_lex(text, windows))
     except ValueError:
         _add(ctx, L.ASK, "Command could not be parsed safely (unbalanced quotes)")
         return

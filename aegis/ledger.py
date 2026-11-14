@@ -24,6 +24,7 @@ import json
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -73,41 +74,86 @@ def summarize_arguments(tool: str, arguments: Any) -> str:
     return redact(f"{tool}(...)")
 
 
+_INPROC_LOCKS_GUARD = threading.Lock()
+_INPROC_LOCKS: Dict[str, threading.RLock] = {}
+
+
+def _get_inproc_lock(lock_path: str) -> threading.RLock:
+    key = os.path.normcase(os.path.abspath(lock_path))
+    with _INPROC_LOCKS_GUARD:
+        lock = _INPROC_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _INPROC_LOCKS[key] = lock
+        return lock
+
+
 class _FileLock:
     """Cross-process lock on <ledger>.lock (fcntl on POSIX, msvcrt on Windows)."""
 
     def __init__(self, path: str) -> None:
         self.path = path + ".lock"
         self._fh = None
+        self._thread_lock: Optional[threading.RLock] = None
 
     def __enter__(self) -> "_FileLock":
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        self._fh = open(self.path, "a+b")
+        tlock = _get_inproc_lock(self.path)
+        tlock.acquire()
+        self._thread_lock = tlock
         try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            self._fh = open(self.path, "a+b")
             if os.name == "nt":
                 import msvcrt
-                self._fh.seek(0)
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+                deadline = time.monotonic() + 15.0
+                last_exc: Optional[OSError] = None
+                while True:
+                    try:
+                        self._fh.seek(0)
+                        msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        last_exc = exc
+                        if time.monotonic() >= deadline:
+                            raise last_exc
+                        time.sleep(0.015)
             else:
                 import fcntl
                 fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         except Exception:
-            self._fh.close()
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+            self._thread_lock = None
+            tlock.release()
             raise
         return self
 
     def __exit__(self, *exc: Any) -> None:
         try:
-            if os.name == "nt":
-                import msvcrt
-                self._fh.seek(0)
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        self._fh.close()
+            if self._fh is not None:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        self._fh.seek(0)
+                        msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    self._fh.close()
+                finally:
+                    self._fh = None
+        finally:
+            if self._thread_lock is not None:
+                tlock = self._thread_lock
+                self._thread_lock = None
+                tlock.release()
 
 
 def _last_line(path: str) -> Optional[str]:
