@@ -12,6 +12,7 @@ powershell -Command) and the working directory changes made by cd within one com
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shlex
@@ -340,7 +341,59 @@ def _extract_heredocs(text: str) -> Tuple[str, List[str], List[bool]]:
     return "\n".join(out_lines), bodies, quoted
 
 
-def _extract_substitutions(text: str, ctx: _Ctx) -> str:
+def _scan_balanced_parens(text: str, open_idx: int, windows: bool) -> Tuple[str, int, bool]:
+    """Scan balanced '(...)' from *open_idx*, respecting quotes and shell escapes."""
+    depth = 1
+    j = open_idx + 1
+    n = len(text)
+    in_s = False
+    in_d = False
+    while j < n:
+        c = text[j]
+        if in_s:
+            if windows and c == "'" and j + 1 < n and text[j + 1] == "'":
+                j += 2
+                continue
+            if c == "'":
+                in_s = False
+            j += 1
+            continue
+        if in_d:
+            if windows and c == "`" and j + 1 < n:
+                j += 2
+                continue
+            if (not windows) and c == "\\" and j + 1 < n:
+                j += 2
+                continue
+            if c == '"':
+                in_d = False
+            j += 1
+            continue
+        if windows and c == "`" and j + 1 < n:
+            j += 2
+            continue
+        if (not windows) and c == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if c == "'":
+            in_s = True
+            j += 1
+            continue
+        if c == '"':
+            in_d = True
+            j += 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : j], j + 1, True
+        j += 1
+    return text[open_idx + 1 :], n, False
+
+
+def _extract_substitutions(text: str, ctx: _Ctx, windows: bool = False) -> str:
     """Replace $(...), `...`, <(...), >(...) outside single quotes with placeholders.
 
     Each inner command is analyzed recursively right away.
@@ -350,8 +403,18 @@ def _extract_substitutions(text: str, ctx: _Ctx) -> str:
     in_single = in_double = False
     while i < n:
         ch = text[i]
+        if in_single:
+            if windows and ch == "'" and i + 1 < n and text[i + 1] == "'":
+                out.append("''")
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            out.append(ch)
+            i += 1
+            continue
         if ch == "'" and not in_double:
-            in_single = not in_single
+            in_single = True
             out.append(ch)
             i += 1
             continue
@@ -360,46 +423,59 @@ def _extract_substitutions(text: str, ctx: _Ctx) -> str:
             out.append(ch)
             i += 1
             continue
-        if in_single:
-            out.append(ch)
-            i += 1
-            continue
-        if ch == "\\" and i + 1 < n:
-            out.append(text[i:i + 2])
+        if (not windows) and ch == "\\" and i + 1 < n:
+            out.append(text[i : i + 2])
             i += 2
             continue
-        opener = None
+        if windows and ch == "`":
+            if i + 1 >= n:
+                i += 1
+                continue
+            nxt = text[i + 1]
+            if nxt == "$":
+                out.append("$")
+                i += 2
+                continue
+            if nxt == '"':
+                out.append("'" if in_double else '"')
+                i += 2
+                continue
+            if nxt == "n":
+                out.append("\n")
+                i += 2
+                continue
+            if nxt == "r":
+                out.append("\r")
+                i += 2
+                continue
+            if nxt == "t":
+                out.append("\t")
+                i += 2
+                continue
+            if nxt == "0":
+                i += 2
+                continue
+            out.append(nxt)
+            i += 2
+            continue
         if text.startswith("$((", i):
-            # arithmetic expansion: no commands inside
-            depth, j = 0, i + 1
-            while j < n:
-                if text[j] == "(":
-                    depth += 1
-                elif text[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            out.append("0")
-            i = j + 1
-            continue
+            inner_one, end_one, closed_one = _scan_balanced_parens(text, i + 1, windows)
+            if (not windows) and closed_one and inner_one.startswith("(") and inner_one.endswith(")"):
+                _, inner_end, inner_closed = _scan_balanced_parens(inner_one, 0, windows)
+                if inner_closed and inner_end == len(inner_one):
+                    arith_inner = inner_one[1:-1]
+                    if re.fullmatch(r"[0-9+\-*/%&|^~<>!=\s()]+", arith_inner):
+                        out.append("0")
+                        i = end_one
+                        continue
         if text.startswith("$(", i) or ((text.startswith("<(", i) or text.startswith(">(", i)) and not in_double):
-            opener = i + 2
-        if opener is not None:
-            depth, j = 1, opener
-            while j < n and depth:
-                if text[j] == "(":
-                    depth += 1
-                elif text[j] == ")":
-                    depth -= 1
-                j += 1
-            inner = text[opener:j - 1] if depth == 0 else text[opener:]
+            inner, end_idx, _ = _scan_balanced_parens(text, i + 1, windows)
             out.append(_register_subst(inner, ctx))
-            i = j
+            i = end_idx
             continue
-        if ch == "`":
+        if (not windows) and ch == "`":
             j = text.find("`", i + 1)
-            inner = text[i + 1:j] if j != -1 else text[i + 1:]
+            inner = text[i + 1 : j] if j != -1 else text[i + 1 :]
             out.append(_register_subst(inner, ctx))
             i = (j + 1) if j != -1 else n
             continue
@@ -587,34 +663,17 @@ def _analyze_nested(command: str, ctx: _Ctx, cwd: Optional[str] = None) -> Decis
     return v.level
 
 
-def _analyze(text: str, ctx: _Ctx) -> None:
-    # Fork bombs: name(){ name|name& };name
-    if re.search(r"([\w:.]+)\s*\(\)\s*\{[^}]*\1\s*\|\s*\1\s*&", text):
-        raise _Lock("Fork bomb detected")
-
-    from .clans.custody import CustodyClan     # local import avoids a cycle
-    sec = CustodyClan.inspect_secrets(text)
-    if sec.level >= L.LOCK:
-        if ctx.policy.secret_level == "ask":
-            _add(ctx, L.ASK, "Command line contains a live credential (owner approval): " + "; ".join(sec.reasons))
-        else:
-            raise _Lock("Command line contains a live credential: " + "; ".join(sec.reasons))
-
-    if ctx.depth == 0:
-        text = text.replace("\ue000", "").replace("\ue001", "")
-    # $IFS / ${IFS} word splitting evasion: rm${IFS}-rf${IFS}~
-    text = re.sub(r"\$\{IFS\}|\$IFS\b", " ", text)
-    text, heredocs, quoted = _extract_heredocs(text)
-    for body, q in zip(heredocs, quoted):
-        if not q and ("$(" in body or "`" in body):
-            _extract_substitutions(body, ctx)
-    text = re.sub(r"\\;|(?<![\w'\"])';'(?![\w'\"])|(?<![\w'\"])\";\"(?![\w'\"])", f" {_SEMI} ", text)
-    text = _extract_substitutions(text, ctx)
-
-    windows = ctx.force_windows or bool(re.search(r"(?:^|[\s'\"=])[A-Za-z]:\\", text))
-    first = (text.strip().split() or [""])[0].strip("'\"").lower()
-    if first.endswith(".exe"):
-        first = first[:-4]
+def _detect_windows(text: str, ctx: _Ctx) -> bool:
+    if ctx.force_windows or bool(re.search(r"(?:^|[\s'\"=])[A-Za-z]:\\", text)):
+        return True
+    if re.search(r"(?:^|\s)-(?:encodedcommand|enc|ec)\b", text, re.IGNORECASE):
+        return True
+    raw_first = (text.strip().split() or [""])[0].strip("'\"")
+    first = raw_first.replace("`", "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for ext in (".exe", ".cmd", ".bat", ".com"):
+        if first.endswith(ext) and len(first) > len(ext):
+            first = first[: -len(ext)]
+            break
     ps_like = re.match(r"^([a-z]+)-[a-z]+$", first)
     ps_var = bool(re.match(r"^\$(?:env:)?[a-z_][a-z0-9_]*=?$", first))
     ps_expr = text.lstrip().startswith(("(", "[", "$")) and bool(
@@ -631,8 +690,42 @@ def _analyze(text: str, ctx: _Ctx) -> None:
         or first == "cmd"
         or ps_var
         or ps_expr
+        or first == "diskpart"
+        or (first == "format" and bool(re.search(r"(?:^|\s)[A-Za-z]:(?:\s|$|\\|/)", text)))
     ):
-        windows = True
+        return True
+    return False
+
+
+def _analyze(text: str, ctx: _Ctx) -> None:
+    # Fork bombs: name(){ name|name& };name
+    if re.search(r"([\w:.]+)\s*\(\)\s*\{[^}]*\1\s*\|\s*\1\s*&", text):
+        raise _Lock("Fork bomb detected")
+
+    from .clans.custody import CustodyClan     # local import avoids a cycle
+    sec = CustodyClan.inspect_secrets(text)
+    if sec.level >= L.LOCK:
+        if ctx.policy.secret_level == "ask":
+            _add(ctx, L.ASK, "Command line contains a live credential (owner approval): " + "; ".join(sec.reasons))
+        else:
+            raise _Lock("Command line contains a live credential: " + "; ".join(sec.reasons))
+
+    if ctx.depth == 0:
+        text = text.replace("\ue000", "").replace("\ue001", "")
+    windows = _detect_windows(text, ctx)
+    if windows:
+        ctx.force_windows = True
+    # $IFS / ${IFS} word splitting evasion: rm${IFS}-rf${IFS}~
+    text = re.sub(r"\$\{IFS\}|\$IFS\b", " ", text)
+    text, heredocs, quoted = _extract_heredocs(text)
+    for body, q in zip(heredocs, quoted):
+        if not q and ("$(" in body or "`" in body):
+            _extract_substitutions(body, ctx, windows=windows)
+    text = re.sub(r"\\;|(?<![\w'\"])';'(?![\w'\"])|(?<![\w'\"])\";\"(?![\w'\"])", f" {_SEMI} ", text)
+    text = _extract_substitutions(text, ctx, windows=windows)
+    windows = windows or _detect_windows(text, ctx)
+    if windows:
+        ctx.force_windows = True
     try:
         tokens = _strip_safe_ps_member_chains(_lex(text, windows))
     except ValueError:
@@ -1321,8 +1414,35 @@ def _powershell(args: List[str], seg: Segment, ctx: _Ctx) -> None:
             elif inner:
                 _analyze_nested(inner, ctx)
             return
-        if low in ("-encodedcommand", "-enc", "-e", "-ec"):
+        if low in ("-encodedcommand", "-enc", "-e", "-ec") or (
+            len(low) >= 3 and low.startswith("-en") and "-encodedcommand".startswith(low)
+        ):
             _add(ctx, L.ASK, "PowerShell -EncodedCommand hides the command from inspection")
+            if not rest or not rest[0].strip():
+                _add(ctx, L.DENY, "PowerShell -EncodedCommand missing payload")
+                return
+            b64_arg = rest.pop(0).strip()
+            try:
+                raw_bytes = base64.b64decode(b64_arg, validate=True)
+            except Exception:
+                raw_bytes = b""
+            if not raw_bytes or (len(raw_bytes) % 2) != 0:
+                _add(ctx, L.DENY, "Malformed or opaque PowerShell -EncodedCommand payload")
+                return
+            try:
+                decoded = raw_bytes.decode("utf-16-le", errors="strict")
+            except UnicodeDecodeError:
+                _add(ctx, L.DENY, "Malformed or opaque PowerShell -EncodedCommand payload")
+                return
+            if not decoded.strip() or "\x00" in decoded:
+                _add(ctx, L.DENY, "Malformed or opaque PowerShell -EncodedCommand payload")
+                return
+            prev_win = ctx.force_windows
+            ctx.force_windows = True
+            try:
+                _analyze_nested(decoded, ctx)
+            finally:
+                ctx.force_windows = prev_win
             return
         if low in ("-file", "-f"):
             if rest and _check_path(ctx, rest[0], "exec") is not None:

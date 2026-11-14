@@ -239,6 +239,67 @@ class TestTektonSupport(unittest.TestCase):
         self.assertTrue(res.ok, res.problem)
         self.assertEqual(res.count, 36)
 
+    def test_powershell_subexpressions_backticks_encoded_command_and_posix_arith(self):
+        import base64
+
+        def b64_u16(s: str) -> str:
+            return base64.b64encode(s.encode("utf-16-le")).decode("ascii")
+
+        def eval_fresh(cmd: str, **kwargs):
+            h = self.harness(extra_roots=[self.b], strict_tools=True)
+            return h.evaluate_tool_call("start_process", {"command": cmd, **kwargs})
+
+        # F-01: PowerShell $((...)) and backslash before $( must be inspected recursively
+        self.assertEqual(eval_fresh('Write-Output "$((format D:))"', shell="powershell").level, L.LOCK)
+        self.assertEqual(eval_fresh('Write-Output "$((format D:))"').level, L.LOCK)
+        self.assertEqual(
+            eval_fresh('Write-Output "$((Get-Content C:\\Windows\\win.ini))"', shell="powershell").level,
+            L.DENY,
+        )
+        self.assertEqual(
+            eval_fresh('Write-Output "$((Get-Content \'C:\\dir(1)\\win.ini\'))"', shell="powershell").level,
+            L.DENY,
+        )
+        self.assertEqual(eval_fresh('Write-Output "C:\\Temp\\$(format D:)"', shell="powershell").level, L.LOCK)
+
+        # F-03: PowerShell backtick obfuscation and -EncodedCommand base64 inspection
+        self.assertEqual(eval_fresh("f`ormat D:", shell="powershell").level, L.LOCK)
+        self.assertEqual(eval_fresh("f`or`mat D:").level, L.LOCK)
+        self.assertEqual(eval_fresh("Remove-`Item -Recurse -Force C:\\Users", shell="powershell").level, L.LOCK)
+        self.assertEqual(eval_fresh("Remove-`Item C:\\Windows\\win.ini").level, L.DENY)
+        self.assertEqual(eval_fresh(f"powershell -ec {b64_u16('format D:')}").level, L.LOCK)
+        encoded_win_ini = b64_u16("Get-Content C:\\Windows\\win.ini")
+        self.assertEqual(eval_fresh(f"pwsh -EncodedCommand {encoded_win_ini}").level, L.DENY)
+        self.assertEqual(eval_fresh(f"powershell -enc {b64_u16('Write-Output ok')}").level, L.ASK)
+        self.assertEqual(eval_fresh("powershell -ec !!!").level, L.DENY)
+
+        # POSIX pure arithmetic remains PASS while nested command arithmetic still LOCKs
+        self.assertEqual(eval_fresh("echo $((1 + 2))", shell="bash").level, L.PASS)
+        self.assertEqual(eval_fresh("echo $(( $(rm -rf /) + 1 ))", shell="bash").level, L.LOCK)
+
+    def test_ledger_rotate_on_damage_preserves_evidence_and_recovers_active_chain(self):
+        from aegis.core import Verdict
+        from aegis.ledger import DecisionLedger
+
+        ledger_path = os.path.join(self.a, "decisions.jsonl")
+        led = DecisionLedger(ledger_path, rotate_on_damage=True)
+        led.record(Verdict(L.PASS, ["first"], "Test"), tool="read_file", arguments={"path": "a.txt"})
+        with open(ledger_path, "a", encoding="utf-8") as fh:
+            fh.write("{broken-partial-json\n")
+
+        recovered = led.record(Verdict(L.PASS, ["after"], "Test"), tool="read_file", arguments={"path": "b.txt"})
+        assert recovered is not None
+        self.assertTrue(str(recovered["previousDigest"]).startswith("DAMAGED:"))
+        self.assertTrue(bool(recovered.get("continues")))
+        rotated = [
+            name for name in os.listdir(self.a)
+            if name.startswith("decisions.") and name.endswith(".jsonl") and name != "decisions.jsonl"
+        ]
+        self.assertEqual(len(rotated), 1)
+        res = DecisionLedger(ledger_path).verify()
+        self.assertTrue(res.ok, res.problem)
+        self.assertEqual(res.count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
