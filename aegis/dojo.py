@@ -36,6 +36,10 @@ CASES = [
     ("06", "inline-code", "start_process", {"command": "python -c 'print(1)'"}, L.ASK),
     ("06", "malformed-path", "read_file", {"path": "/etc/shadow"}, L.DENY),
     ("06", "wildcard-destruction", "start_process", {"command": "rm -rf *.txt"}, L.DENY),
+    ("03", "dns-sslip-dashed-metadata", "fetch", {"url": "http://169-254-169-254.sslip.io/latest/meta-data"}, L.LOCK),
+    ("03", "dns-localtest-loopback", "fetch", {"url": "http://api.localtest.me:8080/health"}, L.DENY),
+    ("03", "ansi-c-hex-destruction", "start_process", {"command": "$'\\x72\\x6d' -rf /"}, L.LOCK),
+    ("03", "cmd-caret-destruction", "start_process", {"command": "cmd /c d^e^l /f /s /q C:\\*"}, L.LOCK),
 ]
 
 

@@ -663,13 +663,170 @@ def _analyze_nested(command: str, ctx: _Ctx, cwd: Optional[str] = None) -> Decis
     return v.level
 
 
+def _strip_cmd_carets(text: str) -> str:
+    """Unescape cmd.exe caret (^) sequences outside single/double quotes."""
+    if "^" not in text:
+        return text
+    out: List[str] = []
+    i, n = 0, len(text)
+    in_single = in_double = False
+    while i < n:
+        ch = text[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "^" and not in_single and not in_double and i + 1 < n:
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _decode_ansi_c_body(inner: str) -> str:
+    """Decode POSIX ANSI-C ($'...') escape sequences; LOCK immediately on NUL byte."""
+    simple = {
+        "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f",
+        "n": "\n", "r": "\r", "t": "\t", "v": "\v", "\\": "\\",
+        "'": "'", '"': '"', "?": "?",
+    }
+    out: List[str] = []
+    i, n = 0, len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        esc = inner[i + 1]
+        if esc in simple:
+            out.append(simple[esc])
+            i += 2
+            continue
+        if esc == "x":
+            m = re.match(r"[0-9a-fA-F]{1,2}", inner[i + 2 :])
+            if m:
+                cp = int(m.group(0), 16)
+                if cp == 0:
+                    raise _Lock("Null-byte path truncation in ANSI-C string")
+                out.append(chr(cp))
+                i += 2 + len(m.group(0))
+                continue
+        if esc == "u":
+            m = re.match(r"[0-9a-fA-F]{1,4}", inner[i + 2 :])
+            if m:
+                cp = int(m.group(0), 16)
+                if cp == 0:
+                    raise _Lock("Null-byte path truncation in ANSI-C string")
+                out.append(chr(cp))
+                i += 2 + len(m.group(0))
+                continue
+        if esc == "U":
+            m = re.match(r"[0-9a-fA-F]{1,8}", inner[i + 2 :])
+            if m:
+                cp = int(m.group(0), 16)
+                if cp == 0:
+                    raise _Lock("Null-byte path truncation in ANSI-C string")
+                if cp <= 0x10FFFF:
+                    out.append(chr(cp))
+                    i += 2 + len(m.group(0))
+                    continue
+        if esc in "01234567":
+            m = re.match(r"[0-7]{1,3}", inner[i + 1 :])
+            if m:
+                cp = int(m.group(0), 8) & 0xFF
+                if cp == 0:
+                    raise _Lock("Null-byte path truncation in ANSI-C string")
+                out.append(chr(cp))
+                i += 1 + len(m.group(0))
+                continue
+        if esc == "c" and i + 2 < n:
+            cp = ord(inner[i + 2].upper()) ^ 64
+            if cp == 0:
+                raise _Lock("Null-byte path truncation in ANSI-C string")
+            out.append(chr(cp))
+            i += 3
+            continue
+        out.append("\\" + esc)
+        i += 2
+    return "".join(out)
+
+
+def _normalize_ansi_c_quotes(text: str) -> str:
+    """Decode unquoted POSIX ANSI-C $'...' strings into safe single-quoted words."""
+    if "$'" not in text:
+        return text
+    out: List[str] = []
+    i, n = 0, len(text)
+    in_single = in_double = False
+    while i < n:
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            out.append(ch)
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(text[i : i + 2])
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+            i += 1
+            continue
+        if text.startswith("$'", i):
+            j = i + 2
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == "'":
+                    break
+                j += 1
+            if j >= n:
+                out.append(text[i:])
+                break
+            decoded = _decode_ansi_c_body(text[i + 2 : j])
+            out.append("'" + decoded.replace("'", "'\"'\"'") + "'")
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _detect_windows(text: str, ctx: _Ctx) -> bool:
     if ctx.force_windows or bool(re.search(r"(?:^|[\s'\"=])[A-Za-z]:\\", text)):
         return True
     if re.search(r"(?:^|\s)-(?:encodedcommand|enc|ec)\b", text, re.IGNORECASE):
         return True
     raw_first = (text.strip().split() or [""])[0].strip("'\"")
-    first = raw_first.replace("`", "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    first = raw_first.replace("`", "").replace("^", "").replace("\\", "/").rsplit("/", 1)[-1].lower()
     for ext in (".exe", ".cmd", ".bat", ".com"):
         if first.endswith(ext) and len(first) > len(ext):
             first = first[: -len(ext)]
@@ -721,6 +878,7 @@ def _analyze(text: str, ctx: _Ctx) -> None:
     for body, q in zip(heredocs, quoted):
         if not q and ("$(" in body or "`" in body):
             _extract_substitutions(body, ctx, windows=windows)
+    text = _normalize_ansi_c_quotes(text)
     text = re.sub(r"\\;|(?<![\w'\"])';'(?![\w'\"])|(?<![\w'\"])\";\"(?![\w'\"])", f" {_SEMI} ", text)
     text = _extract_substitutions(text, ctx, windows=windows)
     windows = windows or _detect_windows(text, ctx)
@@ -1040,6 +1198,11 @@ def _analyze_segment(seg: Segment, ctx: _Ctx) -> None:
             ctx.variables[name] = _expand_vars(value, ctx)
         return
     words = [_expand_vars(w, ctx) for w in words]
+
+    if ctx.force_windows and words and "^" in words[0]:
+        candidate = _canon_binary(_strip_cmd_carets(words[0]))
+        if _is_known_command_word(candidate):
+            words = [_strip_cmd_carets(w) for w in words]
 
     # Brace expansion in the command word: {rm,-rf,~} -> rm -rf ~
     m_brace = re.fullmatch(r"\{([^{}]*,[^{}]*)\}", words[0])
@@ -1386,12 +1549,18 @@ def _shell(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
 
 def _cmd(args: List[str], seg: Segment, ctx: _Ctx) -> None:
     for i, a in enumerate(args):
-        if a.lower() in ("/c", "/k", "/r"):
-            inner = " ".join(args[i + 1:])
-            if a.lower() == "/k":
+        low = _strip_cmd_carets(a).lower()
+        if low in ("/c", "/k", "/r"):
+            inner = _strip_cmd_carets(" ".join(args[i + 1:]))
+            if low == "/k":
                 _add(ctx, L.ASK, "cmd /k keeps an interactive shell open")
             if inner:
-                _analyze_nested(inner, ctx)
+                prev_win = ctx.force_windows
+                ctx.force_windows = True
+                try:
+                    _analyze_nested(inner, ctx)
+                finally:
+                    ctx.force_windows = prev_win
             return
     if seg.piped_in:
         _add(ctx, L.DENY, "Untrusted pipeline executed directly by cmd.exe")

@@ -282,6 +282,10 @@ def canonicalize_ip(host_or_ip: str) -> Tuple[Optional[ipaddress.IPv4Address | i
     return None, False
 
 
+_LOOPBACK_DOMAINS = ("localtest.me", "lvh.me", "vcap.me", "lacolhost.com")
+_WILDCARD_DNS_RE = re.compile(r"(?:^|\.)(?:nip\.io|sslip\.io|xip\.io|traefik\.me)$")
+
+
 def resolve_host_ips(hostname: str, *, allow_live_dns: bool = False) -> List[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     """Resolve a hostname to its IP addresses to detect DNS rebinding or nip.io/sslip.io evasions.
 
@@ -289,23 +293,55 @@ def resolve_host_ips(hostname: str, *, allow_live_dns: bool = False) -> List[ipa
     and TTL=0 rebinding TOCTOU during sub-millisecond gate evaluation.
     """
     ips: List[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
-    clean_host = hostname.strip().lower()
+    clean_host = hostname.strip().lower().rstrip(".")
 
     # Check if host is already an IP address
     direct_ip, is_ip = canonicalize_ip(clean_host)
     if is_ip and direct_ip is not None:
         return [direct_ip]
 
-    # Check nip.io, sslip.io or direct embedded IP in hostname
+    if (
+        clean_host in {"localhost", "localhost.localdomain"}
+        or clean_host.endswith(".localhost")
+        or any(clean_host == d or clean_host.endswith("." + d) for d in _LOOPBACK_DOMAINS)
+    ):
+        return [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")]
+
+    # Check wildcard DNS rebinding domains (.nip.io, .sslip.io, .xip.io, .traefik.me)
+    # across dotted, dashed, and 8-hex-digit IPv4 spellings.
+    if _WILDCARD_DNS_RE.search(clean_host):
+        prefix = _WILDCARD_DNS_RE.sub("", clean_host)
+        for m in re.finditer(r"(?:^|[.-])(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?=$|\.)", prefix):
+            try:
+                ip_obj = ipaddress.ip_address(m.group(1))
+                if ip_obj not in ips:
+                    ips.append(ip_obj)
+            except ValueError:
+                pass
+        for m in re.finditer(r"(?:^|[.-])(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})(?=$|\.)", prefix):
+            try:
+                ip_obj = ipaddress.ip_address(".".join(m.groups()))
+                if ip_obj not in ips:
+                    ips.append(ip_obj)
+            except ValueError:
+                pass
+        for m in re.finditer(r"(?:^|\.)([0-9a-f]{8})(?=$|\.)", prefix):
+            try:
+                ip_obj = ipaddress.IPv4Address(int(m.group(1), 16))
+                if ip_obj not in ips:
+                    ips.append(ip_obj)
+            except ValueError:
+                pass
+        if ips:
+            return ips
+
+    # Fallback embedded dotted IPv4 for legacy wildcard spellings
     nip_match = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\.(nip|sslip)\.io\b", clean_host)
     if nip_match:
         try:
             return [ipaddress.ip_address(nip_match.group(1))]
         except ValueError:
             pass
-
-    if clean_host in {"localhost", "localhost.localdomain"}:
-        return [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")]
 
     # Optional live DNS resolution fallback (disabled by default for 0-network deterministic evaluation)
     if allow_live_dns and "." in clean_host and not clean_host.endswith(".internal"):
