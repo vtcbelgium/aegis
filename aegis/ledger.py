@@ -192,11 +192,13 @@ class DecisionLedger:
     """Append-only, hash-chained record of Aegis decisions."""
 
     def __init__(self, path: str, *, min_level: DecisionLevel = DecisionLevel.PASS,
-                 max_bytes: int = 20 * 1024 * 1024, session: Optional[str] = None) -> None:
+                 max_bytes: int = 20 * 1024 * 1024, session: Optional[str] = None,
+                 rotate_on_damage: bool = False) -> None:
         self.path = os.path.abspath(os.path.expanduser(path))
         self.min_level = min_level
         self.max_bytes = max_bytes
         self.session = session
+        self.rotate_on_damage = bool(rotate_on_damage)
         self._lock = threading.Lock()
 
     # -- writing -------------------------------------------------------------
@@ -212,9 +214,10 @@ class DecisionLedger:
             # A damaged tip is evidence: keep it and start a new file that points back at it.
             return "DAMAGED:" + hashlib.sha256(line.encode("utf-8", "replace")).hexdigest(), 0
 
-    def _rotate_if_needed(self) -> Optional[str]:
+    def _rotate_if_needed(self, *, force: bool = False) -> Optional[str]:
         try:
-            if os.path.getsize(self.path) < self.max_bytes:
+            size = os.path.getsize(self.path)
+            if not (force and size > 0) and size < self.max_bytes:
                 return None
         except OSError:
             return None
@@ -228,7 +231,7 @@ class DecisionLedger:
     def append(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock, _FileLock(self.path):
             previous, seq = self._tip()
-            continues = self._rotate_if_needed()
+            continues = self._rotate_if_needed(force=(self.rotate_on_damage and previous.startswith("DAMAGED:")))
             body: Dict[str, Any] = {
                 "schema": SCHEMA,
                 "seq": seq + 1,
@@ -245,6 +248,10 @@ class DecisionLedger:
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(canonical_json(body) + "\n")
                 fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
             return body
 
     def record(self, verdict: Verdict, *, tool: Optional[str] = None, arguments: Any = None,
