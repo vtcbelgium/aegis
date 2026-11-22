@@ -192,10 +192,18 @@ def unquote_recursively(text: str, max_depth: int = 4) -> Tuple[str, bool]:
 
 
 def detect_null_bytes(text: str) -> bool:
-    """Detect raw or encoded null bytes used for path truncation attacks."""
-    if "\x00" in text or "%00" in text or "\\0" in text:
+    """Detect actual NUL or recursively percent-encoded NUL in a path.
+
+    Textual backslash-zero is not itself a null byte: in Windows paths,
+    a separator followed by a zero-prefixed folder such as
+    C:\06_Exports is completely normal. Actual NUL remains forbidden.
+    """
+    if not isinstance(text, str):
+        return False
+    if "\x00" in text:
         return True
-    return False
+    decoded, _ = unquote_recursively(text)
+    return "\x00" in decoded
 
 
 def canonicalize_path(base_dir: str, target_path: str) -> Tuple[str, bool]:
