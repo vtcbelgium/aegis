@@ -31,55 +31,30 @@ if sys.platform == "win32":
 
 def run_audit(target_path: str) -> int:
     """Audit a directory or file."""
-    if not os.path.exists(target_path):
-        print(f"Error: Target path does not exist: {target_path}", file=sys.stderr)
+    from .audit import scan_path
+
+    try:
+        report = scan_path(target_path)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"🛡️  Aegis Sentinel Audit: {os.path.abspath(target_path)}")
+    print(f"🛡️  Aegis Sentinel Audit: {report['target']}")
     print(f"📜 Supreme Law: \"{SUPREME_LAW}\"\n")
 
-    gate = AegisGate(base_dir=target_path)
-    issues = 0
-
-    if os.path.isfile(target_path):
-        files_to_check = [target_path]
-    else:
-        files_to_check = []
-        for root, _, files in os.walk(target_path):
-            if any(p in root for p in {".git", "node_modules", ".venv", "__pycache__"}):
-                continue
-            for f in files:
-                files_to_check.append(os.path.join(root, f))
-
-    for filepath in files_to_check:
-        try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-
-            sec_verdict = CustodyClan.inspect_secrets(content)
-            if not sec_verdict.passed:
-                print(f"  🛑 [{sec_verdict.level.name}] {filepath}: {'; '.join(sec_verdict.reasons)}")
-                gate.record(sec_verdict)
-                issues += 1
-
-            if filepath.endswith((".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rb", ".php", ".java",
-                                  ".sh", ".yml", ".yaml", ".env", ".toml", ".cjs", ".mjs")):
-                from .audit import audit_code
-                code_verdict = audit_code(content, filepath)
-                if not code_verdict.passed:
-                    for r in code_verdict.reasons:
-                        print(f"  ⚠️  [{code_verdict.level.name}] {filepath}: {r}")
-                    issues += 1
-        except Exception as e:
-            print(f"  ⚠️  [FAIL_CLOSED] {filepath}: Could not read ({e})")
-            issues += 1
+    for item in report["findings"]:
+        icon = "🛑" if item["kind"] == "secret" else "⚠️ "
+        print(f"  {icon} [{item['level']}] {item['file']}: {item['message']}")
 
     print("\n" + "=" * 60)
-    if issues == 0:
-        print("✅ PASS: Clean code repository. Zero security restrictions triggered.")
+    if report["passed"]:
+        print(f"✅ PASS: Clean repository ({report['filesScanned']} files scanned). Zero security restrictions triggered.")
         return 0
     else:
-        print(f"🛑 FAILED: {issues} security violation(s) detected. Gate escalated to: {gate.current_level.name}")
+        print(
+            f"🛑 FAILED: {report['findingCount']} security finding(s) across "
+            f"{report['filesWithIssues']} file(s). Gate escalated to: {report['level']}"
+        )
         return 1
 
 
@@ -104,72 +79,84 @@ def run_gate_check(tool_name: str, args_json: str, base_dir: Optional[str] = Non
     return 0 if verdict.passed else 1
 
 
-def run_daemon(port: int = 9999, base_dir: str = ".", owner_secret: Optional[str] = None) -> None:
-    """Run local desktop daemon REST API."""
-    secret = owner_secret or os.environ.get("AEGIS_OWNER_SECRET") or secrets.token_hex(16)
-    gate = AegisGate(base_dir=base_dir, owner_secret=secret)
-    harness = AegisHarness(gate=gate, base_dir=base_dir)
+def run_daemon(
+    port: int = 9999,
+    base_dir: str = ".",
+    owner_secret: Optional[str] = None,
+    open_browser: bool = False,
+) -> None:
+    """Run the hardened local Control Center and security daemon REST API."""
+    from .server import run_server
+    run_server(port=port, base_dir=base_dir, owner_secret=owner_secret, open_browser=open_browser)
 
-    class DaemonHandler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: Any) -> None:
-            return  # Quiet logs
 
-        def do_GET(self) -> None:
-            if self.path == "/status" or self.path == "/api/status":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(gate.snapshot(), indent=2).encode())
-            else:
-                self.send_response(404)
-                self.end_headers()
+def run_doctor_cli(as_json: bool = False) -> int:
+    """Print an honest health report of Aegis on this machine."""
+    from .setup_wizard import run_doctor
+    report = run_doctor()
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return 0 if (report["policy"]["ok"] and report["ledger"]["ok"] and report["tripwires"]["ok"]) else 1
 
-        def do_POST(self) -> None:
-            if self.path == "/gate" or self.path == "/api/gate":
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length)
-                try:
-                    payload = json.loads(body)
-                    tool = payload.get("tool", "unknown")
-                    arguments = payload.get("arguments", {})
-                    verdict = harness.evaluate_tool_call(tool, arguments)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps(verdict.to_dict()).encode())
-                except Exception as e:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": str(e)}).encode())
-            elif self.path == "/reset" or self.path == "/api/reset":
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length)
-                try:
-                    payload = json.loads(body)
-                    token = payload.get("owner_token", "")
-                    success = gate.reset_session(token)
-                    self.send_response(200 if success else 403)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"reset": success, "currentLevel": gate.current_level.name}).encode())
-                except Exception as e:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": str(e)}).encode())
-            else:
-                self.send_response(404)
-                self.end_headers()
+    print(f"🛡️  Aegis Doctor v{report['version']} ({report['platform']}, Python {report['python']})")
+    print(f"   State folder: {report['aegisHome']}")
+    pol = report["policy"]
+    print(f"   Policy file:  {'OK' if pol['ok'] else 'ERROR: ' + str(pol['error'])} ({pol['path']})")
+    led = report["ledger"]
+    print(f"   Ledger chain: {'OK' if led['ok'] else 'BROKEN'} ({led['count']} entries)")
+    tw = report["tripwires"]
+    print(f"   Tripwires:    {tw['decoyCount']} decoy(s), {tw['canaryCount']} canary token(s)")
+    sb = report["sandbox"]
+    print(f"   OS Sandbox:   {'Bubblewrap OK' if sb['works'] else 'Unavailable (' + sb['platform'] + ' — rule gate active)'}")
+    print("\nConnected AI Apps:")
+    for h in report["hosts"].values():
+        if h["kind"] == "hook":
+            status = "PROTECTED" if h["protected"] else ("not connected" if h["detected"] else "not detected")
+        elif h["kind"] == "mcp":
+            status = f"{h['protectedCount']}/{h['totalCount']} MCP servers guarded" if h["exists"] else "no MCP config"
+        else:
+            status = "ready in " + str(h["path"]) if h["detected"] else "install from browser store"
+        print(f"   - {h['name']:32} {status}")
+    return 0 if (pol["ok"] and led["ok"] and tw["ok"]) else 1
 
-    print(f"🛡️  Aegis Security Daemon running on http://127.0.0.1:{port}")
-    print(f"   - Status: GET  http://127.0.0.1:{port}/status")
-    print(f"   - Gate:   POST http://127.0.0.1:{port}/gate")
-    print(f"   - Reset:  POST http://127.0.0.1:{port}/reset")
-    print(f"🔑 Session Owner Secret: {secret}")
-    server = http.server.HTTPServer(("127.0.0.1", port), DaemonHandler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nDaemon terminated cleanly.")
+
+def run_setup_cli(target: str, disable: bool = False) -> int:
+    """Safely configure Aegis hooks for supported AI hosts (creates backups first)."""
+    from .setup_wizard import (
+        claude_code_settings_path,
+        configure_hook_host,
+        detect_hosts,
+        gemini_cli_settings_path,
+    )
+    hosts = detect_hosts()
+    targets = []
+    if target == "auto":
+        for key in ("claude_code", "gemini_cli"):
+            if hosts[key]["detected"]:
+                targets.append(key)
+        if not targets:
+            print("No Claude Code or Gemini CLI config directory detected yet.")
+            print("Run `aegis setup claude` or `aegis setup gemini` to create one, or launch `aegis ui`.")
+            return 0
+    elif target == "claude":
+        targets = ["claude_code"]
+    elif target == "gemini":
+        targets = ["gemini_cli"]
+    else:
+        print(f"Unknown setup target: {target}", file=sys.stderr)
+        return 1
+
+    path_map = {
+        "claude_code": claude_code_settings_path(),
+        "gemini_cli": gemini_cli_settings_path(),
+    }
+    for key in targets:
+        res = configure_hook_host(path_map[key], enable=not disable)
+        verb = "Disabled" if disable else "Enabled"
+        print(f"✅ {verb} Aegis hooks for {hosts[key]['name']}: {res['path']}")
+        if res["backup"]:
+            print(f"   Backup saved: {res['backup']}")
+    return 0
 
 
 def run_explain(command: str, base_dir: Optional[str]) -> int:
@@ -239,12 +226,22 @@ def run_sandbox(action: str, command: Optional[str], base_dir: Optional[str]) ->
 
 def run_pin(action: str, server: str, tools_json: str) -> int:
     from .pinning import ToolPins
+    raw = tools_json
+    if os.path.isfile(tools_json):
+        try:
+            with open(tools_json, "r", encoding="utf-8") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            print(f"Error: could not read tools file '{tools_json}': {exc}", file=sys.stderr)
+            return 1
     try:
-        tools = json.loads(tools_json)
+        tools = json.loads(raw)
         if isinstance(tools, dict):
             tools = tools.get("tools", [])
+        if not isinstance(tools, list):
+            raise ValueError("tools must be a list")
     except ValueError:
-        print("Error: tools must be JSON (a list of tool definitions)", file=sys.stderr)
+        print("Error: tools must be a JSON file path or JSON string containing a list of tool definitions", file=sys.stderr)
         return 1
     pins = ToolPins()
     if action == "pin":
@@ -333,6 +330,7 @@ def main() -> None:
     mcpp.add_argument("--server-id", default=None, help="Stable identifier for MCP tool pinning & fingerprinting")
     mcpp.add_argument("--base-dir", default=None, help="Base directory for path confinement & workspace policies")
     mcpp.add_argument("--pins-file", default=None, help="Custom path for pins.json")
+    mcpp.add_argument("--no-auto-pin", action="store_true", help="Require explicit prior `aegis pin pin` instead of auto-pinning first-seen tools")
     mcpp.add_argument("command", nargs=argparse.REMAINDER, help="Upstream MCP server command (e.g. -- npx -y @modelcontextprotocol/server-filesystem /tmp)")
 
     pp = sub.add_parser("pin", help="MCP tool pinning: check or pin a server's tools")
@@ -346,11 +344,29 @@ def main() -> None:
     hp.add_argument("--format", choices=("claude", "json", "exit"), default="claude",
                     help="Output shape: claude/gemini/copilot JSON (default), plain json, or exit-code only")
 
-    svp = sub.add_parser("serve", help="Run local security daemon")
+    uip = sub.add_parser("ui", help="Open the offline Aegis Control Center app in your browser")
+    uip.add_argument("--port", type=int, default=9999)
+    uip.add_argument("--base-dir", default=".")
+    uip.add_argument("--no-open", action="store_true", help="Do not automatically launch a browser tab")
+
+    docp = sub.add_parser("doctor", help="Check Aegis health, ledger integrity, tripwires, and connected AI apps")
+    docp.add_argument("--json", action="store_true", help="Emit structured JSON diagnostics")
+
+    setp = sub.add_parser("setup", help="One-click setup for Claude Code / Gemini CLI hooks (creates backups)")
+    setp.add_argument("target", nargs="?", choices=("auto", "claude", "gemini"), default="auto")
+    setp.add_argument("--disable", action="store_true", help="Remove Aegis hooks instead of enabling them")
+
+    svp = sub.add_parser("serve", help="Run local security daemon & Control Center API")
     svp.add_argument("--port", type=int, default=9999); svp.add_argument("--base-dir", default=".")
 
     args = parser.parse_args()
-    if args.subcommand == "dojo":
+    if args.subcommand == "ui":
+        run_daemon(args.port, base_dir=args.base_dir, open_browser=not args.no_open)
+    elif args.subcommand == "doctor":
+        sys.exit(run_doctor_cli(as_json=args.json))
+    elif args.subcommand == "setup":
+        sys.exit(run_setup_cli(args.target, disable=args.disable))
+    elif args.subcommand == "dojo":
         from .dojo import run_dojo
         report = run_dojo(mission=args.mission, pack=args.pack)
         print(json.dumps(report, indent=2))
@@ -372,7 +388,13 @@ def main() -> None:
         cmd = args.command
         if cmd and cmd[0] == "--":
             cmd = cmd[1:]
-        sys.exit(run_mcp_proxy_stdio(cmd, server_id=args.server_id, base_dir=args.base_dir, pins_path=args.pins_file))
+        sys.exit(run_mcp_proxy_stdio(
+            cmd,
+            server_id=args.server_id,
+            base_dir=args.base_dir,
+            pins_path=args.pins_file,
+            auto_pin_new=not args.no_auto_pin,
+        ))
     elif args.subcommand == "pin":
         sys.exit(run_pin(args.action, args.server, args.tools))
     elif args.subcommand == "learn":
