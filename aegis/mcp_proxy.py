@@ -278,13 +278,16 @@ def run_mcp_proxy_stdio(
     base_dir: Optional[str] = None,
     pins_path: Optional[str] = None,
     auto_pin_new: bool = True,
+    ledger_path: Optional[str] = None,
 ) -> int:
     """Run Aegis as a stdio proxy between an agent host and an upstream MCP server subprocess."""
     import json
     import subprocess
     import sys
     import threading
-    from .pinning import ToolPins
+    from .ledger import DecisionLedger, default_ledger_path
+    from .pinning import ToolPins, default_pins_path
+    from .integrations.generic import load_policy
 
     if not command:
         sys.stderr.write("Error: no command provided for upstream MCP server\n")
@@ -292,10 +295,13 @@ def run_mcp_proxy_stdio(
 
     pins = None
     if server_id:
-        pins_file = pins_path or os.path.expanduser("~/.aegis/pins.json")
+        pins_file = pins_path or default_pins_path()
         pins = ToolPins(pins_file)
 
-    proxy = AegisMcpProxy(base_dir=base_dir, tool_pins=pins, server_id=server_id)
+    led = DecisionLedger(ledger_path or default_ledger_path(), session=f"mcp:{server_id or 'default'}")
+    policy = load_policy(base_dir)
+    gate = AegisGate(base_dir=base_dir, policy=policy, ledger=led)
+    proxy = AegisMcpProxy(gate=gate, base_dir=base_dir, tool_pins=pins, server_id=server_id)
 
     # Launch upstream MCP server subprocess communicating via stdio pipes
     proc = subprocess.Popen(

@@ -72,23 +72,15 @@ def normalize(tool_name: str, tool_input: Any) -> Tuple[str, Dict[str, Any]]:
 
 
 def load_policy(workspace: Optional[str] = None) -> AegisPolicy:
-    """Build a policy from environment variables, so any host can configure Aegis the same way.
+    """Build a policy from defaults -> ~/.aegis/policy.json -> AEGIS_* environment variables.
 
+    Supported env overrides:
     AEGIS_PROJECT_EXEC, AEGIS_SECRET_LEVEL, AEGIS_LEAK_GUARD, AEGIS_CODE_AUDIT,
-    AEGIS_UNKNOWN_BINARY, AEGIS_EXTRA_ROOTS (os.pathsep-separated), AEGIS_STRICT_TOOLS.
+    AEGIS_UNKNOWN_BINARY, AEGIS_EXTRA_ROOTS (os.pathsep-separated), AEGIS_STRICT_TOOLS,
+    AEGIS_INLINE_EXEC.
     """
-    env = os.environ.get
-    roots = [r for r in (env("AEGIS_EXTRA_ROOTS", "") or "").split(os.pathsep) if r]
-    pol = AegisPolicy(
-        project_exec=env("AEGIS_PROJECT_EXEC", "allow"),
-        secret_level=env("AEGIS_SECRET_LEVEL", "lock"),
-        leak_guard=env("AEGIS_LEAK_GUARD", "ask"),
-        code_audit=env("AEGIS_CODE_AUDIT", "warn"),
-        unknown_binary=env("AEGIS_UNKNOWN_BINARY", "ask"),
-        strict_tools=(env("AEGIS_STRICT_TOOLS", "") or "").lower() in ("1", "true", "yes"),
-        extra_roots=roots,
-    )
-    return pol
+    from ..config import build_policy_from_sources
+    return build_policy_from_sources(workspace=workspace)
 
 
 def _decision_for(level: DecisionLevel) -> str:

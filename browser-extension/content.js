@@ -1,14 +1,13 @@
 /**
  * Aegis AI Shield - In-Page Content Script
  *
- * Redacts prompt-injection text from web pages before a browsing agent reads it.
+ * Redacts prompt-injection text from web pages before a browsing agent reads it,
+ * and strips data-exfiltration beacon elements.
  *
- *  - Text is normalized first (NFKC, invisible/bidi/tag characters removed, case-folded,
- *    whitespace collapsed), so zero-width splits and fullwidth letters do not evade matching.
- *  - Only the INNERMOST element that contains a match is redacted, never its ancestors,
- *    so an article that merely discusses prompt injection loses one sentence, not the page.
- *  - Exfiltration beacons are blocked before the request leaves the browser by the
- *    declarativeNetRequest rules in rules.json; this script only cleans up the elements.
+ *  - Respects global protectionActive toggle and per-site allowlist from chrome.storage.local.
+ *  - Normalizes text (NFKC, invisible/bidi/tag characters removed, case-folded, whitespace collapsed).
+ *  - Redacts only the INNERMOST element containing a match, preserving the rest of the page.
+ *  - Reports both prompt-injection redactions and removed exfiltration beacons to background.js.
  *
  * Pattern matching is a redaction layer, not a guarantee: a determined attacker can paraphrase.
  */
@@ -39,9 +38,29 @@
   const INVISIBLE_RE = /[­᠎​-‏‪-‮⁠-⁤⁦-⁩﻿]|[\u{E0000}-\u{E007F}]/gu;
 
   let quarantinedThreats = 0;
+  let activeForPage = true;
+  let observerStarted = false;
 
   function normalize(text) {
     return (text || "").normalize("NFKC").replace(INVISIBLE_RE, "").toLowerCase().replace(/\s+/g, " ");
+  }
+
+  function currentHost() {
+    try {
+      return (window.location?.hostname || "").toLowerCase();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function isEnabledForSettings(data) {
+    if (data && data.protectionActive === false) return false;
+    const list = Array.isArray(data?.allowlist) ? data.allowlist : [];
+    const host = currentHost();
+    if (host && list.some((entry) => String(entry).toLowerCase() === host)) {
+      return false;
+    }
+    return true;
   }
 
   function matchingPattern(el) {
@@ -66,8 +85,23 @@
       (style.color === style.backgroundColor && style.color !== "rgba(0, 0, 0, 0)");
   }
 
+  function reportThreat(threat) {
+    if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
+      try {
+        const res = chrome.runtime.sendMessage({
+          type: "AEGIS_THREAT_BLOCKED",
+          threat
+        });
+        if (res && typeof res.catch === "function") res.catch(() => {});
+      } catch (_) {
+        // Ignore disconnected service worker
+      }
+    }
+  }
+
   /** Redact only matches that contain no other match (the innermost elements). */
   function scanRoot(root) {
+    if (!activeForPage || !root) return;
     const candidates = [];
     if (root.nodeType === Node.ELEMENT_NODE && root.matches && root.matches(SELECTOR)) candidates.push(root);
     if (root.querySelectorAll) candidates.push(...root.querySelectorAll(SELECTOR));
@@ -88,7 +122,7 @@
   function quarantineElement(el, pattern) {
     const wasHidden = isHidden(el);
     const excerpt = normalize(el.textContent).slice(0, 60);
-    const reason = `Prompt injection signature [${pattern.source.slice(0, 40)}...]: "${excerpt}..."`;
+    const reason = `Hidden AI prompt trap: "${excerpt}..."`;
     quarantinedThreats++;
     console.warn(`[Aegis AI Shield] NEUTRALIZED threat: ${reason}`);
 
@@ -98,43 +132,84 @@
     el.style.fontSize = "11px";
     el.style.opacity = "0.6";
 
-    if (chrome.runtime?.sendMessage) {
-      chrome.runtime.sendMessage({
-        type: "AEGIS_THREAT_BLOCKED",
-        threat: { url: window.location.href, reason, wasHidden, timestamp: new Date().toISOString() }
-      }).catch(() => {});
-    }
+    reportThreat({
+      kind: "injection",
+      url: window.location?.href || "",
+      hostname: currentHost(),
+      reason,
+      wasHidden,
+      timestamp: new Date().toISOString()
+    });
   }
 
-  // Requests are already blocked by rules.json; remove the leftover elements and count them.
+  // Requests are already blocked by rules.json; remove leftover elements and report them.
   function scanBeacons(root) {
+    if (!activeForPage || !root) return;
     const nodes = root.querySelectorAll ? root.querySelectorAll("img, link[rel='prefetch'], link[rel='prerender']") : [];
     for (const node of nodes) {
       const src = node.src || node.href || "";
       if (src && BEACON_RE.test(src)) {
+        quarantinedThreats++;
+        const shortSrc = src.split("?")[0].slice(0, 80);
+        const reason = `Blocked data-theft beacon (${shortSrc})`;
         console.warn(`[Aegis AI Shield] Removed exfiltration beacon element: ${src}`);
         node.remove();
+        reportThreat({
+          kind: "beacon",
+          url: window.location?.href || "",
+          hostname: currentHost(),
+          reason,
+          wasHidden: true,
+          timestamp: new Date().toISOString()
+        });
       }
     }
   }
 
-  scanRoot(document.body || document.documentElement);
-
-  // Dynamic pages: rescan the nearest container of added nodes
-  const observer = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      for (const node of mutation.addedNodes) {
-        if (node.nodeType === Node.ELEMENT_NODE && !node.closest?.("[data-aegis-quarantined]")) {
-          scanRoot(node);
-        } else if (node.nodeType === Node.TEXT_NODE && node.parentElement && !isSkippable(node.parentElement)) {
-          scanRoot(node.parentElement);
+  function startProtection() {
+    if (!activeForPage) return;
+    const target = document.body || document.documentElement;
+    scanRoot(target);
+    if (!observerStarted && target) {
+      observerStarted = true;
+      const observer = new MutationObserver((mutations) => {
+        if (!activeForPage) return;
+        for (const mutation of mutations) {
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType === Node.ELEMENT_NODE && !node.closest?.("[data-aegis-quarantined]")) {
+              scanRoot(node);
+            } else if (node.nodeType === Node.TEXT_NODE && node.parentElement && !isSkippable(node.parentElement)) {
+              scanRoot(node.parentElement);
+            }
+          }
         }
-      }
+      });
+      observer.observe(target, { childList: true, subtree: true });
     }
-  });
-  observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+  }
+
+  if (typeof chrome !== "undefined" && chrome.storage?.local?.get) {
+    chrome.storage.local.get(["protectionActive", "allowlist"], (data) => {
+      activeForPage = isEnabledForSettings(data);
+      if (activeForPage) startProtection();
+    });
+    if (chrome.storage.onChanged?.addListener) {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== "local") return;
+        if (changes.protectionActive || changes.allowlist) {
+          chrome.storage.local.get(["protectionActive", "allowlist"], (data) => {
+            const wasActive = activeForPage;
+            activeForPage = isEnabledForSettings(data);
+            if (!wasActive && activeForPage) startProtection();
+          });
+        }
+      });
+    }
+  } else {
+    startProtection();
+  }
 
   if (typeof module !== "undefined") {
-    module.exports = { normalize, scanRoot, get count() { return quarantinedThreats; } };
+    module.exports = { normalize, scanRoot, isEnabledForSettings, get count() { return quarantinedThreats; } };
   }
 })();

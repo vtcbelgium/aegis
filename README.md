@@ -99,11 +99,16 @@ fools the judge. Aegis never negotiates with a model:
   provenance. `aegis dojo --mission "local regression"` runs bounded offline policy simulations.
   See [Dojo coverage and limits](docs/dojo/COVERAGE.md).
 
-## Install
+## Install & Quick Start
 
 ```bash
 pip install aegis-gate     # or: pip install -e .  from a clone
+aegis ui                   # open the offline Control Center app in your browser
+aegis setup                # 1-click hook setup for Claude Code / Gemini CLI (creates backups)
+aegis doctor               # verify ledger integrity, tripwires, policy, and connected apps
 ```
+
+New to Aegis or want a plain-English walkthrough of every capability? Read the [User Guide](docs/USER_GUIDE.md).
 
 ## Use it
 
@@ -149,17 +154,20 @@ First-use auto-pinning is a convenience API, not proof that a server is trustwor
 **Command line:**
 
 ```bash
+aegis ui                          # open the offline Control Center web app
+aegis setup                       # 1-click hook setup for Claude Code / Gemini CLI
+aegis doctor                      # check policy, ledger integrity, tripwires, and connected apps
 aegis explain 'rm -rf /'          # why a command gets its verdict
 aegis minotaur init               # plant tripwires
 aegis ledger verify               # check the decision log is intact
 aegis sandbox probe               # can this host confine with bubblewrap?
-aegis audit ./src                 # OWASP scan a repo
+aegis audit ./src                 # OWASP + secret scan a repo offline
 aegis pin check myserver tools.json
 ```
 
-Configure through environment variables (so every host configures it the same way):
+Configure visually in `aegis ui` (saved to `~/.aegis/policy.json`), or override via environment variables:
 `AEGIS_PROJECT_EXEC`, `AEGIS_SECRET_LEVEL`, `AEGIS_LEAK_GUARD`, `AEGIS_CODE_AUDIT`,
-`AEGIS_UNKNOWN_BINARY`, `AEGIS_EXTRA_ROOTS`, `AEGIS_STRICT_TOOLS`.
+`AEGIS_UNKNOWN_BINARY`, `AEGIS_EXTRA_ROOTS`, `AEGIS_STRICT_TOOLS`, `AEGIS_INLINE_EXEC`.
 
 ## What Aegis is not
 

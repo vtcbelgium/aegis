@@ -22,6 +22,14 @@ classifiers = [
 [project.scripts]
 aegis = "aegis.cli:main"
 
+[project.urls]
+Homepage = "https://othrys.be/aegis"
+Repository = "https://github.com/vtcbelgium/aegis"
+Issues = "https://github.com/vtcbelgium/aegis/issues"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["aegis*"]
+
+[tool.setuptools.package-data]
+"aegis.ui" = ["*.html", "*.css", "*.js"]
