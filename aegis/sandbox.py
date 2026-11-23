@@ -72,6 +72,8 @@ def srt_path() -> Optional[str]:
 
 
 def _user_namespaces_ok() -> bool:
+    if platform.system() != "Linux":
+        return False
     try:
         with open("/proc/sys/kernel/unprivileged_userns_clone") as fh:
             if fh.read().strip() == "0":

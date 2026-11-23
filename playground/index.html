@@ -158,8 +158,8 @@
       <h2>👁️ In-Page Prompt Injection Tests</h2>
       <p>Simulate hidden web attacks designed to hijack browsing agents (DAN mode, zero-font, opacity-0).</p>
       <button class="btn btn-red" onclick="injectZeroFont()">💥 Trigger Zero-Font Trap (0px font)</button>
-      <button class="btn btn-red" onclick="injectWhiteOnWhite()">💥 Trigger Hidden Color Trap</button>
-      <button class="btn btn-red" onclick="injectOpacityTrap()">💥 Trigger CSS Opacity 0 Trap</button>
+      <button class="btn btn-red" onclick="injectWhiteOnWhite()">💥 Trigger Zero-Width Split Trap</button>
+      <button class="btn btn-red" onclick="injectOpacityTrap()">💥 Trigger Hidden Shell Command Trap</button>
       <div class="quarantine-zone" id="browserFeed">
         <span style="color: var(--muted);">Click a button to deploy in-page payload. Aegis content script will detect and quarantine it.</span>
       </div>
@@ -179,8 +179,8 @@
     <!-- Test Card 3: Concurrency Hammer -->
     <div class="card">
       <h2>⚡ In-Browser Concurrency Hammer</h2>
-      <p>Fire 1,000 rapid deterministic gate evaluations to stress memory, latency, and event loops.</p>
-      <button class="btn" id="hammerBtn" onclick="runHammer()">🚀 Run 1,000 Evals Hammer</button>
+      <p>Fire 500 rapid deterministic gate evaluations to stress memory, latency, and event loops.</p>
+      <button class="btn" id="hammerBtn" onclick="runHammer()">🚀 Run 500 Evals Hammer</button>
       <div class="stat-row">
         <div class="stat-box">
           <div class="stat-val" id="hammerCount">0</div>
@@ -209,15 +209,6 @@
   </div>
 
   <script>
-    // Inline Aegis Pattern Detectors for Playground
-    const INJECTION_PATTERNS = [
-      /ignore\s+(all\s+)?(previous|prior)\s+instructions/i,
-      /system\s+prompt\s*:/i,
-      /you\s+are\s+now\s+in\s+DAN\s+mode/i,
-      /send\s+(the\s+)?(cookies|passwords|history|tokens)\s+to/i,
-      /exfiltrate/i
-    ];
-
     function logAudit(msg, isThreat = false) {
       const feed = document.getElementById("auditLog");
       const div = document.createElement("div");

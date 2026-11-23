@@ -84,9 +84,17 @@ RULES: List[Rule] = [
        "Unbounded destructive file primitive"),
 ]
 
-# Lines that are clearly examples/tests/placeholders should not raise a real finding.
+# Lines or values that are clearly examples/tests/placeholders should not raise a real finding.
 _BENIGN = re.compile(r"\b(?:example|dummy|placeholder|your[-_]?key[-_]?here|xxx+|changeme|test[-_]?key|fixture|sample)\b",
                      re.IGNORECASE)
+_SYMBOLIC_ENUM_VALUE = re.compile(r"""[:=]\s*['"]([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)['"]""")
+_COMMENT_LINE = re.compile(r"^\s*(?:#|//|/\*|\*)")
+
+_SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build"})
+_AUDIT_EXTENSIONS = (
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rb", ".php", ".java",
+    ".sh", ".yml", ".yaml", ".env", ".toml", ".cjs", ".mjs",
+)
 
 
 @dataclass
@@ -113,6 +121,12 @@ def scan(content: str, filename: str = "") -> List[Finding]:
         for m in rule.pattern.finditer(content):
             line_no = content.count("\n", 0, m.start()) + 1
             excerpt = (lines[line_no - 1] if 0 < line_no <= len(lines) else m.group(0)).strip()[:160]
+            matched_text = m.group(0)
+            if _COMMENT_LINE.match(excerpt) and rule.id in ("A01", "A02", "A03", "A05", "A07", "A10"):
+                continue
+            if rule.id == "A02" and rule.level == L.RESTRICT:
+                if _BENIGN.search(matched_text) or _SYMBOLIC_ENUM_VALUE.search(matched_text):
+                    continue
             if _BENIGN.search(excerpt) and rule.level < L.RESTRICT:
                 continue
             findings.append(Finding(rule.id, rule.name, rule.level, rule.message, line_no, excerpt))
@@ -128,3 +142,103 @@ def audit_code(content: str, filename: str = "") -> Verdict:
     reasons = [f"{f.rule_id} {f.name}: {f.message} (line {f.line})"
                for f in sorted(findings, key=lambda f: (-int(f.level), f.line))[:8]]
     return Verdict(worst, reasons, NAME, metadata={"findings": [f.to_dict() for f in findings], "file": filename})
+
+
+def scan_path(target_path: str, *, max_files: int = 2000, max_file_bytes: int = 2 * 1024 * 1024) -> dict:
+    """Scan a file or directory for live secrets and OWASP issues (shared by CLI and UI)."""
+    import os
+    from .clans import CustodyClan
+    from .core import AegisGate
+    from .ledger import redact
+
+    abs_target = os.path.abspath(os.path.expanduser(target_path))
+    if not os.path.exists(abs_target):
+        raise FileNotFoundError(f"Target path does not exist: {target_path}")
+
+    gate = AegisGate(base_dir=abs_target, max_violations_per_minute=10**9)
+    files_to_check: List[str] = []
+    truncated = False
+
+    if os.path.isfile(abs_target):
+        files_to_check = [abs_target]
+    else:
+        for root, dirs, files in os.walk(abs_target, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+            for name in sorted(files):
+                files_to_check.append(os.path.join(root, name))
+                if len(files_to_check) >= max_files:
+                    truncated = True
+                    break
+            if truncated:
+                break
+
+    findings_out: List[dict] = []
+    files_with_issues = 0
+
+    for filepath in files_to_check:
+        rel = os.path.relpath(filepath, abs_target) if os.path.isdir(abs_target) else os.path.basename(filepath)
+        file_had_issue = False
+        try:
+            if os.path.getsize(filepath) > max_file_bytes:
+                continue
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as fh:
+                content = fh.read()
+
+            sec_verdict = CustodyClan.inspect_secrets(content)
+            if not sec_verdict.passed:
+                gate.record(sec_verdict)
+                file_had_issue = True
+                for reason in sec_verdict.reasons:
+                    findings_out.append({
+                        "file": rel,
+                        "path": filepath,
+                        "kind": "secret",
+                        "rule": "CUSTODY",
+                        "level": sec_verdict.level.name,
+                        "message": redact(reason),
+                        "line": None,
+                    })
+
+            if filepath.lower().endswith(_AUDIT_EXTENSIONS):
+                code_verdict = audit_code(content, filepath)
+                if code_verdict.level > L.PASS:
+                    gate.record(code_verdict)
+                    file_had_issue = True
+                    for item in code_verdict.metadata.get("findings") or []:
+                        findings_out.append({
+                            "file": rel,
+                            "path": filepath,
+                            "kind": "owasp",
+                            "rule": item["rule"],
+                            "level": item["level"],
+                            "message": f"{item['rule']} {item['name']}: {item['message']} (line {item['line']})",
+                            "line": item["line"],
+                            "excerpt": redact(item.get("excerpt", ""), 160),
+                        })
+        except Exception as exc:
+            fail_v = Verdict(L.DENY, [f"Could not read file ({exc})"], NAME)
+            gate.record(fail_v)
+            file_had_issue = True
+            findings_out.append({
+                "file": rel,
+                "path": filepath,
+                "kind": "error",
+                "rule": "FAIL_CLOSED",
+                "level": "DENY",
+                "message": f"Could not read ({exc})",
+                "line": None,
+            })
+
+        if file_had_issue:
+            files_with_issues += 1
+
+    return {
+        "target": abs_target,
+        "filesScanned": len(files_to_check),
+        "truncated": truncated,
+        "filesWithIssues": files_with_issues,
+        "findingCount": len(findings_out),
+        "level": gate.current_level.name,
+        "passed": len(findings_out) == 0,
+        "findings": findings_out,
+    }

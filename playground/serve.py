@@ -44,6 +44,9 @@ def scan(text):
     return out
 
 
+MAX_BODY_BYTES = 1024 * 1024
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=DIRECTORY, **kwargs)
@@ -51,21 +54,36 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         return  # Quiet logging
 
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length < 0 or length > MAX_BODY_BYTES:
+            raise ValueError("Request body too large")
+        return json.loads(self.rfile.read(length) if length else b"{}")
+
     def do_GET(self):
         if self.path in {"/status", "/api/status"}:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(gate.snapshot(), indent=2).encode())
-        else:
+        elif self.path in {"/", "/index.html"}:
+            self.path = "/index.html"
             super().do_GET()
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def do_POST(self):
+        sec_fetch = self.headers.get("Sec-Fetch-Site", "")
+        if sec_fetch and sec_fetch not in ("same-origin", "none"):
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Cross-origin requests are forbidden"}).encode())
+            return
         if self.path in {"/gate", "/api/gate"}:
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
             try:
-                data = json.loads(body)
+                data = self._read_json()
                 tool = data.get("tool", "test_tool")
                 arguments = data.get("arguments", {})
                 verdict = evaluate(tool, arguments)
@@ -79,9 +97,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
         elif self.path in {"/scan", "/api/scan"}:
-            length = int(self.headers.get("Content-Length", 0))
             try:
-                data = json.loads(self.rfile.read(length))
+                data = self._read_json()
                 body = json.dumps(scan(str(data.get("text", "")))).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -93,10 +110,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
         elif self.path in {"/reset", "/api/reset"}:
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
             try:
-                data = json.loads(body)
+                data = self._read_json()
                 token = data.get("owner_token", "")
                 success = gate.reset_session(token)
                 self.send_response(200 if success else 403)
@@ -123,7 +138,7 @@ if __name__ == "__main__":
     print(f"🛡️  Aegis Adversarial Stress Lab running at: http://127.0.0.1:{PORT}")
     print(f"   Live Gate API mounted at http://127.0.0.1:{PORT}/gate and /scan")
     print(f"🔑 Owner secret for /reset: {OWNER_SECRET}")
-    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
