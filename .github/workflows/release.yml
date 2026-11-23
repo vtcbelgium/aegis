@@ -19,7 +19,7 @@ jobs:
           python-version: '3.12'
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
       - run: sudo apt-get update -qq && sudo apt-get install -y bubblewrap
       - run: python -m pip install -e . pytest
       - run: python -m pytest -q
