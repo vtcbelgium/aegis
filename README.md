@@ -101,12 +101,20 @@ fools the judge. Aegis never negotiates with a model:
 
 ## Install & Quick Start
 
+**No Python needed (Windows / macOS / Linux):**
+Download the standalone app from [GitHub Releases](https://github.com/vtcbelgium/aegis/releases/latest) (`aegis-desktop-windows-x64.exe`, `aegis-desktop-macos`, or `aegis-desktop-linux-x64`) and run it to open the offline Control Center.
+
+**Python / CLI (Python 3.9+, zero dependencies):**
+
 ```bash
-pip install aegis-gate     # or: pip install -e .  from a clone
+pip install git+https://github.com/vtcbelgium/aegis.git
 aegis ui                   # open the offline Control Center app in your browser
 aegis setup                # 1-click hook setup for Claude Code / Gemini CLI (creates backups)
 aegis doctor               # verify ledger integrity, tripwires, policy, and connected apps
 ```
+
+**Browser Extension (Chrome / Edge / Brave / Firefox):**
+Download `aegis-ai-shield-extension-*.zip` from [GitHub Releases](https://github.com/vtcbelgium/aegis/releases/latest).
 
 New to Aegis or want a plain-English walkthrough of every capability? Read the [User Guide](docs/USER_GUIDE.md).
 

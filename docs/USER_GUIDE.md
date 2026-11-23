@@ -11,8 +11,11 @@ It runs 100% offline on your own device, needs no account, costs zero AI tokens,
 ## 60-Second Quick Start
 
 ### Option A: Open the Control Center App (Recommended)
+
+* **No Python needed:** Download `aegis-desktop-windows-x64.exe`, `aegis-desktop-macos`, or `aegis-desktop-linux-x64` from [GitHub Releases](https://github.com/vtcbelgium/aegis/releases/latest) and run it.
+* **Or via Python (3.9+):**
 ```bash
-pip install aegis-gate
+pip install git+https://github.com/vtcbelgium/aegis.git
 aegis ui
 ```
 This opens the **Aegis Control Center** in your browser (`http://127.0.0.1:9999`) where you can:
