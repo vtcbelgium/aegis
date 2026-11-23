@@ -1,18 +1,29 @@
 {
   "manifest_version": 3,
   "name": "Aegis AI Shield",
-  "version": "1.1.0",
-  "description": "Redacts prompt-injection text from pages and blocks exfiltration beacons before AI browsing agents read them.",
+  "version": "1.0.0",
+  "description": "Free, offline shield that removes hidden AI prompt-injection traps from web pages and blocks data-theft beacons.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "storage",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "activeTab"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Aegis AI Shield"
+    "default_title": "Aegis AI Shield",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "background": {
     "service_worker": "background.js"
@@ -36,5 +47,11 @@
         "path": "rules.json"
       }
     ]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "aegis-shield@othrys.be",
+      "strict_min_version": "109.0"
+    }
   }
 }
