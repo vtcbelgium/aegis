@@ -1,0 +1,100 @@
+name: Release Aegis Public App
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: sudo apt-get update -qq && sudo apt-get install -y bubblewrap
+      - run: python -m pip install -e . pytest
+      - run: python -m pytest -q
+      - run: python -m aegis dojo --mission "release-gate"
+      - run: npm ci && npm run test:extension
+
+  package-python-and-extension:
+    needs: verify
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install build
+      - run: python scripts/build_release.py --out-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-and-extension
+          path: dist/*
+
+  package-standalone-desktop:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: aegis-desktop-windows-x64.exe
+            add_data_sep: ';'
+          - os: macos-latest
+            artifact_name: aegis-desktop-macos
+            add_data_sep: ':'
+          - os: ubuntu-22.04
+            artifact_name: aegis-desktop-linux-x64
+            add_data_sep: ':'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e . pyinstaller
+      - name: Build single-file Aegis Control Center launcher
+        run: |
+          pyinstaller --onefile --name aegis-desktop --add-data "aegis/ui/index.html${{ matrix.add_data_sep }}aegis/ui" scripts/aegis_launcher.py
+      - name: Stage desktop binary
+        shell: bash
+        run: |
+          mkdir -p desktop-dist
+          if [ -f dist/aegis-desktop.exe ]; then
+            cp dist/aegis-desktop.exe "desktop-dist/${{ matrix.artifact_name }}"
+          else
+            cp dist/aegis-desktop "desktop-dist/${{ matrix.artifact_name }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: desktop-dist/*
+
+  publish-github-release:
+    needs: [package-python-and-extension, package-standalone-desktop]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Refresh combined SHA256SUMS.txt
+        run: |
+          cd release-assets
+          rm -f SHA256SUMS.txt
+          sha256sum * > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*
