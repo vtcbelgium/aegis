@@ -113,7 +113,12 @@ def run_doctor_cli(as_json: bool = False) -> int:
         if h["kind"] == "hook":
             status = "PROTECTED" if h["protected"] else ("not connected" if h["detected"] else "not detected")
         elif h["kind"] == "mcp":
-            status = f"{h['protectedCount']}/{h['totalCount']} MCP servers guarded" if h["exists"] else "no MCP config"
+            if h["exists"]:
+                native = int(h.get("nativeCount") or 0)
+                suffix = f" ({native} native Tekton)" if native else ""
+                status = f"{h['protectedCount']}/{h['totalCount']} MCP servers guarded{suffix}"
+            else:
+                status = "no MCP config"
         else:
             status = "ready in " + str(h["path"]) if h["detected"] else "install from browser store"
         print(f"   - {h['name']:32} {status}")
@@ -224,8 +229,8 @@ def run_sandbox(action: str, command: Optional[str], base_dir: Optional[str]) ->
     return 1
 
 
-def run_pin(action: str, server: str, tools_json: str) -> int:
-    from .pinning import ToolPins
+def run_pin(action: str, server: str, tools_json: str, *, as_json: bool = False) -> int:
+    from .pinning import ToolPins, tool_fingerprint
     raw = tools_json
     if os.path.isfile(tools_json):
         try:
@@ -249,6 +254,32 @@ def run_pin(action: str, server: str, tools_json: str) -> int:
         print(f"Pinned {len(tools)} tool(s) for '{server}'.")
         return 0
     changes = pins.check(server, tools)
+    if action == "diff":
+        rec = pins._data.get("servers", {}).get(server) or {}
+        pinned_map = rec.get("tools") or {}
+        current_map = {t["name"]: tool_fingerprint(t) for t in tools if isinstance(t, dict) and t.get("name")}
+        diff_items = []
+        for c in changes:
+            diff_items.append({
+                "kind": c.kind,
+                "tool": c.tool,
+                "detail": c.detail,
+                "pinnedSha": (pinned_map.get(c.tool) or "")[:12] or None,
+                "currentSha": (current_map.get(c.tool) or "")[:12] or None,
+            })
+        if as_json:
+            print(json.dumps({"server": server, "clean": not changes, "changes": diff_items}, indent=2))
+            return 0 if not changes else 2
+        if not diff_items:
+            print(f"'{server}': 0 differences from pinned catalogue ({len(current_map)} tool(s) verified).")
+            return 0
+        print(f"Pin diff for '{server}' ({len(diff_items)} change(s)):")
+        for item in diff_items:
+            sha_info = ""
+            if item["pinnedSha"] or item["currentSha"]:
+                sha_info = f" [{item['pinnedSha'] or 'none'} -> {item['currentSha'] or 'removed'}]"
+            print(f"  [{item['kind']}] {item['tool']}{sha_info}: {item['detail']}")
+        return 2
     if not changes:
         print(f"'{server}': no changes from the pinned catalogue.")
         return 0
@@ -333,8 +364,22 @@ def main() -> None:
     mcpp.add_argument("--no-auto-pin", action="store_true", help="Require explicit prior `aegis pin pin` instead of auto-pinning first-seen tools")
     mcpp.add_argument("command", nargs=argparse.REMAINDER, help="Upstream MCP server command (e.g. -- npx -y @modelcontextprotocol/server-filesystem /tmp)")
 
-    pp = sub.add_parser("pin", help="MCP tool pinning: check or pin a server's tools")
-    pp.add_argument("action", choices=["check", "pin"]); pp.add_argument("server"); pp.add_argument("tools")
+    mcp_grp = sub.add_parser("mcp", help="MCP firewall helpers (`aegis mcp wrap -- <cmd>`)")
+    mcp_sub = mcp_grp.add_subparsers(dest="mcp_action")
+    mcp_wrap = mcp_sub.add_parser("wrap", help="Wrap any stdio MCP server behind Aegis tool pinning & output scrubbing")
+    mcp_wrap.add_argument("--server", "--server-id", dest="server_id", default=None, help="Stable server identifier for tool pinning")
+    mcp_wrap.add_argument("--base-dir", default=None, help="Base directory for path confinement & workspace policies")
+    mcp_wrap.add_argument("--pins-file", default=None, help="Custom path for pins.json")
+    mcp_wrap.add_argument("--no-auto-pin", action="store_true", help="Require explicit prior pinning before tools/call")
+    mcp_wrap.add_argument("command", nargs=argparse.REMAINDER, help="Upstream MCP server command after `--`")
+
+    pp = sub.add_parser("pin", help="MCP tool pinning: check, diff, or pin a server's tools")
+    pp.add_argument("action", choices=["check", "diff", "pin"]); pp.add_argument("server"); pp.add_argument("tools")
+    pp.add_argument("--json", action="store_true", dest="as_json", help="Emit structured JSON diff output")
+
+    pps = sub.add_parser("pins", help="Inspect MCP tool pin fingerprints (`aegis pins diff <server> <tools>`)")
+    pps.add_argument("action", choices=["check", "diff", "pin"]); pps.add_argument("server"); pps.add_argument("tools")
+    pps.add_argument("--json", action="store_true", dest="as_json", help="Emit structured JSON diff output")
 
     lrn = sub.add_parser("learn", help="Suggest policy tweaks from the ledger (you decide)")
     lrn.add_argument("-n", type=int, default=15)
@@ -395,8 +440,23 @@ def main() -> None:
             pins_path=args.pins_file,
             auto_pin_new=not args.no_auto_pin,
         ))
-    elif args.subcommand == "pin":
-        sys.exit(run_pin(args.action, args.server, args.tools))
+    elif args.subcommand == "mcp":
+        if args.mcp_action == "wrap":
+            from .mcp_proxy import run_mcp_proxy_stdio
+            cmd = args.command
+            if cmd and cmd[0] == "--":
+                cmd = cmd[1:]
+            sys.exit(run_mcp_proxy_stdio(
+                cmd,
+                server_id=args.server_id,
+                base_dir=args.base_dir,
+                pins_path=args.pins_file,
+                auto_pin_new=not args.no_auto_pin,
+            ))
+        mcp_grp.print_help()
+        sys.exit(1)
+    elif args.subcommand in ("pin", "pins"):
+        sys.exit(run_pin(args.action, args.server, args.tools, as_json=args.as_json))
     elif args.subcommand == "learn":
         sys.exit(run_learn(args.n))
     elif args.subcommand == "hook":

@@ -98,15 +98,25 @@ for line in sys.stdin:
         encoding="utf-8",
     )
 
+    repo_root = str(Path(__file__).resolve().parents[1])
     env = os.environ.copy()
     env["AEGIS_HOME"] = str(aegis_home)
+    env["PYTHONPATH"] = repo_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     cmd = [
         sys.executable, "-m", "aegis.cli", "mcp-proxy",
         "--server-id", "strict-srv",
         "--no-auto-pin",
         "--", sys.executable, str(server_script),
     ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=repo_root,
+        env=env,
+    )
     proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": "1", "method": "tools/list"}) + "\n")
     proc.stdin.flush()
     resp = json.loads(proc.stdout.readline())

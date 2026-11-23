@@ -37,6 +37,7 @@ from .harness import AegisHarness
 from .ledger import DecisionLedger, default_ledger_path, summarize_arguments
 from .mcp_proxy import AegisMcpProxy
 from .setup_wizard import (
+    antigravity_mcp_path,
     claude_code_settings_path,
     claude_desktop_config_path,
     configure_hook_host,
@@ -45,6 +46,7 @@ from .setup_wizard import (
     detect_hosts,
     gemini_cli_settings_path,
     run_doctor,
+    vscode_mcp_path,
 )
 from .shell import analyze_command
 
@@ -449,6 +451,8 @@ def _build_handler(state: AegisAppState, port: int):
                 host_paths = {
                     "cursor_mcp": cursor_mcp_path(),
                     "claude_desktop_mcp": claude_desktop_config_path(),
+                    "antigravity_mcp": antigravity_mcp_path(),
+                    "vscode_mcp": vscode_mcp_path(),
                 }
                 if host not in host_paths:
                     self._send_json(400, {"error": f"Unsupported MCP host: {host!r}"})

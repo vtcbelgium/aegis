@@ -61,6 +61,21 @@ def cursor_mcp_path() -> str:
     return os.path.join(_home(), ".cursor", "mcp.json")
 
 
+def antigravity_mcp_path() -> str:
+    return os.path.join(_home(), ".gemini", "antigravity", "mcp_config.json")
+
+
+def vscode_mcp_path() -> str:
+    sys_name = platform.system()
+    if sys_name == "Windows":
+        appdata = os.environ.get("APPDATA") or os.path.join(_home(), "AppData", "Roaming")
+        return os.path.join(appdata, "Code", "User", "mcp.json")
+    if sys_name == "Darwin":
+        return os.path.join(_home(), "Library", "Application Support", "Code", "User", "mcp.json")
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(_home(), ".config")
+    return os.path.join(xdg, "Code", "User", "mcp.json")
+
+
 def claude_desktop_config_path() -> str:
     sys_name = platform.system()
     if sys_name == "Windows":
@@ -180,6 +195,30 @@ def configure_hook_host(path: str, *, enable: bool = True, command_prefix: Optio
     }
 
 
+def _is_native_tekton_server(name: str, cmd: str, args: List[str]) -> bool:
+    """Detect Tekton MCP entries that enforce Aegis natively (avoid double-wrapping)."""
+    low_name = name.lower()
+    low_cmd = os.path.basename(cmd).lower()
+    low_args = [a.lower() for a in args]
+    if low_cmd in ("tekton", "tekton.exe", "tekton.cmd", "tekton-mcp", "tekton-mcp.exe", "tekton-mcp.cmd"):
+        return True
+    if "-m" in low_args:
+        idx = low_args.index("-m")
+        if idx + 1 < len(low_args) and low_args[idx + 1] in ("tekton", "tekton.mcp_server"):
+            return True
+    if low_name == "tekton" and any("tekton" in part for part in [low_cmd] + low_args):
+        return True
+    return False
+
+
+def _mcp_servers_key(data: Dict[str, Any]) -> str:
+    if isinstance(data.get("mcpServers"), dict):
+        return "mcpServers"
+    if isinstance(data.get("servers"), dict):
+        return "servers"
+    return "mcpServers"
+
+
 def _inspect_mcp_file(path: str) -> Dict[str, Any]:
     exists = os.path.isfile(path)
     servers: List[Dict[str, Any]] = []
@@ -187,7 +226,7 @@ def _inspect_mcp_file(path: str) -> Dict[str, Any]:
     if exists:
         try:
             data = _read_json_file(path) or {}
-            mcp_servers = data.get("mcpServers") or {}
+            mcp_servers = data.get(_mcp_servers_key(data)) or {}
             if isinstance(mcp_servers, dict):
                 for name, cfg in sorted(mcp_servers.items()):
                     if not isinstance(cfg, dict):
@@ -195,12 +234,16 @@ def _inspect_mcp_file(path: str) -> Dict[str, Any]:
                     cmd = str(cfg.get("command") or "")
                     args = [str(a) for a in (cfg.get("args") or [])] if isinstance(cfg.get("args"), list) else []
                     joined = " ".join([cmd] + args)
-                    wrapped = ("mcp-proxy" in args) and ("aegis" in joined.lower())
+                    wrapped = (("mcp-proxy" in args) or ("mcp" in args and "wrap" in args)) and ("aegis" in joined.lower())
+                    native_tekton = (not wrapped) and _is_native_tekton_server(name, cmd, args)
                     servers.append({
                         "name": name,
                         "command": cmd,
                         "args": args,
-                        "protected": wrapped,
+                        "protected": wrapped or native_tekton,
+                        "wrapped": wrapped,
+                        "nativeAegis": native_tekton,
+                        "protectionKind": "aegis-mcp-proxy" if wrapped else ("tekton-native" if native_tekton else "unprotected"),
                     })
         except Exception as exc:
             error = str(exc)
@@ -209,6 +252,7 @@ def _inspect_mcp_file(path: str) -> Dict[str, Any]:
         "exists": exists,
         "servers": servers,
         "protectedCount": sum(1 for s in servers if s["protected"]),
+        "nativeCount": sum(1 for s in servers if s.get("nativeAegis")),
         "totalCount": len(servers),
         "error": error,
     }
@@ -225,7 +269,8 @@ def configure_mcp_server(
     data = _read_json_file(path)
     if data is None:
         raise FileNotFoundError(f"MCP config not found: {path}")
-    servers = data.get("mcpServers")
+    servers_key = _mcp_servers_key(data)
+    servers = data.get(servers_key)
     if not isinstance(servers, dict) or server_name not in servers:
         raise KeyError(f"MCP server '{server_name}' not found in {path}")
     entry = servers[server_name]
@@ -234,7 +279,16 @@ def configure_mcp_server(
 
     cmd = str(entry.get("command") or "")
     args = [str(a) for a in (entry.get("args") or [])] if isinstance(entry.get("args"), list) else []
-    is_wrapped = ("mcp-proxy" in args) and ("aegis" in " ".join([cmd] + args).lower())
+    is_wrapped = (("mcp-proxy" in args) or ("mcp" in args and "wrap" in args)) and ("aegis" in " ".join([cmd] + args).lower())
+    if enable and not is_wrapped and _is_native_tekton_server(server_name, cmd, args):
+        return {
+            "path": path,
+            "server": server_name,
+            "protected": True,
+            "nativeAegis": True,
+            "backup": None,
+            "note": "Tekton enforces Aegis natively; mcp-proxy wrapping is not needed.",
+        }
 
     if enable and not is_wrapped:
         if not cmd:
@@ -298,6 +352,8 @@ def detect_hosts() -> Dict[str, Any]:
     for key, label, cfg_path in (
         ("cursor_mcp", "Cursor (MCP)", cursor_mcp_path()),
         ("claude_desktop_mcp", "Claude Desktop (MCP)", claude_desktop_config_path()),
+        ("antigravity_mcp", "Antigravity IDE (MCP)", antigravity_mcp_path()),
+        ("vscode_mcp", "VS Code (MCP)", vscode_mcp_path()),
     ):
         info = _inspect_mcp_file(cfg_path)
         hosts[key] = {

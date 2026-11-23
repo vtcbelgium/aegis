@@ -170,8 +170,11 @@ aegis minotaur init               # plant tripwires
 aegis ledger verify               # check the decision log is intact
 aegis sandbox probe               # can this host confine with bubblewrap?
 aegis audit ./src                 # OWASP + secret scan a repo offline
-aegis pin check myserver tools.json
+aegis mcp wrap --server fs -- npx -y @modelcontextprotocol/server-filesystem .
+aegis pins diff myserver tools.json --json
 ```
+
+**Specification & Interlocking Products:** The TOCTOU-resistant destructive confirmation format is published as a standalone JSON Schema at [docs/specs/destructive-confirmation-v1.schema.json](docs/specs/destructive-confirmation-v1.schema.json) (`aegis.destructive-confirmation.v1`), consumed both by standalone Aegis hooks/UI and by interlocking execution bridges such as Tekton.
 
 Configure visually in `aegis ui` (saved to `~/.aegis/policy.json`), or override via environment variables:
 `AEGIS_PROJECT_EXEC`, `AEGIS_SECRET_LEVEL`, `AEGIS_LEAK_GUARD`, `AEGIS_CODE_AUDIT`,

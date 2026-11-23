@@ -113,12 +113,17 @@ for line in sys.stdin:
         "--", sys.executable, str(server_script)
     ]
 
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = repo_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     p = subprocess.Popen(
         proxy_cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        cwd=repo_root,
+        env=env,
     )
 
     # 1. tools/list -> should pass and pin tools
