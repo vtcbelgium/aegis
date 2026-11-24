@@ -1532,6 +1532,24 @@ def _paths(ctx: _Ctx, args: List[str], mode: str, windows: bool = False) -> None
         _check_path(ctx, a, mode)
 
 
+def _expand_long_opt(opt: str, classes) -> str:
+    """Return the known long option that `opt` abbreviates, checking classes in order.
+
+    GNU tools accept any prefix of a long option; we resolve fail-closed: the first class
+    (most dangerous) containing an option that starts with `opt` wins, even if ambiguous.
+    """
+    if len(opt) < 3 or not opt.startswith("--"):
+        return opt
+    for cls in classes:
+        if opt in cls:
+            return opt
+    for cls in classes:
+        for known in sorted(cls):
+            if known.startswith("--") and known.startswith(opt):
+                return known
+    return opt
+
+
 def _read_tool(name: str, args: List[str], ctx: _Ctx) -> None:
     spec = _READ_TOOL_SPEC.get(name)
     windows = name in CMD_BUILTINS
@@ -1565,6 +1583,9 @@ def _read_tool(name: str, args: List[str], ctx: _Ctx) -> None:
                     continue
             if a.startswith("--") and len(a) > 2:
                 opt, eq, val = a.partition("=")
+                # GNU getopt accepts any unambiguous prefix (--out == --output), so map an
+                # abbreviation onto the option it can expand to. Most dangerous class wins.
+                opt = _expand_long_opt(opt, (ask_opts, write_opts, read_opts, value_opts))
                 if opt in ask_opts:
                     _add(ctx, L.ASK, f"{name} {opt} executes an arbitrary program (owner approval)")
                     if not eq and i < n:
@@ -1588,8 +1609,10 @@ def _read_tool(name: str, args: List[str], ctx: _Ctx) -> None:
                     if not eq and i < n:
                         i += 1
                     continue
+                # Unknown long option on a tool with a known output table: a path-like value
+                # could be an output we do not model, so fail closed and check it as a write.
                 if eq and _looks_like_path_token(val):
-                    _check_path(ctx, val, "read")
+                    _check_path(ctx, val, "write")
                 continue
             if a.startswith("-") and len(a) > 1 and not a.startswith("--"):
                 if a in value_opts and len(a) > 2:
@@ -1670,6 +1693,19 @@ def _env_builtin(name: str, args: List[str], ctx: _Ctx) -> None:
     if name == "set":
         if not args:
             _add(ctx, L.ASK, "Environment variable dump (set)")
+            return
+        # cmd.exe: `set NAME=value`, `set "NAME=value"`, `set /p NAME=...`, `set /a NAME=...`
+        for a in args:
+            tok = a.strip().strip('"').strip()
+            if not tok or tok.startswith(("-", "/")) or "=" not in tok:
+                continue
+            var = tok.split("=", 1)[0].strip()
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", var):
+                continue
+            if boundaries.GUARD_ENV_RE.match(var):
+                raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {var}", boundaries.POLICY_TAMPER)
+            if var.upper() in DANGEROUS_ENV_OVERRIDES:
+                _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {var}")
         return
     # export / declare / typeset
     if not plain or any(a in ("-p", "-x") for a in args) and not plain:

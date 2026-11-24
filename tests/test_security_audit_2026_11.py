@@ -559,3 +559,76 @@ def test_r4_h1_python_module_cwd_shadowing_and_plugin_linters_require_ask(tmp_pa
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# Round 5: GNU long-option abbreviations and cmd `set` env overrides
+# ---------------------------------------------------------------------------
+
+def test_r5_h1_abbreviated_long_output_options_checked_as_write(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_posix = str(protected / "config.json").replace("\\", "/")
+    pol_shared = AegisPolicy(extra_roots=[str(tmp_path)], protected_paths=[str(protected)])
+    for cmd in (
+        f"sort x.json --out='{cfg_posix}'",
+        f"sort x.json --outp '{cfg_posix}'",
+        f"sort x.json --o='{cfg_posix}'",
+        f"sort x.json --temp='{cfg_posix}'",
+        f"sort x.json --temporary '{cfg_posix}'",
+        f"iconv -f utf-8 -t utf-8 x.json --out='{cfg_posix}'",
+        f"base64 -d x.json --outp='{cfg_posix}'",
+        f"less --log='{cfg_posix}' x.json",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    # Unknown long options carrying a path value on spec'd tools fail closed as write
+    v = analyze_command(f"sort x.json --bogus='{cfg_posix}'", base_dir=str(ws), cwd=str(ws), policy=pol_shared)
+    assert v.level == L.LOCK, (v.level.name, v.reasons)
+
+    # Benign abbreviations still pass
+    pol_ws = AegisPolicy()
+    for cmd in ("sort --uniq data.txt", "sort --rev data.txt", "sort --field-sep=, -k2 data.txt"):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_ws)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+
+def test_r5_h2_abbreviated_exec_options_require_ask(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    pol = AegisPolicy()
+    for cmd in (
+        "sort -S 1K --compress-prog=./z.sh big.txt",
+        "sort --compress=./z.sh big.txt",
+        "sort --compress-p ./z.sh big.txt",
+        "sort --comp=sh big.txt",
+    ):
+        v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+
+def test_r5_h3_cmd_set_of_sensitive_env_vars_requires_ask(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+    for cmd in (
+        "set PYTHONPATH=.&& python -P -m platform",
+        'set "PYTHONPATH=." && python -P -m platform',
+        "set pythonpath=.& python -P -m platform",
+        "set PYTHONSTARTUP=x.py",
+        "set PATH=.;%PATH%",
+        "set /p PYTHONPATH=<x.txt",
+    ):
+        v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol, windows=True)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+    for cmd in ("set AEGIS_MODE=off", "set TEKTON_AEGIS_MODE=off"):
+        v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol, windows=True)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+    # Harmless cmd set still passes
+    v = analyze_command("set FOO=bar", base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol, windows=True)
+    assert v.level == L.PASS, (v.level.name, v.reasons)
