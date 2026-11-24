@@ -1,6 +1,6 @@
 {
   "name": "@othrys/aegis",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Deterministic Monotonic Negative Security Gate & Agentic Firewall for AI Agents",
   "scripts": {
     "test": "python -m unittest discover -s tests -t .",

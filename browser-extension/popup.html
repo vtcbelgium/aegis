@@ -5,12 +5,15 @@
   <title>Aegis Shield</title>
   <style>
     :root {
-      --bg: #0b0d11;
-      --border: rgba(255, 255, 255, 0.09);
-      --fg: #f3f5f8;
-      --muted: #8b94a5;
-      --ok: #34d399;
-      --danger: #f87171;
+      --bg: #0e0f11;
+      --surface: #141518;
+      --field: #1a1c20;
+      --border: rgba(255, 255, 255, 0.075);
+      --fg: #f2f4f8;
+      --muted: #7f8590;
+      --accent: #2b59ff;
+      --ok: #7fb098;
+      --danger: #df6b6b;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
     }
@@ -45,14 +48,14 @@
       height: 19px;
       border-radius: 999px;
       border: 1px solid var(--border);
-      background: #1a1f2b;
+      background: var(--field);
       padding: 2px;
       display: inline-flex;
       align-items: center;
       cursor: pointer;
       transition: background 140ms ease;
     }
-    .switch[data-on="true"] { background: var(--ok); border-color: var(--ok); }
+    .switch[data-on="true"] { background: var(--accent); border-color: var(--accent); }
     .switch span {
       width: 13px;
       height: 13px;
@@ -108,11 +111,12 @@
 <body>
   <div class="bar">
     <div class="brand">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
-        <path d="M12 2.5L4.5 5.5v6.2c0 4.9 3.1 8.8 7.5 10.3 4.4-1.5 7.5-5.4 7.5-10.3V5.5L12 2.5z"/>
-        <path d="M9 12.2l2.1 2.1L15.4 10"/>
+      <svg width="16" height="16" viewBox="0 0 128 128" fill="none" aria-hidden="true">
+        <path d="M56 16H74L49 70L61 98H37L31 112H12L56 16Z" fill="currentColor"/>
+        <path d="M77 25L116 112H95L89 98H67L79 70L66 47L77 25Z" fill="currentColor"/>
       </svg>
-      <span>Aegis Shield</span>
+      <span style="letter-spacing:0.04em;">AEGIS</span>
+      <span class="muted" style="font-weight:400;font-size:11px;">Shield</span>
     </div>
     <button class="switch" id="toggleProtection" data-on="true" aria-label="Toggle shield"><span></span></button>
   </div>

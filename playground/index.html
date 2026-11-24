@@ -6,23 +6,28 @@
   <title>Aegis AI Shield — Adversarial Stress Lab</title>
   <style>
     :root {
-      --bg: #0b111a;
-      --panel: #111a26;
-      --line: rgba(255, 255, 255, 0.12);
-      --text: #f1f5f9;
-      --muted: #94a3b8;
-      --cyan: #38bdf8;
-      --red: #f87171;
-      --green: #4ade80;
-      --gold: #d9ae62;
+      --bg: #0e0f11;
+      --panel: #141518;
+      --elevated: #1a1c20;
+      --line: rgba(255, 255, 255, 0.08);
+      --line-strong: rgba(255, 255, 255, 0.16);
+      --text: #f2f4f8;
+      --muted: #7f8590;
+      --accent: #2b59ff;
+      --accent-hover: #3b67ff;
+      --cyan: #f2f4f8;
+      --red: #df6b6b;
+      --green: #7fb098;
+      --gold: #d4a759;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       background: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
       padding: 24px;
       line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
     header {
       display: flex;
@@ -35,41 +40,43 @@
       gap: 12px;
     }
     .badge {
-      background: rgba(56, 189, 248, 0.12);
-      color: var(--cyan);
-      border: 1px solid rgba(56, 189, 248, 0.3);
+      background: var(--elevated);
+      color: var(--text);
+      border: 1px solid var(--line-strong);
       padding: 4px 10px;
-      border-radius: 6px;
+      border-radius: 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 11px;
-      font-weight: 700;
+      font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
     .law {
-      background: rgba(56, 189, 248, 0.06);
-      border-left: 3px solid var(--cyan);
-      padding: 10px 14px;
-      border-radius: 0 8px 8px 0;
-      font-style: italic;
-      color: #e2e8f0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-left: 2px solid var(--accent);
+      padding: 11px 15px;
+      border-radius: 6px;
+      color: var(--text);
       font-size: 13px;
       margin-bottom: 24px;
     }
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 20px;
+      gap: 16px;
       margin-bottom: 24px;
     }
     .card {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 10px;
+      border-radius: 8px;
       padding: 18px;
     }
     .card h2 {
-      font-size: 15px;
-      color: var(--cyan);
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
       margin-bottom: 8px;
       display: flex;
       align-items: center;
@@ -81,25 +88,25 @@
       margin-bottom: 14px;
     }
     button.btn {
-      background: var(--cyan);
-      color: #0b111a;
-      border: none;
+      background: var(--accent);
+      color: #ffffff;
+      border: 1px solid var(--accent);
       padding: 8px 14px;
       border-radius: 6px;
       font-size: 12px;
-      font-weight: 700;
+      font-weight: 600;
       cursor: pointer;
-      transition: opacity 0.15s;
+      transition: background 0.15s, border-color 0.15s;
       width: 100%;
       margin-bottom: 8px;
     }
-    button.btn:hover { opacity: 0.9; }
+    button.btn:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
     button.btn-red {
-      background: rgba(248, 113, 113, 0.2);
+      background: var(--elevated);
       color: var(--red);
-      border: 1px solid var(--red);
+      border: 1px solid var(--line-strong);
     }
-    button.btn-red:hover { background: rgba(248, 113, 113, 0.3); }
+    button.btn-red:hover { border-color: var(--red); background: rgba(223, 107, 107, 0.1); }
     .quarantine-zone {
       background: rgba(0, 0, 0, 0.3);
       border: 1px solid var(--line);
@@ -138,13 +145,19 @@
 </head>
 <body>
   <header>
-    <div>
-      <h1 style="font-size: 22px; font-weight: 800;">🛡️ Aegis AI Shield — Adversarial Stress Lab</h1>
-      <p style="font-size: 12px; color: var(--muted); margin-top: 4px;">Live In-Browser & Local Gate Red-Team Stress Arena</p>
+    <div style="display: flex; align-items: center; gap: 12px;">
+      <svg width="26" height="26" viewBox="0 0 128 128" fill="none" aria-hidden="true">
+        <path d="M56 16H74L49 70L61 98H37L31 112H12L56 16Z" fill="#F2F4F8"/>
+        <path d="M77 25L116 112H95L89 98H67L79 70L66 47L77 25Z" fill="#F2F4F8"/>
+      </svg>
+      <div>
+        <h1 style="font-size: 18px; font-weight: 600; letter-spacing: 0.04em;">AEGIS — Adversarial Stress Lab</h1>
+        <p style="font-size: 12px; color: var(--muted); margin-top: 2px;">Live In-Browser &amp; Local Gate Red-Team Stress Arena</p>
+      </div>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
       <span class="badge">STRESS READY</span>
-      <span class="badge" style="color: var(--green); border-color: rgba(74,222,128,0.3); background: rgba(74,222,128,0.12);">100% DETERMINISTIC</span>
+      <span class="badge" style="color: var(--green);">100% DETERMINISTIC</span>
     </div>
   </header>
 

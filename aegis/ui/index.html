@@ -5,18 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="aegis-token" content="__AEGIS_SESSION_TOKEN__">
   <title>Aegis Control Center</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect width='128' height='128' rx='26' fill='%230E0F11'/%3E%3Cpath d='M56 16H74L49 70L61 98H37L31 112H12L56 16Z' fill='%23F7F8FA'/%3E%3Cpath d='M77 25L116 112H95L89 98H67L79 70L66 47L77 25Z' fill='%23F7F8FA'/%3E%3C/svg%3E">
   <style>
     :root {
-      --bg: #0b0d11;
-      --sidebar: #101319;
-      --field: #141821;
-      --border: rgba(255, 255, 255, 0.09);
-      --border-strong: rgba(255, 255, 255, 0.22);
-      --fg: #f3f5f8;
-      --muted: #8b94a5;
-      --ok: #34d399;
-      --warn: #f59e0b;
-      --danger: #f87171;
+      --bg: #0e0f11;
+      --sidebar: #141518;
+      --field: #1a1c20;
+      --elevated: #202228;
+      --border: rgba(255, 255, 255, 0.075);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --fg: #f2f4f8;
+      --muted: #7f8590;
+      --accent: #2b59ff;
+      --accent-hover: #3b67ff;
+      --ok: #7fb098;
+      --warn: #d4a759;
+      --danger: #df6b6b;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
     }
@@ -73,13 +77,14 @@
       gap: 2px;
     }
     .nav-btn {
+      position: relative;
       background: transparent;
       border: none;
       color: var(--muted);
       font: inherit;
       font-weight: 500;
-      padding: 8px 10px;
-      border-radius: 7px;
+      padding: 8px 10px 8px 12px;
+      border-radius: 6px;
       text-align: left;
       cursor: pointer;
       display: flex;
@@ -87,8 +92,18 @@
       justify-content: space-between;
       transition: background 120ms ease, color 120ms ease;
     }
-    .nav-btn:hover { color: var(--fg); background: rgba(255, 255, 255, 0.04); }
-    .nav-btn[data-active="true"] { background: rgba(255, 255, 255, 0.08); color: var(--fg); }
+    .nav-btn:hover { color: var(--fg); background: rgba(255, 255, 255, 0.035); }
+    .nav-btn[data-active="true"] { background: var(--field); color: var(--fg); }
+    .nav-btn[data-active="true"]::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 6px;
+      bottom: 6px;
+      width: 2px;
+      border-radius: 2px;
+      background: var(--accent);
+    }
     .count {
       font-family: var(--mono);
       font-variant-numeric: tabular-nums;
@@ -180,9 +195,9 @@
     .btn {
       display: inline-flex;
       align-items: center;
-      background: transparent;
+      background: var(--field);
       border: 1px solid var(--border);
-      border-radius: 7px;
+      border-radius: 6px;
       color: var(--fg);
       font: inherit;
       font-size: 12px;
@@ -191,13 +206,17 @@
       cursor: pointer;
       white-space: nowrap;
       text-decoration: none;
-      transition: border-color 120ms ease, opacity 120ms ease;
+      transition: border-color 120ms ease, background 120ms ease, opacity 120ms ease;
     }
-    .btn:hover:not(:disabled) { border-color: var(--border-strong); }
+    .btn:hover:not(:disabled) { border-color: var(--border-strong); background: var(--elevated); }
     .btn.primary {
-      background: var(--fg);
-      color: var(--bg);
-      border-color: var(--fg);
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent);
+    }
+    .btn.primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
     }
     .btn.danger-outline:hover:not(:disabled) {
       border-color: var(--danger);
@@ -284,7 +303,7 @@
       padding: 5px 12px;
       cursor: pointer;
     }
-    .seg button.active { background: var(--fg); color: var(--bg); }
+    .seg button.active { background: var(--elevated); color: var(--fg); box-shadow: inset 0 0 0 1px var(--border-strong); }
 
     .switch {
       width: 34px;
@@ -299,7 +318,7 @@
       flex-shrink: 0;
       transition: background 140ms ease;
     }
-    .switch[data-on="true"] { background: var(--ok); border-color: var(--ok); }
+    .switch[data-on="true"] { background: var(--accent); border-color: var(--accent); }
     .switch span {
       width: 13px;
       height: 13px;
@@ -518,11 +537,11 @@
       <div>
         <div class="brand">
           <div class="brand-left">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
-              <path d="M12 2.5L4.5 5.5v6.2c0 4.9 3.1 8.8 7.5 10.3 4.4-1.5 7.5-5.4 7.5-10.3V5.5L12 2.5z"/>
-              <path d="M9 12.2l2.1 2.1L15.4 10"/>
+            <svg width="17" height="17" viewBox="0 0 128 128" fill="none" aria-hidden="true">
+              <path d="M56 16H74L49 70L61 98H37L31 112H12L56 16Z" fill="currentColor"/>
+              <path d="M77 25L116 112H95L89 98H67L79 70L66 47L77 25Z" fill="currentColor"/>
             </svg>
-            <span>Aegis</span>
+            <span style="letter-spacing:0.06em;font-weight:600;font-size:13px;">AEGIS</span>
           </div>
           <span class="version" id="sideVersion">v1.1.0</span>
         </div>
