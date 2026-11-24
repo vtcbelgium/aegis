@@ -2086,8 +2086,8 @@ def _python_module_paths(mod_l: str, rest: List[str], ctx: _Ctx) -> None:
             if a == "--" and not end_of_opts:
                 end_of_opts = True
                 continue
-            if not end_of_opts and a.startswith("-"):
-                if a == "--indent" and i < len(rest):
+            if not end_of_opts and a.startswith("-") and len(a) > 1:
+                if (a == "--indent" or (a.startswith("--") and "=" not in a and len(a) >= 4 and "--indent".startswith(a))) and i < len(rest):
                     i += 1
                 elif a.startswith("--") and "=" in a:
                     opt, val = a.split("=", 1)
@@ -2110,7 +2110,7 @@ def _python_module_paths(mod_l: str, rest: List[str], ctx: _Ctx) -> None:
             if a == "--" and not end_of_opts:
                 end_of_opts = True
                 continue
-            if not end_of_opts and a.startswith("-"):
+            if not end_of_opts and a.startswith("-") and len(a) > 1:
                 if a == "-i" and i < len(rest):
                     _check_path(ctx, rest[i], "read")
                     i += 1
@@ -2134,7 +2134,7 @@ def _python_module_paths(mod_l: str, rest: List[str], ctx: _Ctx) -> None:
             if a == "--" and not end_of_opts:
                 end_of_opts = True
                 continue
-            if not end_of_opts and a.startswith("-"):
+            if not end_of_opts and a.startswith("-") and len(a) > 1:
                 if a == "--prompt" and i < len(rest):
                     i += 1
                 elif a.startswith("--") and "=" in a:
@@ -2272,39 +2272,72 @@ def _pattern_tool(name: str, args: List[str], ctx: _Ctx) -> None:
 
 
 def _sed(args: List[str], ctx: _Ctx) -> None:
-    in_place = any(a == "-i" or a.startswith("-i") or a.startswith("--in-place") for a in args)
+    in_place = False
     scripts: List[str] = []
     files: List[str] = []
+    explicit = False
+    end_of_opts = False
     rest = list(args)
-    explicit = any(
-        a in ("-e", "--expression", "-f", "--file")
-        or a.startswith(("--expression=", "--file="))
-        or (a.startswith(("-e", "-f")) and len(a) > 2 and not a.startswith("--"))
-        for a in rest
-    )
     while rest:
         a = rest.pop(0)
-        if a in ("-e", "--expression") and rest:
-            scripts.append(rest.pop(0))
-        elif a.startswith("--expression="):
-            scripts.append(a.split("=", 1)[1])
-        elif a.startswith("-e") and len(a) > 2 and not a.startswith("--"):
-            scripts.append(a[2:])
-        elif a in ("-f", "--file") and rest:
-            _check_path(ctx, rest.pop(0), "read")
-        elif a.startswith("--file="):
-            _check_path(ctx, a.split("=", 1)[1], "read")
-        elif a.startswith("-f") and len(a) > 2 and not a.startswith("--"):
-            _check_path(ctx, a[2:], "read")
-        elif _is_option(a):
+        if a == "--" and not end_of_opts:
+            end_of_opts = True
             continue
-        elif not explicit and not scripts:
+        if not end_of_opts and a.startswith("--") and len(a) > 2:
+            opt, eq, val = a.partition("=")
+            if "--in-place".startswith(opt) and len(opt) >= 4:
+                in_place = True
+            elif "--expression".startswith(opt) and len(opt) >= 4:
+                explicit = True
+                scripts.append(val if eq else (rest.pop(0) if rest else ""))
+            elif "--file".startswith(opt) and len(opt) >= 4:
+                explicit = True
+                sf = val if eq else (rest.pop(0) if rest else "")
+                if sf:
+                    _check_path(ctx, sf, "read")
+                    _project_exec(ctx, f"sed -f {sf}")
+            continue
+        if not end_of_opts and a.startswith("-") and len(a) > 1 and not a.startswith("--"):
+            chars = a[1:]
+            k = 0
+            while k < len(chars):
+                ch = chars[k]
+                if ch == "i":
+                    in_place = True
+                    break  # remaining chars are optional backup suffix
+                if ch == "e":
+                    explicit = True
+                    scripts.append(chars[k + 1:] if k + 1 < len(chars) else (rest.pop(0) if rest else ""))
+                    break
+                if ch == "f":
+                    explicit = True
+                    sf = chars[k + 1:] if k + 1 < len(chars) else (rest.pop(0) if rest else "")
+                    if sf:
+                        _check_path(ctx, sf, "read")
+                        _project_exec(ctx, f"sed -f {sf}")
+                    break
+                k += 1
+            continue
+        if not explicit and not scripts:
             scripts.append(a)
         else:
             files.append(a)
+    # Match sed address + e/W/w (with OR without whitespace before filename/cmd) and s///...e|w[file]
+    sed_addr = r"(?:(?:/(?:\\.|[^/])*/|\d+|\$|[~+,-]|\s)*!?\s*)"
     for s in scripts:
-        if re.search(r"(?:^|[;\n{}])\s*[0-9$,/]*\s*[eWw](?:\s|$)", s) or re.search(r"s(.)(?:(?!\1).)*\1(?:(?!\1).)*\1[gpIiMm0-9]*[ew]", s):
+        m_ew = re.search(rf"(?:^|[;\n{{}}])\s*{sed_addr}([eWw])([^\n;}}]*)", s)
+        m_sub = re.search(r"s(.)(?:(?!\1).)*\1(?:(?!\1).)*\1[gpIiMm0-9]*([ew])([^\n;}]*)", s)
+        if m_ew or m_sub:
             _add(ctx, L.ASK, "sed script executes commands or writes files (owner approval)")
+            for m in (m_ew, m_sub):
+                if m and m.group(1) in ("w", "W"):
+                    target = m.group(2).strip()
+                    if target:
+                        _check_path(ctx, target, "write")
+        for m_r in re.finditer(rf"(?:^|[;\n{{}}])\s*{sed_addr}[rR]\s*([^\n;}}]+)", s):
+            target = m_r.group(1).strip()
+            if target:
+                _check_path(ctx, target, "read")
     for f in files:
         _check_path(ctx, f, "write" if in_place else "read")
 
@@ -2316,13 +2349,19 @@ def _awk(args: List[str], ctx: _Ctx) -> None:
     while rest:
         a = rest.pop(0)
         if a in ("-f", "--file") and rest:
-            _check_path(ctx, rest.pop(0), "read")
+            sf = rest.pop(0)
+            _check_path(ctx, sf, "read")
+            _project_exec(ctx, f"awk -f {sf}")
             program = ""
         elif a.startswith("--file="):
-            _check_path(ctx, a.split("=", 1)[1], "read")
+            sf = a.split("=", 1)[1]
+            _check_path(ctx, sf, "read")
+            _project_exec(ctx, f"awk -f {sf}")
             program = ""
         elif a.startswith("-f") and len(a) > 2 and not a.startswith("--"):
-            _check_path(ctx, a[2:], "read")
+            sf = a[2:]
+            _check_path(ctx, sf, "read")
+            _project_exec(ctx, f"awk -f {sf}")
             program = ""
         elif a in ("-v", "-F", "--assign", "--field-separator") and rest:
             rest.pop(0)
@@ -2504,37 +2543,122 @@ def _chmod(args: List[str], ctx: _Ctx) -> None:
 
 def _tar(args: List[str], ctx: _Ctx) -> None:
     rest = list(args)
-    for a in rest:
-        if a.startswith(("--to-command", "--checkpoint-action", "--use-compress-program", "--rsh-command", "--info-script", "--new-volume-script")) or a in ("-I", "-F"):
-            _add(ctx, L.ASK, f"tar option executes a program: {a}")
+    exec_long = (
+        "--to-command", "--checkpoint-action", "--use-compress-program",
+        "--rsh-command", "--info-script", "--new-volume-script",
+    )
+    # Pre-scan to know whether this tar invocation creates/updates an archive (so -f/--file is checked as "write" regardless of option order).
+    creating = False
+    for idx, a in enumerate(rest):
+        if a == "--":
+            break
+        if a.startswith("--") and len(a) > 2:
+            opt = a.split("=", 1)[0]
+            if any(long_o.startswith(opt) and len(opt) >= 4 for long_o in exec_long):
+                _add(ctx, L.ASK, f"tar option executes a program: {a}")
+                return
+            if any(m.startswith(opt) and len(opt) >= 4 for m in ("--create", "--append", "--update")):
+                creating = True
+        elif a.startswith("-") and not a.startswith("--") and len(a) > 1:
+            for ch in a[1:]:
+                if ch in ("I", "F"):
+                    _add(ctx, L.ASK, f"tar option executes a program: {a}")
+                    return
+                if ch in ("c", "r", "u"):
+                    creating = True
+                if ch in ("f", "C", "T", "X"):
+                    break
+        elif idx == 0 and re.match(r"^[A-Za-z]+$", a) and any(c in a for c in "cxtruf"):
+            if any(c in a for c in "IF"):
+                _add(ctx, L.ASK, f"tar option executes a program: {a}")
+                return
+            if any(c in a for c in "cru"):
+                creating = True
+
+    def _check_tar_archive(val: str) -> None:
+        if not val:
             return
-    skip = False
-    for i, a in enumerate(rest):
-        if skip:
-            skip = False
-            _check_path(ctx, a, "write" if rest[i - 1] in ("-C", "--directory") else "read")
+        if "://" in val or (re.match(r"^[\w.-]+@[\w.-]+:", val) and not looks_windows_path(val)):
+            _add(ctx, L.ASK, f"tar to a remote archive: {val}")
+            return
+        _check_path(ctx, val, "write" if creating else "read")
+
+    end_of_opts = False
+    i = 0
+    n = len(rest)
+    while i < n:
+        a = rest[i]
+        is_first = (i == 0)
+        i += 1
+        if a == "--" and not end_of_opts:
+            end_of_opts = True
             continue
-        if a in ("-C", "--directory", "-f", "--file", "-T", "--files-from", "-X", "--exclude-from"):
-            skip = True
-            continue
-        if a.startswith("--directory=") or a.startswith("--file="):
-            _check_path(ctx, a.split("=", 1)[1], "write")
-            continue
-        if a.startswith(("--files-from=", "--exclude-from=")):
-            _check_path(ctx, a.split("=", 1)[1], "read")
-            continue
-        if a.startswith("-C") and len(a) > 2 and not a.startswith("--"):
-            _check_path(ctx, a[2:], "write")
-            continue
-        if a.startswith("-f") and len(a) > 2 and not a.startswith("--"):
-            _check_path(ctx, a[2:], "write")
-            continue
-        if a.startswith(("-T", "-X")) and len(a) > 2 and not a.startswith("--"):
-            _check_path(ctx, a[2:], "read")
-            continue
-        if _is_option(a) or (i == 0 and re.match(r"^[cxtrufzjJvpPkO]+$", a)):
-            continue
-        if "://" in a or re.match(r"^[\w.-]+@[\w.-]+:", a):
+        if not end_of_opts:
+            if a.startswith("--") and len(a) > 2:
+                opt, eq, val = a.partition("=")
+                if "--directory".startswith(opt) and len(opt) >= 4:
+                    target = val if eq else (rest[i] if i < n else "")
+                    if not eq and i < n:
+                        i += 1
+                    if target:
+                        _check_path(ctx, target, "write")
+                    continue
+                if "--file".startswith(opt) and len(opt) >= 4:
+                    target = val if eq else (rest[i] if i < n else "")
+                    if not eq and i < n:
+                        i += 1
+                    _check_tar_archive(target)
+                    continue
+                if any(o.startswith(opt) and len(opt) >= 4 for o in ("--files-from", "--exclude-from")):
+                    target = val if eq else (rest[i] if i < n else "")
+                    if not eq and i < n:
+                        i += 1
+                    if target:
+                        _check_path(ctx, target, "read")
+                    continue
+                if eq and _looks_like_path_token(val):
+                    _check_path(ctx, val, "write" if creating else "read")
+                continue
+            if a.startswith("-") and not a.startswith("--") and len(a) > 1:
+                chars = a[1:]
+                k = 0
+                while k < len(chars):
+                    ch = chars[k]
+                    if ch == "C":
+                        target = chars[k + 1:] if k + 1 < len(chars) else (rest[i] if i < n else "")
+                        if k + 1 >= len(chars) and i < n:
+                            i += 1
+                        if target:
+                            _check_path(ctx, target, "write")
+                        break
+                    if ch == "f":
+                        target = chars[k + 1:] if k + 1 < len(chars) else (rest[i] if i < n else "")
+                        if k + 1 >= len(chars) and i < n:
+                            i += 1
+                        _check_tar_archive(target)
+                        break
+                    if ch in ("T", "X"):
+                        target = chars[k + 1:] if k + 1 < len(chars) else (rest[i] if i < n else "")
+                        if k + 1 >= len(chars) and i < n:
+                            i += 1
+                        if target:
+                            _check_path(ctx, target, "read")
+                        break
+                    k += 1
+                continue
+            if is_first and re.match(r"^[A-Za-z]+$", a) and any(c in a for c in "cxtruf"):
+                for ch in a:
+                    if ch == "f" and i < n:
+                        _check_tar_archive(rest[i])
+                        i += 1
+                    elif ch == "C" and i < n:
+                        _check_path(ctx, rest[i], "write")
+                        i += 1
+                    elif ch in ("T", "X") and i < n:
+                        _check_path(ctx, rest[i], "read")
+                        i += 1
+                continue
+        if "://" in a or (re.match(r"^[\w.-]+@[\w.-]+:", a) and not looks_windows_path(a)):
             _add(ctx, L.ASK, f"tar to a remote archive: {a}")
             continue
         _check_path(ctx, a, "read")

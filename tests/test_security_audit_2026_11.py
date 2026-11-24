@@ -632,3 +632,119 @@ def test_r5_h3_cmd_set_of_sensitive_env_vars_requires_ask(tmp_path):
     # Harmless cmd set still passes
     v = analyze_command("set FOO=bar", base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol, windows=True)
     assert v.level == L.PASS, (v.level.name, v.reasons)
+
+
+def test_r5_c1_json_tool_stdin_dash_preserves_write_position(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_file = protected / "config.json"
+
+    pol_shared = AegisPolicy(
+        extra_roots=[str(tmp_path)],
+        protected_paths=[str(protected)],
+        project_exec="ask",
+    )
+    # Bare '-' (stdin) must count as positional 0 so arg 2 is checked as write
+    for cmd in (
+        f'python -I -m json.tool - "{cfg_file}"',
+        f'python -I -m json.tool --indent 2 - "{cfg_file}"',
+        f'python -I -m json.tool --ind 2 - "{cfg_file}"',
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared, windows=True)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    for autoexec in (".git\\hooks\\pre-commit", ".envrc", "conftest.py", "sitecustomize.py", ".vscode\\tasks.json"):
+        v = analyze_command(
+            f"python -I -m json.tool - {autoexec}",
+            base_dir=str(ws), cwd=str(ws), policy=AegisPolicy(project_exec="ask"), windows=True,
+        )
+        assert v.level >= L.ASK, (autoexec, v.level.name, v.reasons)
+
+    # Reading from stdin only (no output file) still passes under -I
+    v_ok = analyze_command(
+        "python -I -m json.tool -",
+        base_dir=str(ws), cwd=str(ws), policy=AegisPolicy(project_exec="ask"), windows=True,
+    )
+    assert v_ok.level == L.PASS, (v_ok.level.name, v_ok.reasons)
+
+
+def test_r5_c2_sed_attached_write_and_script_files(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_posix = str(protected / "config.json").replace("\\", "/")
+
+    pol = AegisPolicy(project_exec="ask")
+    for cmd in (
+        "sed -n 'w.git/hooks/pre-commit' in.txt",
+        "sed -n w.git/hooks/pre-commit in.txt",
+        "sed -n '1w.envrc' in.txt",
+        "sed -n '/foo/w.git/hooks/pre-commit' in.txt",
+        "sed 's/a/b/w.git/hooks/pre-commit' in.txt",
+        "sed -ne 'w.git/hooks/pre-commit' in.txt",
+        "sed -ni 's/a/b/' .git/hooks/pre-commit",
+        "sed -f evil.sed in.txt",
+        "sed -nf evil.sed in.txt",
+        "awk -f evil.awk in.txt",
+        "sed 'r/etc/passwd' in.txt",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    pol_shared = AegisPolicy(extra_roots=[str(tmp_path)], protected_paths=[str(protected)])
+    v_lock = analyze_command(f"sed -n 'w{cfg_posix}' in.txt", base_dir=str(ws), cwd=str(ws), policy=pol_shared)
+    assert v_lock.level == L.LOCK, (v_lock.level.name, v_lock.reasons)
+
+    # Benign sed/awk usage still passes
+    for cmd in ("sed -n '1,10p' src/app.py", "sed -i 's/foo/bar/g' src/app.py", "awk '{print $1}' data.txt"):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+
+def test_r5_c2_tar_clustered_create_flags_checked_as_write(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_posix = str(protected / "config.json").replace("\\", "/")
+
+    pol = AegisPolicy(project_exec="ask")
+    for cmd in (
+        "tar -cf .git/hooks/pre-commit in.txt",
+        "tar -cf.git/hooks/pre-commit in.txt",
+        "tar -cvf .envrc in.txt",
+        "tar -cvf.envrc in.txt",
+        "tar cf .git/hooks/pre-commit in.txt",
+        "tar czf .envrc in.txt",
+        "tar -f .git/hooks/pre-commit -c in.txt",
+        "tar --file=.git/hooks/pre-commit --create in.txt",
+        "tar --fil=.envrc -c in.txt",
+        "tar -Ish -cf out.tar in.txt",
+        "tar --to-comm=sh -xf a.tar",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    pol_shared = AegisPolicy(extra_roots=[str(tmp_path)], protected_paths=[str(protected)])
+    for cmd in (
+        f"tar -cf '{cfg_posix}' in.txt",
+        f"tar -cvf'{cfg_posix}' in.txt",
+        f"tar cf '{cfg_posix}' in.txt",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    # Benign tar create/extract inside workspace still passes
+    for cmd in ("tar -xzf archive.tar.gz", "tar czf backup.tgz src/", "tar -cf out.tar in.txt"):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
