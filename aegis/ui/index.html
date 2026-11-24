@@ -335,6 +335,8 @@
       box-shadow: 0 0 14px rgba(168, 85, 247, 0.55);
       transform: translateY(-1px);
     }
+    .help-q-btn:focus { outline: none; }
+    .help-q-btn:focus-visible { box-shadow: 0 0 0 2px rgba(192, 132, 252, 0.75); }
 
     /* Telemetry Pills & KPI Grid */
     .kpi-grid {
@@ -362,10 +364,11 @@
     }
     .hero-split {
       display: grid;
-      grid-template-columns: 1.05fr 1.35fr;
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.35fr);
       gap: 16px;
       margin-bottom: 16px;
     }
+    .hero-split > *, .kpi-grid > * { min-width: 0; }
     @media (max-width: 1020px) {
       .hero-split { grid-template-columns: 1fr; }
     }
@@ -498,17 +501,17 @@
     }
     .iso-canvas {
       position: relative;
-      height: 228px;
+      height: 256px;
       display: flex;
       align-items: center;
       justify-content: center;
     }
     .iso-plane {
       position: absolute;
-      width: 162px;
-      height: 102px;
-      border-radius: 13px;
-      transform: rotateX(56deg) rotateZ(-42deg);
+      width: 152px;
+      height: 86px;
+      border-radius: 12px;
+      transform: rotateX(58deg) rotateZ(-42deg);
       transition: all 200ms ease;
       cursor: pointer;
       display: flex;
@@ -517,15 +520,19 @@
     }
     .iso-plane span {
       transform: rotateZ(42deg);
-      font: 700 9.5px/1 var(--mono);
+      font: 700 9px/1 var(--mono);
       letter-spacing: 0.08em;
       color: #ffffff;
-      text-shadow: 0 2px 10px rgba(0, 0, 0, 0.9);
+      background: rgba(7, 6, 15, 0.72);
+      padding: 4px 7px;
+      border-radius: 5px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      white-space: nowrap;
     }
-    .iso-p1 { top: 8px; z-index: 4; background: linear-gradient(135deg, rgba(168,85,247,0.40), rgba(16,14,34,0.72)); border: 1.5px solid rgba(192,132,252,0.82); box-shadow: 0 10px 28px rgba(168,85,247,0.30); }
-    .iso-p2 { top: 48px; z-index: 3; background: linear-gradient(135deg, rgba(56,189,248,0.36), rgba(16,14,34,0.75)); border: 1.5px solid rgba(56,189,248,0.78); }
-    .iso-p3 { top: 88px; z-index: 2; background: linear-gradient(135deg, rgba(52,211,153,0.32), rgba(16,14,34,0.78)); border: 1.5px solid rgba(52,211,153,0.75); }
-    .iso-p4 { top: 128px; z-index: 1; background: linear-gradient(135deg, rgba(251,146,60,0.30), rgba(16,14,34,0.82)); border: 1.5px solid rgba(251,146,60,0.75); }
+    .iso-p1 { top: 6px; z-index: 4; background: linear-gradient(135deg, rgba(168,85,247,0.42), rgba(16,14,34,0.78)); border: 1.5px solid rgba(192,132,252,0.85); box-shadow: 0 10px 26px rgba(168,85,247,0.28); }
+    .iso-p2 { top: 56px; z-index: 3; background: linear-gradient(135deg, rgba(56,189,248,0.38), rgba(16,14,34,0.80)); border: 1.5px solid rgba(56,189,248,0.82); }
+    .iso-p3 { top: 106px; z-index: 2; background: linear-gradient(135deg, rgba(52,211,153,0.34), rgba(16,14,34,0.82)); border: 1.5px solid rgba(52,211,153,0.78); }
+    .iso-p4 { top: 156px; z-index: 1; background: linear-gradient(135deg, rgba(251,146,60,0.32), rgba(16,14,34,0.85)); border: 1.5px solid rgba(251,146,60,0.78); }
     .iso-plane.highlight {
       filter: brightness(1.25);
       transform: rotateX(56deg) rotateZ(-42deg) translateY(-6px) scale(1.04);
@@ -577,7 +584,7 @@
     /* Storyline Decision Trace Graph */
     .storyline-track {
       display: flex;
-      align-items: center;
+      align-items: stretch;
       gap: 6px;
       padding: 4px 0 2px;
       overflow-x: auto;
@@ -589,7 +596,11 @@
       border-radius: 9px;
       background: rgba(8, 7, 18, 0.9);
       border: 1px solid var(--border-strong);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
     }
+    .st-arrow { color: var(--guard); font: 700 11px/1 var(--mono); flex-shrink: 0; align-self: center; }
     .st-node.PASS { border-color: rgba(52, 211, 153, 0.55); background: rgba(52, 211, 153, 0.08); }
     .st-node.WARN { border-color: rgba(250, 204, 21, 0.55); background: rgba(250, 204, 21, 0.07); }
     .st-node.ASK { border-color: rgba(251, 146, 60, 0.62); background: rgba(251, 146, 60, 0.09); }
@@ -3224,13 +3235,19 @@
       pop.setAttribute("aria-hidden", "false");
       pop.classList.add("visible");
       const stageRect = stage.getBoundingClientRect();
+      const modalEl = document.querySelector("#bpModal .bp-modal");
+      const modalRect = modalEl ? modalEl.getBoundingClientRect() : { bottom: window.innerHeight - 16, top: 16 };
       const btnRect = btnEl.getBoundingClientRect();
       const popW = pop.offsetWidth || 290;
-      const popH = pop.offsetHeight || 120;
+      const popH = pop.offsetHeight || 130;
       let left = (btnRect.left - stageRect.left) + (btnRect.width / 2) - (popW / 2);
       left = Math.max(10, Math.min(left, stageRect.width - popW - 10));
       let top = (btnRect.bottom - stageRect.top) + 8;
-      if (top + popH > stageRect.height - 10) top = Math.max(10, (btnRect.top - stageRect.top) - popH - 8);
+      const wouldClipStage = (top + popH > stageRect.height - 10);
+      const wouldClipViewport = (btnRect.bottom + 8 + popH > Math.min(window.innerHeight, modalRect.bottom) - 12);
+      if (wouldClipStage || wouldClipViewport) {
+        top = Math.max(10, (btnRect.top - stageRect.top) - popH - 8);
+      }
       pop.style.left = left + "px";
       pop.style.top = top + "px";
     }
