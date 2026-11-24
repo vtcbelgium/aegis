@@ -807,3 +807,60 @@ def test_r6_h2_h3_fail_closed_sed_awk_and_tar_allowlists(tmp_path):
         assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
 
 
+def test_r7_env_flags_awk_allowlist_and_tar_oldstyle_and_git_extract(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+
+    # 1. env must preserve inner command flags (never strip -o / -c / -cf / -m)
+    for cmd in (
+        "env sort -o/etc/passwd x",
+        "env python -c 'import os'",
+        "env tar -cf .envrc x",
+        "env -i python -m platform",
+        "env -u PATH sort -o.envrc x",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+    assert analyze_command("env sort -o/etc/passwd x", base_dir=str(ws), cwd=str(ws), policy=pol).level >= L.DENY
+
+    # 2. awk indirect calls, backslash-newline, and -W long options must fail closed
+    for cmd in (
+        'awk \'BEGIN { f="system"; @f("id") }\' data.txt',
+        "awk 'BEGIN { sys\\\ntem(\"id\") }' data.txt",
+        "gawk -W exec=evil.awk data.txt",
+        "gawk -W load=evil data.txt",
+        "gawk -W source='BEGIN{print 1}' data.txt",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # 3. tar old-style first-argument options without cxtruf (A/I/g/P) & extraction into .git
+    for cmd in (
+        "tar A .git/hooks/pre-commit in.tar",
+        "tar I sh -cf out.tar in.txt",
+        "tar g .git/hooks/pre-commit -cf out.tar in.txt",
+        "tar P -xf a.tar",
+        "tar -C .git -xf evil.tar",
+        "tar --directory=.git -xf evil.tar",
+        "tar -C .husky -xf evil.tar",
+        "tar -C .vscode -xf evil.tar",
+        "tar xCf .git evil.tar",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Benign env / awk / tar still pass
+    for cmd in (
+        "env FOO=bar sort -u data.txt",
+        "awk -F, '{print $1, $2}' data.csv",
+        "awk 'NR==1 {print tolower($1)}' data.txt",
+        "tar -xzf archive.tar.gz",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+
+

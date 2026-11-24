@@ -1363,18 +1363,53 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
     if name in WRAPPERS:
         return _wrapper(name, args, seg, ctx)
     if name == "env":
-        for i, a in enumerate(args):
-            if a in ("-S", "--split-string") and i + 1 < len(args):
-                _analyze_nested(" ".join(args[i + 1:]), ctx)
+        idx = 0
+        while idx < len(args):
+            a = args[idx]
+            if a == "--":
+                idx += 1
+                break
+            if a in ("-S", "--split-string") and idx + 1 < len(args):
+                _analyze_nested(" ".join(args[idx + 1:]), ctx)
                 return
             if a.startswith("--split-string="):
-                _analyze_nested(a.split("=", 1)[1] + " " + " ".join(args[i + 1:]), ctx)
+                _analyze_nested(a.split("=", 1)[1] + " " + " ".join(args[idx + 1:]), ctx)
                 return
-        rest = [a for a in args if not a.startswith("-")]
+            if a.startswith("-S") and len(a) > 2 and not a.startswith("--"):
+                _analyze_nested(a[2:] + " " + " ".join(args[idx + 1:]), ctx)
+                return
+            if a in ("-u", "--unset", "-C", "--chdir") and idx + 1 < len(args):
+                if a in ("-C", "--chdir"):
+                    resolved_cd = _check_path(ctx, args[idx + 1], "cd")
+                    if resolved_cd is not None:
+                        ctx.cwd = resolved_cd
+                idx += 2
+                continue
+            if a.startswith("--chdir="):
+                resolved_cd = _check_path(ctx, a.split("=", 1)[1], "cd")
+                if resolved_cd is not None:
+                    ctx.cwd = resolved_cd
+                idx += 1
+                continue
+            if a.startswith("-C") and len(a) > 2 and not a.startswith("--"):
+                resolved_cd = _check_path(ctx, a[2:], "cd")
+                if resolved_cd is not None:
+                    ctx.cwd = resolved_cd
+                idx += 1
+                continue
+            if a.startswith("-"):
+                idx += 1
+                continue
+            break
+        rest = list(args[idx:])
         while rest and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", rest[0]):
-            var = rest[0].split("=", 1)[0]
+            var, _, val = rest[0].partition("=")
+            if boundaries.GUARD_ENV_RE.match(var):
+                raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {var}", boundaries.POLICY_TAMPER)
             if var.upper() in DANGEROUS_ENV_OVERRIDES:
                 _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {var}")
+            if var.upper() == "TAPE" and val:
+                _check_path(ctx, val, "write")
             rest.pop(0)
         if not rest:
             _add(ctx, L.ASK, "Unrestricted environment variable dump (env)")
@@ -2468,6 +2503,39 @@ def _sed(args: List[str], ctx: _Ctx) -> None:
         _check_path(ctx, f, file_mode)
 
 
+_SAFE_AWK_BUILTINS = frozenset({
+    "length", "substr", "index", "split", "sub", "gsub", "match",
+    "tolower", "toupper", "sprintf", "int", "sqrt", "exp", "log",
+    "sin", "cos", "atan2", "rand", "srand", "strftime", "systime",
+})
+
+
+def _awk_program_is_pure(program: str) -> bool:
+    """Strict read-only allowlist for inline awk programs.
+
+    Fails closed (returns False -> _inline_code) on redirections/pipes (>, |, <),
+    indirect calls/directives (@), backslash continuations/escapes outside quotes,
+    command execution (system/getline/close/fflush), or non-allowlisted function calls.
+    """
+    if not program or not program.strip():
+        return True
+    # Any '@', '>', '|', or backslash-newline line continuation fails closed immediately
+    if "@" in program or ">" in program or "|" in program or "\\\n" in program or "\\\r\n" in program:
+        return False
+    # Strip quoted string literals and regex literals to inspect identifiers/calls cleanly
+    cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', program)
+    if "\\" in cleaned:
+        return False
+    if re.search(r"\b(system|getline|close|fflush|nextfile|function|func)\b", cleaned):
+        return False
+    # Every function call `ident(` must be a pure safe builtin (or `printf(` / `print(` / control keywords)
+    allowed_calls = _SAFE_AWK_BUILTINS | {"if", "while", "for", "print", "printf", "delete"}
+    for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", cleaned):
+        if m.group(1) not in allowed_calls:
+            return False
+    return True
+
+
 def _awk(args: List[str], ctx: _Ctx) -> None:
     rest = list(args)
     program = None
@@ -2525,7 +2593,7 @@ def _awk(args: List[str], ctx: _Ctx) -> None:
                     if k + 1 >= len(chars) and rest:
                         rest.pop(0)
                     break
-                if ch in ("S", "P", "W"):
+                if ch in ("S", "P"):
                     k += 1
                     continue
                 mutating = True
@@ -2536,7 +2604,7 @@ def _awk(args: List[str], ctx: _Ctx) -> None:
             program = a
         else:
             files.append(a)
-    if program and re.search(r"system\s*\(|\bgetline\b|@load\b|@include\b|[>|]", program):
+    if program and not _awk_program_is_pure(program):
         _inline_code(ctx, "awk", program)
         mutating = True
     for f in files:
@@ -2733,7 +2801,9 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
     safe_long_val_nonpath = ("--exclude", "--strip-components")
 
     creating = False
+    extracting = False
     unknown_mode = False
+    first_is_oldstyle = bool(rest) and not rest[0].startswith("-")
     for idx, a in enumerate(rest):
         if a == "--":
             break
@@ -2741,6 +2811,8 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
             opt = a.split("=", 1)[0]
             if "--create".startswith(opt) and len(opt) >= 3:
                 creating = True
+            elif any(o.startswith(opt) and len(opt) >= 3 for o in ("--extract", "--get")):
+                extracting = True
             elif any(o.startswith(opt) and len(opt) >= 3 for o in (
                 "--append", "--update", "--catenate", "--concatenate", "--delete",
                 "--listed-incremental", "--index-file", "--transform", "--xform",
@@ -2760,20 +2832,41 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
             for ch in a[1:]:
                 if ch == "c":
                     creating = True
+                elif ch == "x":
+                    extracting = True
                 if ch in safe_val_short:
                     break
                 if ch not in safe_bool_short:
                     unknown_mode = True
                     _add(ctx, L.ASK, f"tar uses advanced/unallowlisted flag '-{ch}' in '{a}' (owner approval)")
                     break
-        elif idx == 0 and re.match(r"^[A-Za-z]+$", a) and any(c in a for c in "cxtruf"):
+        elif idx == 0 and first_is_oldstyle:
+            # GNU/POSIX tar always treats a non-dash first argument as old-style option letters
             for ch in a:
                 if ch == "c":
                     creating = True
+                elif ch == "x":
+                    extracting = True
                 if ch not in safe_bool_short and ch not in safe_val_short:
                     unknown_mode = True
-                    _add(ctx, L.ASK, f"tar uses advanced/unallowlisted flag '{ch}' in '{a}' (owner approval)")
+                    _add(ctx, L.ASK, f"tar uses advanced/unallowlisted old-style flag '{ch}' in '{a}' (owner approval)")
                     break
+
+    _SENSITIVE_EXTRACT_DIRS = {".git", ".husky", ".vscode", ".github"}
+
+    def _check_tar_dir(target: str) -> None:
+        if not target:
+            return
+        resolved = _check_path(ctx, target, "write")
+        if extracting or unknown_mode:
+            parts = [p.rstrip(". ").lower() for p in (resolved or target).replace("\\", "/").split("/") if p]
+            if any(p in _SENSITIVE_EXTRACT_DIRS for p in parts):
+                _add(ctx, L.ASK, f"tar extracts into sensitive control directory '{target}' (owner approval)")
+
+    if extracting and ctx.cwd:
+        cwd_parts = [p.rstrip(". ").lower() for p in ctx.cwd.replace("\\", "/").split("/") if p]
+        if any(p in _SENSITIVE_EXTRACT_DIRS for p in cwd_parts):
+            _add(ctx, L.ASK, f"tar extracts inside sensitive control directory '{ctx.cwd}' (owner approval)")
 
     def _check_tar_archive(val: str) -> None:
         if not val:
@@ -2800,8 +2893,7 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
                     target = val if eq else (rest[i] if i < n else "")
                     if not eq and i < n:
                         i += 1
-                    if target:
-                        _check_path(ctx, target, "write")
+                    _check_tar_dir(target)
                     continue
                 if "--file".startswith(opt) and len(opt) >= 3:
                     target = val if eq else (rest[i] if i < n else "")
@@ -2832,8 +2924,7 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
                         target = chars[k + 1:] if k + 1 < len(chars) else (rest[i] if i < n else "")
                         if k + 1 >= len(chars) and i < n:
                             i += 1
-                        if target:
-                            _check_path(ctx, target, "write")
+                        _check_tar_dir(target)
                         break
                     if ch == "f":
                         target = chars[k + 1:] if k + 1 < len(chars) else (rest[i] if i < n else "")
@@ -2855,14 +2946,14 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
                         break
                     k += 1
                 continue
-            if is_first and re.match(r"^[A-Za-z]+$", a) and any(c in a for c in "cxtruf"):
+            if is_first and first_is_oldstyle:
                 if not unknown_mode:
                     for ch in a:
                         if ch == "f" and i < n:
                             _check_tar_archive(rest[i])
                             i += 1
                         elif ch == "C" and i < n:
-                            _check_path(ctx, rest[i], "write")
+                            _check_tar_dir(rest[i])
                             i += 1
                         elif ch in ("T", "X") and i < n:
                             _check_path(ctx, rest[i], "read")
