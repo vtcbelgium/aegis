@@ -981,6 +981,28 @@ def test_r9_brace_expansion_unzip_7z_and_symlink_globs(tmp_path):
         assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
 
 
+def test_r10_nested_posix_bash_under_windows_shell_expands_braces(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+
+    # Under Windows/PowerShell default shell (windows=True), nested bash/sh -c must still
+    # check brace expansion on paths (both comma and range forms).
+    for cmd in (
+        "bash -c 'echo x > {.git/config,}'",
+        "sh -c 'cp x {.git/hooks/pre-commit,}'",
+        "bash -c 'echo x > .gi{s..u}/config'",
+        "bash -lc 'tee {.vscode/tasks.json,} < x'",
+        "bash.exe -c 'echo x > {.git/config,}'",
+        'cmd /c bash -c "echo x > {.git/config,}"',
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol, windows=True)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+
+
 
 
 

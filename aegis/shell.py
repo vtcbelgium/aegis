@@ -1064,7 +1064,7 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             _add(ctx, L.ASK, f"Path built from a command substitution: {raw}")
             return None
         word = safe
-    if not ctx.force_windows and "{" in word and "}" in word and re.search(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", word):
+    if "{" in word and "}" in word and re.search(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", word):
         candidates = _expand_brace_candidates(word)
         if candidates is None:
             _add(ctx, L.ASK, f"Path uses complex shell brace expansion: {raw}")
@@ -1920,7 +1920,12 @@ def _shell(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
         script_file = a
         break
     if script_text is not None:
-        _analyze_nested(script_text, ctx)
+        prev_win = ctx.force_windows
+        ctx.force_windows = False
+        try:
+            _analyze_nested(script_text, ctx)
+        finally:
+            ctx.force_windows = prev_win
         return
     if script_file is not None and script_file not in STDIN_PATHS:
         if _check_path(ctx, script_file, "exec") is not None:
@@ -1931,7 +1936,12 @@ def _shell(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
         _add(ctx, L.DENY, f"Untrusted pipeline executed directly by the {name} shell")
         return
     if seg.heredoc is not None or seg.herestring is not None:
-        _analyze_nested(seg.heredoc if seg.heredoc is not None else seg.herestring, ctx)
+        prev_win = ctx.force_windows
+        ctx.force_windows = False
+        try:
+            _analyze_nested(seg.heredoc if seg.heredoc is not None else seg.herestring, ctx)
+        finally:
+            ctx.force_windows = prev_win
         return
     _add(ctx, L.ASK, f"Spawning bare interactive shell session requires owner approval: {name}")
 
