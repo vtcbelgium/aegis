@@ -110,7 +110,11 @@ def _resolve_json_targets(data: Any, field_path: str, *, filter_field: Optional[
     return cur
 
 
-def verify_production_path(probes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def verify_production_path(
+    probes: Sequence[Dict[str, Any]],
+    *,
+    signing_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """Deterministically evaluate active runtime/deployment probes (tri-state: PASS | FAIL | UNKNOWN).
 
     Enforces strict R0 semantics:
@@ -297,9 +301,13 @@ def verify_production_path(probes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "requiredCount": len(required_results),
         "probes": results,
     }
-    report["digest"] = hashlib.sha256(
-        json.dumps(report, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    ).hexdigest()
+    if signing_key:
+        report["digestAlg"] = "hmac-sha256"
+        payload = json.dumps(report, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        report["digest"] = hmac.new(signing_key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    else:
+        payload = json.dumps(report, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        report["digest"] = hashlib.sha256(payload).hexdigest()
     return report
 
 
@@ -313,6 +321,7 @@ def verify_reply(
     ledger_tip: Optional[str] = None,
     allow_git_subprocess: bool = True,
     production_path: Optional[Dict[str, Any]] = None,
+    production_path_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Cross-examine a draft agent reply against recorded PostToolUse telemetry and live disk/git state."""
     workspace = os.path.abspath(cwd or os.getcwd())
@@ -498,18 +507,45 @@ def verify_reply(
             p_status = str(prod_report.get("status") or "UNKNOWN").upper()
             probes = prod_report.get("probes") if isinstance(prod_report.get("probes"), list) else []
             req_probes = [p for p in probes if isinstance(p, dict) and p.get("required", True)]
-            req_count = int(prod_report.get("requiredCount")) if prod_report.get("requiredCount") is not None else len(req_probes)
-            digest_ok = True
-            if prod_report.get("schema") == "aegis.production-path.v1":
-                claimed_digest = str(prod_report.get("digest") or "")
-                body_no_digest = {k: v for k, v in prod_report.items() if k != "digest"}
-                expected_digest = hashlib.sha256(
-                    json.dumps(body_no_digest, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-                ).hexdigest()
+            raw_req_count = prod_report.get("requiredCount")
+            req_count_valid = True
+            if raw_req_count is None:
+                req_count = len(req_probes)
+            elif isinstance(raw_req_count, bool):
+                req_count = -1
+                req_count_valid = False
+            else:
+                try:
+                    req_count = int(raw_req_count)
+                except (TypeError, ValueError):
+                    req_count = -1
+                    req_count_valid = False
+            if req_count != len(req_probes):
+                req_count_valid = False
+
+            claimed_digest = str(prod_report.get("digest") or "")
+            digest_alg = str(prod_report.get("digestAlg") or "").lower()
+            body_no_digest = {k: v for k, v in prod_report.items() if k != "digest"}
+            payload = json.dumps(body_no_digest, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            if production_path_key or digest_alg == "hmac-sha256":
+                if not production_path_key or digest_alg != "hmac-sha256" or not claimed_digest:
+                    digest_ok = False
+                else:
+                    expected_digest = hmac.new(
+                        production_path_key.encode("utf-8"), payload, hashlib.sha256
+                    ).hexdigest()
+                    digest_ok = hmac.compare_digest(
+                        expected_digest.encode("utf-8"), claimed_digest.encode("utf-8")
+                    )
+            else:
+                expected_digest = hashlib.sha256(payload).hexdigest()
                 digest_ok = bool(claimed_digest) and hmac.compare_digest(
-                    expected_digest.encode("utf-8"),
-                    claimed_digest.encode("utf-8"),
+                    expected_digest.encode("utf-8"), claimed_digest.encode("utf-8")
                 )
+
+            all_req_passed = bool(req_probes) and all(
+                isinstance(p, dict) and p.get("status") == "PASS" for p in req_probes
+            )
             if p_status == "FAIL":
                 failed_ids = [p["id"] for p in probes if isinstance(p, dict) and p.get("status") == "FAIL"]
                 findings.append({
@@ -522,19 +558,17 @@ def verify_reply(
                         f"but production-path verification FAILED on probe(s): {', '.join(failed_ids) or 'unknown'}."
                     ),
                 })
-            elif p_status != "PASS" or not digest_ok or req_count < 1 or not any(
-                isinstance(p, dict) and p.get("status") == "PASS" for p in req_probes
-            ):
+            elif p_status != "PASS" or not digest_ok or not req_count_valid or req_count < 1 or not all_req_passed:
                 unk_ids = [p["id"] for p in probes if isinstance(p, dict) and p.get("status") == "UNKNOWN"]
                 reason_bits = []
                 if not digest_ok:
-                    reason_bits.append("invalid report digest")
-                if req_count < 1:
-                    reason_bits.append("requiredCount < 1")
+                    reason_bits.append("invalid or missing report digest")
+                if not req_count_valid or req_count < 1:
+                    reason_bits.append("invalid requiredCount")
                 if p_status != "PASS":
                     reason_bits.append(f"status={p_status}")
-                elif not any(isinstance(p, dict) and p.get("status") == "PASS" for p in req_probes):
-                    reason_bits.append("no passing required probes")
+                elif not all_req_passed:
+                    reason_bits.append("not all required probes passed")
                 findings.append({
                     "class": "D11",
                     "code": "INCOMPLETE_DEPLOYMENT_VERIFICATION",

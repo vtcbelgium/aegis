@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aegis-gate"
-version = "2.0.2"
+version = "2.0.3"
 description = "Deterministic Monotonic Negative Security Gate & Agentic Firewall for AI Agents."
 readme = "README.md"
 requires-python = ">=3.9"

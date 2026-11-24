@@ -153,9 +153,9 @@ CMD_BUILTINS = {"dir", "type", "copy", "move", "del", "erase", "rd", "rmdir", "m
                 "mklink", "start", "call", "ver", "set"}
 
 SAFE_PY_MODULES = {"pip", "venv", "virtualenv", "pytest", "unittest", "doctest", "json.tool",
-                   "py_compile", "compileall", "timeit", "cprofile", "profile", "ensurepip",
-                   "build", "mypy", "black", "ruff", "flake8", "pylint", "isort", "coverage",
-                   "tox", "nox", "pydoc", "site", "sysconfig", "platform", "this", "pyflakes"}
+                   "py_compile", "compileall", "ensurepip",
+                   "mypy", "black", "ruff", "flake8", "pylint", "isort", "coverage",
+                   "tox", "nox", "site", "sysconfig", "platform", "this", "pyflakes"}
 
 SAFE_PS_MEMBERS = frozenset({
     "tostring", "touniversaltime", "tolocaltime", "toshortdatestring", "tolongdatestring",
@@ -1774,6 +1774,8 @@ def _interpreter(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
         if sub in ("x", "install", "add", "upgrade", "compile", "jupyter", "publish"):
             if sub in ("x", "publish"):
                 _add(ctx, L.ASK, f"{name} {sub} downloads/publishes code (owner approval)")
+            else:
+                _project_exec(ctx, f"{name} {sub}")
             return
         if sub in ("run", "test", "bench", "check", "fmt", "lint", "task", "build"):
             for a in rest[1:]:
@@ -1846,6 +1848,7 @@ def _python_module(mod: str, rest: List[str], ctx: _Ctx) -> None:
 
 def _pip(args: List[str], ctx: _Ctx) -> None:
     rest = list(args)
+    sub = next((x.lower() for x in args if not x.startswith("-")), "")
     url_opts = {"-i", "--index-url", "--extra-index-url", "-f", "--find-links"}
     path_opts = {"-r", "--requirement", "-c", "--constraint", "-e", "--editable", "-t", "--target"}
     while rest:
@@ -1865,6 +1868,8 @@ def _pip(args: List[str], ctx: _Ctx) -> None:
             _check_url(ctx, a.split("+", 1)[-1] if a.startswith(("git+", "hg+", "svn+")) else a)
         elif not a.startswith("-") and ("/" in a or a.startswith((".", "~"))):
             _check_path(ctx, a, "read")
+    if sub in ("install", "wheel", "download", "build"):
+        _project_exec(ctx, f"pip {sub}")
 
 
 def _project_tool(name: str, args: List[str], ctx: _Ctx) -> None:

@@ -332,3 +332,61 @@ def test_r2_l3_reset_session_backoff_never_overflows_after_1500_failures(tmp_pat
     assert gate._reset_locked_until > 0.0
 
 
+# ---------------------------------------------------------------------------
+# Round-3 Audit Fixes: H1 residual bypasses & M2 unconditional/keyed digest
+# ---------------------------------------------------------------------------
+
+def test_r3_h1_python_modules_and_package_installs_require_ask_under_project_exec_ask(tmp_path):
+    from aegis.clans.tartarus import TartarusClan
+    from aegis.policy import AegisPolicy
+
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+    for cmd in (
+        "python -m cProfile evil.py",
+        "python -m profile evil.py",
+        'python -m timeit "__import__(\'os\').system(\'id\')"',
+        "python -m pydoc mod",
+        "python -m build",
+        "pip install -e .",
+        "python -m pip install .",
+        "uv pip install .",
+        "bun install",
+        "bun add lodash",
+        "deno install",
+        "deno compile app.ts",
+    ):
+        v = TartarusClan.inspect_command(cmd, base_dir=str(tmp_path), policy=pol)
+        assert v.level in (L.ASK, L.DENY, L.LOCK), f"Expected ASK/DENY/LOCK for {cmd!r}, got {v}"
+
+
+def test_r3_m2_verify_reply_rejects_schemaless_forged_report_nonnumeric_count_and_hmac_downgrade(tmp_path):
+    import json
+    from aegis.detective.verifier import verify_production_path, verify_reply
+
+    # 1. Forged report omitting schema & digest must fail closed
+    schemaless = {"status": "PASS", "probes": [{"id": "p1", "required": True, "status": "PASS"}]}
+    r1 = verify_reply("Deployed live.", cwd=str(tmp_path), mode="strict", allow_git_subprocess=False, production_path=schemaless)
+    assert r1["decision"] == "block"
+
+    # 2. Non-numeric requiredCount must fail closed without raising
+    bad_count = {"status": "PASS", "requiredCount": "not-a-number", "probes": [{"id": "p1", "required": True, "status": "PASS"}]}
+    r2 = verify_reply("Deployed live.", cwd=str(tmp_path), mode="strict", allow_git_subprocess=False, production_path=bad_count)
+    assert r2["decision"] == "block"
+
+    # 3. Keyed HMAC production-path report passes with matching key and fails closed without/wrong key
+    cfg = tmp_path / "crews.json"
+    cfg.write_text(json.dumps({"crews": [{"id": "othrys", "enabled": True, "engine": "custom"}]}), encoding="utf-8")
+    keyed = verify_production_path(
+        [{"id": "rt", "kind": "json_field", "path": str(cfg), "fieldPath": "crews.*.engine", "expected": "custom", "filterField": "enabled", "filterValue": True}],
+        signing_key="d11-hmac-secret",
+    )
+    assert keyed["digestAlg"] == "hmac-sha256"
+    ok = verify_reply("Deployed live.", cwd=str(tmp_path), mode="strict", allow_git_subprocess=False, production_path=keyed, production_path_key="d11-hmac-secret")
+    assert ok["decision"] == "allow"
+    no_key = verify_reply("Deployed live.", cwd=str(tmp_path), mode="strict", allow_git_subprocess=False, production_path=keyed)
+    assert no_key["decision"] == "block"
+    wrong_key = verify_reply("Deployed live.", cwd=str(tmp_path), mode="strict", allow_git_subprocess=False, production_path=keyed, production_path_key="wrong")
+    assert wrong_key["decision"] == "block"
+
+
+
