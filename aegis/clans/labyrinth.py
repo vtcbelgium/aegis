@@ -11,12 +11,35 @@ Invariants:
 
 from __future__ import annotations
 
+import re
 from typing import Iterable, List, Optional
 
 from .. import boundaries
 from ..core import DecisionLevel, Verdict
 from ..canonicalizer import detect_null_bytes, is_inside, normalize_text, resolve_path, unquote_recursively
 from ..policy import SENSITIVE_PATH_PATTERNS, classify_sensitive  # noqa: F401  (re-exported)
+
+_WIN_DRIVE_RELATIVE_RE = re.compile(r"^[A-Za-z]:(?![\\/]|$)")
+_WIN_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:$")
+_ISO_TIME_RE = re.compile(r"\d{2}:\d{2}")
+
+
+def _has_windows_ads(path: str) -> bool:
+    """True when any path component carries a Windows NTFS Alternate Data Stream (:stream)."""
+    if not path or "://" in path:
+        return False
+    norm = path.replace("\\", "/")
+    if norm.startswith(("//?/", "//./")):
+        norm = norm[4:]
+    parts = norm.split("/")
+    for idx, part in enumerate(parts):
+        if not part:
+            continue
+        if idx == 0 and _WIN_DRIVE_PREFIX_RE.match(part):
+            continue
+        if ":" in part and not _ISO_TIME_RE.search(part):
+            return True
+    return False
 
 
 class LabyrinthClan:
@@ -50,8 +73,10 @@ class LabyrinthClan:
         normalized = normalize_text(path_input)
         lower = normalized.lower()
 
-        # 2. Windows Alternate Data Streams / trailing-dot tricks
-        if "::$data" in lower or path_input.endswith("....") or path_input.endswith("   "):
+        # 2. Windows drive-relative paths (C:foo), Alternate Data Streams (:stream), trailing-dot tricks
+        if _WIN_DRIVE_RELATIVE_RE.match(normalized):
+            return Verdict(DecisionLevel.DENY, ["Windows drive-relative path (e.g. C:foo) is ambiguous and refused"], cls.NAME)
+        if "::$data" in lower or _has_windows_ads(normalized) or path_input.endswith("....") or path_input.endswith("   "):
             return Verdict(DecisionLevel.DENY, ["Windows Alternate Data Stream or trailing normalization bypass detected"], cls.NAME)
 
         # 3. Resolve exactly once with the shared normalizer

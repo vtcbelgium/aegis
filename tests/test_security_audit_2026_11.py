@@ -165,3 +165,99 @@ def test_a7_control_center_refuses_foreign_host_header(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# A-8  Owner reset rate limiting / lockout against brute-force
+# ---------------------------------------------------------------------------
+
+def test_a8_reset_session_locks_out_after_repeated_failures(tmp_path):
+    from aegis.core import AegisGate
+
+    gate = AegisGate(base_dir=str(tmp_path), owner_secret="weak-pin-1234")
+    gate.escalate(L.LOCK)
+
+    for i in range(AegisGate.RESET_MAX_ATTEMPTS):
+        assert gate.reset_session(f"wrong-{i}") is False
+
+    # Even the valid secret is rejected while the backoff window is active.
+    assert gate.reset_session("weak-pin-1234") is False
+    assert gate.current_level == L.LOCK
+
+
+def test_a8_reset_session_succeeds_before_lockout_and_clears_failures(tmp_path):
+    from aegis.core import AegisGate
+
+    gate = AegisGate(base_dir=str(tmp_path), owner_secret="good-secret")
+    gate.escalate(L.LOCK)
+    assert gate.reset_session("wrong-1") is False
+    assert gate.reset_session("wrong-2") is False
+    assert gate.reset_session("good-secret") is True
+    assert gate.current_level == L.PASS
+
+
+# ---------------------------------------------------------------------------
+# A-9  Windows ADS (.env:stream) and drive-relative paths (C:foo)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("spelling, expected", [
+    ("/work/.env:stream", "secret"),
+    ("C:/work/.env:Zone.Identifier", "secret"),
+    ("C:/work/conftest.py:hidden", "autoexec"),
+    ("C:/Users/u/.ssh/id_rsa:alt", "critical"),
+])
+def test_a9_classify_sensitive_sees_windows_ads(spelling, expected):
+    assert classify_sensitive(spelling) == expected
+
+
+@pytest.mark.parametrize("target", [
+    ".env:hidden",
+    "C:/work/.env:Zone.Identifier",
+    "notes.txt:payload",
+    "C:foo.txt",
+    "C:.env",
+])
+def test_a9_labyrinth_denies_ads_and_drive_relative_paths(tmp_path, target):
+    v = LabyrinthClan.inspect_path(target, base_dir=str(tmp_path), mode="write")
+    assert v.level >= L.DENY, (target, v.level.name, v.reasons)
+
+
+def test_a9_labyrinth_allows_normal_workspace_and_timestamp_filenames(tmp_path):
+    v = LabyrinthClan.inspect_path("notes.txt", base_dir=str(tmp_path), mode="write")
+    assert v.level == L.PASS
+
+
+# ---------------------------------------------------------------------------
+# A-10  Keyed HMAC-SHA256 ledger prevents local rewrite without key
+# ---------------------------------------------------------------------------
+
+def test_a10_keyed_ledger_detects_forged_unkeyed_rewrite(tmp_path):
+    import json
+    from aegis.core import Verdict
+    from aegis.ledger import DecisionLedger, body_digest, verify
+
+    path = str(tmp_path / "ledger.jsonl")
+    ledger = DecisionLedger(path, signing_key="super-secret-hmac-key")
+    ev = ledger.record(Verdict(L.WARN, ["test warning"], "Test"), tool="read_file", arguments={"path": "a.txt"})
+    assert ev["digestAlg"] == "hmac-sha256"
+
+    # Valid verification with the right key
+    res = verify(path, signing_key="super-secret-hmac-key")
+    assert res.ok and res.count == 1
+
+    # Fail-closed without key or with wrong key
+    assert not verify(path).ok
+    assert not verify(path, signing_key="wrong-key").ok
+
+    # Attacker with write access rewrites entry with plain sha256 (downgrade attempt)
+    raw = json.loads((tmp_path / "ledger.jsonl").read_text(encoding="utf-8").strip())
+    raw["reasons"] = ["harmless"]
+    raw.pop("digestAlg", None)
+    raw.pop("eventDigest", None)
+    raw["eventDigest"] = body_digest(raw)
+    (tmp_path / "ledger.jsonl").write_text(json.dumps(raw) + "\n", encoding="utf-8")
+
+    # Keyed verification MUST reject the downgraded unkeyed chain
+    res_forged = verify(path, signing_key="super-secret-hmac-key")
+    assert not res_forged.ok
+
