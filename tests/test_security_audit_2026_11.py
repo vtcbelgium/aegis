@@ -863,4 +863,75 @@ def test_r7_env_flags_awk_allowlist_and_tar_oldstyle_and_git_extract(tmp_path):
         assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
 
 
+def test_r8_env_clusters_git_env_awk_argv_and_tar_globs(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+
+    # 1 & 3. env clustered/abbreviated -S and -C
+    for cmd in (
+        "env -vS'sh -c \"cat /etc/passwd\"' true",
+        "env -iS'python -c \"import os\"' true",
+        "env --sp='sh -c \"cat /etc/passwd\"' true",
+        "env -iC/etc pwd",
+        "env -vC/c/Windows pwd",
+        "env --ch=/etc pwd",
+        "env --ch=.git sort -o config x",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # 2 & 5. GIT_CONFIG_* and other exec-triggering env vars (with or without env)
+    for cmd in (
+        "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0='id' git status",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0='id' git status",
+        "LESSOPEN='|id' less README.md",
+        "GIT_EXTERNAL_DIFF=./evil git diff",
+        "GIT_PAGER=./evil git log",
+        "PAGER=./evil man ls",
+        "GIT_DIR=/tmp/x git status",
+        "PYTHONHOME=/tmp/x python -I -m platform",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # 4 & 6. awk ARGV/ARGC file reads and ENVIRON dumps
+    for cmd in (
+        'awk \'BEGIN{ARGV[1]=ENVIRON["HOME"] "/.ssh/id_rsa";ARGC=2}{print}\'',
+        'awk \'BEGIN{ARGV[1]="/etc/passwd";ARGC=2}{print}\'',
+        'awk \'BEGIN{for(k in ENVIRON) print k"="ENVIRON[k]}\'',
+        'awk \'BEGIN{print ENVIRON["AWS_SECRET_ACCESS_KEY"]}\'',
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # 7, 8, 9. tar/cd globs, sensitive members, --strip-components, ln -s .git, .devcontainer/.idea
+    for cmd in (
+        "tar -C .gi? -xf a.tar",
+        "tar -C .g* -xf a.tar",
+        "cd .gi? && tar xf ../a.tar",
+        "cd .g* && ls",
+        "tar -xf a.tar .git/hooks/pre-commit",
+        "tar --strip-components=1 -xf a.tar",
+        "ln -s .git g && tar xf a.tar",
+        "tar -C .devcontainer -xf a.tar",
+        "tar -C .idea -xf a.tar",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Benign env/cd/tar/awk still pass
+    for cmd in (
+        "env NODE_ENV=production sort -u data.txt",
+        "export NODE_ENV=production",
+        "cd src && ls",
+        "tar -xzf archive.tar.gz",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+
+
 

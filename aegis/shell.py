@@ -249,10 +249,47 @@ SAFE_PS_STATIC_ROOTS = frozenset({
 })
 
 DANGEROUS_ENV_OVERRIDES = {"PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-                           "DYLD_LIBRARY_PATH", "PYTHONPATH", "PYTHONSTARTUP", "NODE_OPTIONS",
+                           "DYLD_LIBRARY_PATH", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+                           "PYTHONUSERBASE", "PYTHONINSPECT", "PYTHONBREAKPOINT", "PYTHONEXECUTABLE",
+                           "PYTHONPLATLIBDIR", "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS",
                            "BASH_ENV", "ENV", "PROMPT_COMMAND", "GIT_SSH_COMMAND", "GIT_SSH",
-                           "GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL", "PERL5OPT", "RUBYOPT",
-                           "TAPE", "TAR_OPTIONS", "AWKPATH", "AWKLIBPATH"}
+                           "GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+                           "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_EXTERNAL_DIFF",
+                           "GIT_PAGER", "GIT_DIR", "GIT_WORK_TREE", "GIT_EDITOR", "GIT_ASKPASS",
+                           "GIT_TEMPLATE_DIR", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB",
+                           "TAPE", "TAR_OPTIONS", "AWKPATH", "AWKLIBPATH",
+                           "LESSOPEN", "LESSCLOSE", "PAGER", "MANPAGER", "EDITOR", "VISUAL",
+                           "BROWSER", "SHELL", "COMSPEC", "IFS", "CDPATH", "GLOBIGNORE",
+                           "GCONV_PATH", "LOCPATH", "ZDOTDIR", "HOME", "USERPROFILE",
+                           "XDG_CONFIG_HOME"}
+
+_BENIGN_GIT_ENV_VARS = frozenset({
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+    "GIT_TERMINAL_PROMPT",
+})
+
+_SENSITIVE_CONTROL_DIRS = frozenset({".git", ".husky", ".vscode", ".github", ".devcontainer", ".idea"})
+
+
+def _is_dangerous_env_var(name: str) -> bool:
+    up = (name or "").strip().upper()
+    if not up:
+        return False
+    if up in DANGEROUS_ENV_OVERRIDES:
+        return True
+    if up.startswith(("LD_", "DYLD_")):
+        return True
+    if up.startswith("GIT_") and up not in _BENIGN_GIT_ENV_VARS:
+        return True
+    return False
+
+
+def _touches_sensitive_control_dir(path_str: str) -> bool:
+    if not path_str:
+        return False
+    parts = [p.rstrip(". ").lower() for p in path_str.replace("\\", "/").split("/") if p]
+    return any(p in _SENSITIVE_CONTROL_DIRS for p in parts)
 SECRET_VAR_RE = re.compile(
     r"(?:\$\{?|\$env:|%)([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|AUTH)[A-Za-z0-9_]*)",
     re.IGNORECASE,
@@ -1223,7 +1260,7 @@ def _analyze_segment(seg: Segment, ctx: _Ctx) -> None:
             words.pop(0)
             if boundaries.GUARD_ENV_RE.match(name):
                 raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
-            if name.upper() in DANGEROUS_ENV_OVERRIDES:
+            if _is_dangerous_env_var(name):
                 _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
             if value:
                 words.insert(0, value)
@@ -1241,7 +1278,7 @@ def _analyze_segment(seg: Segment, ctx: _Ctx) -> None:
             words.pop(0)
             if boundaries.GUARD_ENV_RE.match(name):
                 raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
-            if name.upper() in DANGEROUS_ENV_OVERRIDES:
+            if _is_dangerous_env_var(name):
                 _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
             if not words:
                 assignments.append((name, ""))
@@ -1255,7 +1292,7 @@ def _analyze_segment(seg: Segment, ctx: _Ctx) -> None:
             name, _, value = words.pop(0).partition("=")
             if boundaries.GUARD_ENV_RE.match(name):
                 raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {name}", boundaries.POLICY_TAMPER)
-            if name.upper() in DANGEROUS_ENV_OVERRIDES:
+            if _is_dangerous_env_var(name):
                 _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {name}")
             assignments.append((name, value))
             continue
@@ -1364,41 +1401,72 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
         return _wrapper(name, args, seg, ctx)
     if name == "env":
         idx = 0
-        while idx < len(args):
+        n_args = len(args)
+        while idx < n_args:
             a = args[idx]
             if a == "--":
                 idx += 1
                 break
-            if a in ("-S", "--split-string") and idx + 1 < len(args):
-                _analyze_nested(" ".join(args[idx + 1:]), ctx)
-                return
-            if a.startswith("--split-string="):
-                _analyze_nested(a.split("=", 1)[1] + " " + " ".join(args[idx + 1:]), ctx)
-                return
-            if a.startswith("-S") and len(a) > 2 and not a.startswith("--"):
-                _analyze_nested(a[2:] + " " + " ".join(args[idx + 1:]), ctx)
-                return
-            if a in ("-u", "--unset", "-C", "--chdir") and idx + 1 < len(args):
-                if a in ("-C", "--chdir"):
-                    resolved_cd = _check_path(ctx, args[idx + 1], "cd")
-                    if resolved_cd is not None:
-                        ctx.cwd = resolved_cd
-                idx += 2
-                continue
-            if a.startswith("--chdir="):
-                resolved_cd = _check_path(ctx, a.split("=", 1)[1], "cd")
-                if resolved_cd is not None:
-                    ctx.cwd = resolved_cd
+            if a.startswith("--") and len(a) > 2:
+                opt, eq, val = a.partition("=")
+                if "--split-string".startswith(opt) and len(opt) >= 3:
+                    rest_tail = " ".join(args[idx + 1:])
+                    nested = (val + " " + rest_tail).strip() if eq else rest_tail
+                    _analyze_nested(nested, ctx)
+                    return
+                if "--chdir".startswith(opt) and len(opt) >= 3:
+                    target = val if eq else (args[idx + 1] if idx + 1 < n_args else "")
+                    idx += 1 if eq else 2
+                    if target:
+                        if any(c in target for c in "*?[]"):
+                            _add(ctx, L.ASK, f"env --chdir target contains glob wildcard: {target}")
+                        resolved_cd = _check_path(ctx, target, "cd")
+                        if resolved_cd is not None:
+                            ctx.cwd = resolved_cd
+                    continue
+                if "--unset".startswith(opt) and len(opt) >= 3:
+                    idx += 1 if eq else 2
+                    continue
+                if any(o.startswith(opt) and len(opt) >= 3 for o in (
+                    "--ignore-environment", "--null", "--debug",
+                )):
+                    idx += 1
+                    continue
+                _add(ctx, L.ASK, f"env uses unrecognized option '{a}' (owner approval)")
                 idx += 1
                 continue
-            if a.startswith("-C") and len(a) > 2 and not a.startswith("--"):
-                resolved_cd = _check_path(ctx, a[2:], "cd")
-                if resolved_cd is not None:
-                    ctx.cwd = resolved_cd
+            if a.startswith("-") and len(a) > 1 and not a.startswith("--"):
+                chars = a[1:]
+                k = 0
                 idx += 1
-                continue
-            if a.startswith("-"):
-                idx += 1
+                while k < len(chars):
+                    ch = chars[k]
+                    if ch in ("i", "0", "v"):
+                        k += 1
+                        continue
+                    if ch == "S":
+                        val = chars[k + 1:] if k + 1 < len(chars) else (args[idx] if idx < n_args else "")
+                        tail = args[idx:] if k + 1 < len(chars) else args[idx + 1:]
+                        nested = (val + " " + " ".join(tail)).strip()
+                        _analyze_nested(nested, ctx)
+                        return
+                    if ch == "C":
+                        target = chars[k + 1:] if k + 1 < len(chars) else (args[idx] if idx < n_args else "")
+                        if k + 1 >= len(chars) and idx < n_args:
+                            idx += 1
+                        if target:
+                            if any(c in target for c in "*?[]"):
+                                _add(ctx, L.ASK, f"env -C target contains glob wildcard: {target}")
+                            resolved_cd = _check_path(ctx, target, "cd")
+                            if resolved_cd is not None:
+                                ctx.cwd = resolved_cd
+                        break
+                    if ch == "u":
+                        if k + 1 >= len(chars) and idx < n_args:
+                            idx += 1
+                        break
+                    _add(ctx, L.ASK, f"env uses unrecognized flag '-{ch}' in '{a}' (owner approval)")
+                    break
                 continue
             break
         rest = list(args[idx:])
@@ -1406,7 +1474,7 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
             var, _, val = rest[0].partition("=")
             if boundaries.GUARD_ENV_RE.match(var):
                 raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {var}", boundaries.POLICY_TAMPER)
-            if var.upper() in DANGEROUS_ENV_OVERRIDES:
+            if _is_dangerous_env_var(var):
                 _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {var}")
             if var.upper() == "TAPE" and val:
                 _check_path(ctx, val, "write")
@@ -1740,7 +1808,7 @@ def _env_builtin(name: str, args: List[str], ctx: _Ctx) -> None:
                 continue
             if boundaries.GUARD_ENV_RE.match(var):
                 raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {var}", boundaries.POLICY_TAMPER)
-            if var.upper() in DANGEROUS_ENV_OVERRIDES:
+            if _is_dangerous_env_var(var):
                 _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {var}")
         return
     # export / declare / typeset
@@ -1749,7 +1817,7 @@ def _env_builtin(name: str, args: List[str], ctx: _Ctx) -> None:
         return
     for a in plain:
         var, eq, value = a.partition("=")
-        if var.upper() in DANGEROUS_ENV_OVERRIDES and eq:
+        if eq and _is_dangerous_env_var(var):
             _add(ctx, L.ASK, f"Overrides a security-relevant environment variable: {var}")
         if eq:
             ctx.variables[var] = _expand_vars(value, ctx)
@@ -1785,6 +1853,9 @@ def _cd(args: List[str], ctx: _Ctx) -> None:
     target = targets[0] if targets else "~"
     if target == "-":
         _add(ctx, L.ASK, "cd - changes to an unknown previous directory")
+        return
+    if any(c in target for c in "*?[]"):
+        _add(ctx, L.ASK, f"cd target contains glob wildcard: {target}")
         return
     resolved = _check_path(ctx, target, "cd")
     if resolved is not None:
@@ -2526,7 +2597,7 @@ def _awk_program_is_pure(program: str) -> bool:
     cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', program)
     if "\\" in cleaned:
         return False
-    if re.search(r"\b(system|getline|close|fflush|nextfile|function|func)\b", cleaned):
+    if re.search(r"\b(system|getline|close|fflush|nextfile|function|func|ARGV|ARGC|ENVIRON|FILENAME|ARGIND)\b", cleaned):
         return False
     # Every function call `ident(` must be a pure safe builtin (or `printf(` / `print(` / control keywords)
     allowed_calls = _SAFE_AWK_BUILTINS | {"if", "while", "for", "print", "printf", "delete"}
@@ -2741,7 +2812,9 @@ def _copy_like(name: str, args: List[str], ctx: _Ctx) -> None:
         dest = pos.pop()
     moving = name in ("mv", "move", "move-item", "mi")
     for src in pos:
-        _check_path(ctx, src, "move" if moving else "read")
+        resolved_src = _check_path(ctx, src, "move" if moving else "read")
+        if name == "ln" and _touches_sensitive_control_dir(resolved_src or src):
+            _add(ctx, L.ASK, f"ln links sensitive control directory '{src}' (owner approval)")
     if dest is not None:
         _check_path(ctx, dest, "write")
 
@@ -2793,12 +2866,12 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
         "--create", "--extract", "--get", "--list", "--gzip", "--gunzip",
         "--bzip2", "--xz", "--verbose", "--preserve-permissions", "--keep-old-files",
         "--to-stdout", "--dereference", "--auto-compress", "--no-same-owner",
-        "--no-same-permissions", "--one-file-system", "--strip-components",
+        "--no-same-permissions", "--one-file-system",
     )
     safe_long_val_write = ("--directory",)
     safe_long_val_archive = ("--file",)
     safe_long_val_read = ("--files-from", "--exclude-from")
-    safe_long_val_nonpath = ("--exclude", "--strip-components")
+    safe_long_val_nonpath = ("--exclude",)
 
     creating = False
     extracting = False
@@ -2852,21 +2925,18 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
                     _add(ctx, L.ASK, f"tar uses advanced/unallowlisted old-style flag '{ch}' in '{a}' (owner approval)")
                     break
 
-    _SENSITIVE_EXTRACT_DIRS = {".git", ".husky", ".vscode", ".github"}
-
     def _check_tar_dir(target: str) -> None:
         if not target:
             return
+        if any(c in target for c in "*?[]"):
+            _add(ctx, L.ASK, f"tar directory contains glob wildcard '{target}' (owner approval)")
         resolved = _check_path(ctx, target, "write")
         if extracting or unknown_mode:
-            parts = [p.rstrip(". ").lower() for p in (resolved or target).replace("\\", "/").split("/") if p]
-            if any(p in _SENSITIVE_EXTRACT_DIRS for p in parts):
+            if _touches_sensitive_control_dir(resolved or target):
                 _add(ctx, L.ASK, f"tar extracts into sensitive control directory '{target}' (owner approval)")
 
-    if extracting and ctx.cwd:
-        cwd_parts = [p.rstrip(". ").lower() for p in ctx.cwd.replace("\\", "/").split("/") if p]
-        if any(p in _SENSITIVE_EXTRACT_DIRS for p in cwd_parts):
-            _add(ctx, L.ASK, f"tar extracts inside sensitive control directory '{ctx.cwd}' (owner approval)")
+    if extracting and ctx.cwd and _touches_sensitive_control_dir(ctx.cwd):
+        _add(ctx, L.ASK, f"tar extracts inside sensitive control directory '{ctx.cwd}' (owner approval)")
 
     def _check_tar_archive(val: str) -> None:
         if not val:
@@ -2962,7 +3032,12 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
         if "://" in a or (re.match(r"^[\w.-]+@[\w.-]+:", a) and not looks_windows_path(a)):
             _add(ctx, L.ASK, f"tar to a remote archive: {a}")
             continue
-        _check_path(ctx, a, "write" if unknown_mode else "read")
+        if extracting and (_touches_sensitive_control_dir(a) or classify_sensitive(a) in ("autoexec", "startup", "critical", "secret")):
+            _check_path(ctx, a, "write")
+            if _touches_sensitive_control_dir(a):
+                _add(ctx, L.ASK, f"tar extracts sensitive control member '{a}' (owner approval)")
+        else:
+            _check_path(ctx, a, "write" if unknown_mode else "read")
 
 
 def _rsync(args: List[str], ctx: _Ctx) -> None:
