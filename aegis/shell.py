@@ -1027,6 +1027,32 @@ def _is_option(word: str, windows_flags: bool = False) -> bool:
     return False
 
 
+def _expand_brace_candidates(word: str, limit: int = 16) -> Optional[List[str]]:
+    """Expand bash-style brace expressions ({a,b}, {.git/config,}) into concrete path candidates.
+
+    Returns None when the expression is a range ({a..z}) or exceeds *limit* candidates
+    so the caller can fail closed to ASK.
+    """
+    m = re.search(r"\{([^{}]+)\}", word)
+    if not m:
+        return [word]
+    inner = m.group(1)
+    if ".." in inner and "," not in inner:
+        return None
+    if "," not in inner:
+        return [word]
+    prefix, suffix = word[: m.start()], word[m.end() :]
+    results: List[str] = []
+    for part in inner.split(","):
+        expanded = _expand_brace_candidates(prefix + part + suffix, limit=limit - len(results))
+        if expanded is None:
+            return None
+        results.extend(expanded)
+        if len(results) > limit:
+            return None
+    return results
+
+
 def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False) -> Optional[str]:
     """Check one path argument; returns the resolved path (or None if it was refused)."""
     if raw is None:
@@ -1038,6 +1064,19 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             _add(ctx, L.ASK, f"Path built from a command substitution: {raw}")
             return None
         word = safe
+    if not ctx.force_windows and "{" in word and "}" in word and re.search(r"\{[^{}]*(?:,|\.\.)[^{}]*\}", word):
+        candidates = _expand_brace_candidates(word)
+        if candidates is None:
+            _add(ctx, L.ASK, f"Path uses complex shell brace expansion: {raw}")
+            return None
+        last_resolved: Optional[str] = None
+        for cand in candidates:
+            if not cand:
+                continue
+            r = _check_path(ctx, cand, mode, recursive=recursive)
+            if r is not None:
+                last_resolved = r
+        return last_resolved
     m_net = re.match(r"^/dev/(tcp|udp)/([^/]+)/(\d+)", word)
     if m_net:
         _check_url(ctx, f"http://{m_net.group(2)}:{m_net.group(3)}/", allowlist=False)
@@ -1418,8 +1457,8 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
                     target = val if eq else (args[idx + 1] if idx + 1 < n_args else "")
                     idx += 1 if eq else 2
                     if target:
-                        if any(c in target for c in "*?[]"):
-                            _add(ctx, L.ASK, f"env --chdir target contains glob wildcard: {target}")
+                        if any(c in target for c in "*?[]{}"):
+                            _add(ctx, L.ASK, f"env --chdir target contains glob/brace wildcard: {target}")
                         resolved_cd = _check_path(ctx, target, "cd")
                         if resolved_cd is not None:
                             ctx.cwd = resolved_cd
@@ -1455,8 +1494,8 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
                         if k + 1 >= len(chars) and idx < n_args:
                             idx += 1
                         if target:
-                            if any(c in target for c in "*?[]"):
-                                _add(ctx, L.ASK, f"env -C target contains glob wildcard: {target}")
+                            if any(c in target for c in "*?[]{}"):
+                                _add(ctx, L.ASK, f"env -C target contains glob/brace wildcard: {target}")
                             resolved_cd = _check_path(ctx, target, "cd")
                             if resolved_cd is not None:
                                 ctx.cwd = resolved_cd
@@ -1557,6 +1596,8 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
         return _chmod(args, ctx)
     if name == "tar":
         return _tar(args, ctx)
+    if name in ("unzip", "7z", "7za"):
+        return _archive_extract(name, args, ctx)
     if name == "rsync":
         return _rsync(args, ctx)
     if name in ("zip",) and any(a in ("-TT", "--unzip-command") or a.startswith("--unzip-command=") for a in args):
@@ -1854,8 +1895,8 @@ def _cd(args: List[str], ctx: _Ctx) -> None:
     if target == "-":
         _add(ctx, L.ASK, "cd - changes to an unknown previous directory")
         return
-    if any(c in target for c in "*?[]"):
-        _add(ctx, L.ASK, f"cd target contains glob wildcard: {target}")
+    if any(c in target for c in "*?[]{}"):
+        _add(ctx, L.ASK, f"cd target contains glob/brace wildcard: {target}")
         return
     resolved = _check_path(ctx, target, "cd")
     if resolved is not None:
@@ -2811,10 +2852,17 @@ def _copy_like(name: str, args: List[str], ctx: _Ctx) -> None:
     if dest is None and len(pos) > 1:
         dest = pos.pop()
     moving = name in ("mv", "move", "move-item", "mi")
+    linking = (name == "ln") or (
+        name == "cp" and any(
+            a in ("-s", "--symbolic-link", "-l", "--link")
+            or (a.startswith("-") and not a.startswith("--") and any(c in a[1:] for c in "sl"))
+            for a in args
+        )
+    )
     for src in pos:
         resolved_src = _check_path(ctx, src, "move" if moving else "read")
-        if name == "ln" and _touches_sensitive_control_dir(resolved_src or src):
-            _add(ctx, L.ASK, f"ln links sensitive control directory '{src}' (owner approval)")
+        if linking and (_touches_sensitive_control_dir(resolved_src or src) or any(c in src for c in "*?[]{}")):
+            _add(ctx, L.ASK, f"{name} links sensitive or wildcard target '{src}' (owner approval)")
     if dest is not None:
         _check_path(ctx, dest, "write")
 
@@ -2928,8 +2976,8 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
     def _check_tar_dir(target: str) -> None:
         if not target:
             return
-        if any(c in target for c in "*?[]"):
-            _add(ctx, L.ASK, f"tar directory contains glob wildcard '{target}' (owner approval)")
+        if any(c in target for c in "*?[]{}"):
+            _add(ctx, L.ASK, f"tar directory contains glob/brace wildcard '{target}' (owner approval)")
         resolved = _check_path(ctx, target, "write")
         if extracting or unknown_mode:
             if _touches_sensitive_control_dir(resolved or target):
@@ -3038,6 +3086,65 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
                 _add(ctx, L.ASK, f"tar extracts sensitive control member '{a}' (owner approval)")
         else:
             _check_path(ctx, a, "write" if unknown_mode else "read")
+
+
+def _archive_extract(name: str, args: List[str], ctx: _Ctx) -> None:
+    """Inspect unzip / 7z / 7za output directories (-d/-o spaced or attached) and sensitive targets."""
+    def _check_out_dir(target: str) -> None:
+        if not target:
+            return
+        if any(c in target for c in "*?[]{}"):
+            _add(ctx, L.ASK, f"{name} output directory contains glob/brace wildcard '{target}' (owner approval)")
+        resolved = _check_path(ctx, target, "write")
+        if _touches_sensitive_control_dir(resolved or target):
+            _add(ctx, L.ASK, f"{name} extracts into sensitive control directory '{target}' (owner approval)")
+
+    if ctx.cwd and _touches_sensitive_control_dir(ctx.cwd):
+        _add(ctx, L.ASK, f"{name} runs inside sensitive control directory '{ctx.cwd}' (owner approval)")
+
+    i = 0
+    n = len(args)
+    end_of_opts = False
+    is_7z = name in ("7z", "7za")
+    sub_7z = (args[0].lower() if is_7z and args and not args[0].startswith("-") else "")
+    while i < n:
+        a = args[i]
+        i += 1
+        if a == "--" and not end_of_opts:
+            end_of_opts = True
+            continue
+        if not end_of_opts:
+            if not is_7z:
+                if a.startswith("-") and not a.startswith("--") and len(a) > 1:
+                    chars = a[1:]
+                    for k, ch in enumerate(chars):
+                        if ch == "d":
+                            target = chars[k + 1:] if k + 1 < len(chars) else (args[i] if i < n else "")
+                            if k + 1 >= len(chars) and i < n:
+                                i += 1
+                            _check_out_dir(target)
+                            break
+                    continue
+                if a.startswith("--"):
+                    continue
+            else:
+                if a == "-o" and i < n:
+                    _check_out_dir(args[i])
+                    i += 1
+                    continue
+                if a.startswith("-o") and len(a) > 2 and not a.startswith("--"):
+                    _check_out_dir(a[2:])
+                    continue
+                if a.startswith("-") and a != "-":
+                    continue
+                if i == 1 and sub_7z in ("a", "d", "e", "l", "t", "u", "x"):
+                    continue
+        if _touches_sensitive_control_dir(a) or classify_sensitive(a) in ("autoexec", "startup", "critical", "secret"):
+            _check_path(ctx, a, "write")
+            if _touches_sensitive_control_dir(a):
+                _add(ctx, L.ASK, f"{name} targets sensitive control path '{a}' (owner approval)")
+        else:
+            _check_path(ctx, a, "write" if (is_7z and sub_7z in ("a", "u", "d")) else "read")
 
 
 def _rsync(args: List[str], ctx: _Ctx) -> None:

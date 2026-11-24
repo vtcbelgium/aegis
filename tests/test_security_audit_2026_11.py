@@ -933,5 +933,54 @@ def test_r8_env_clusters_git_env_awk_argv_and_tar_globs(tmp_path):
         assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
 
 
+def test_r9_brace_expansion_unzip_7z_and_symlink_globs(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+
+    # High: bash brace expansion must not bypass path checks
+    for cmd in (
+        "echo x > {.git/config,}",
+        "sort -o {.git/config,} x",
+        "tar -C {.git/hooks,} -xf a.tar",
+        "cd {.git,} && ls",
+        "echo x > {../outside,}",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Medium: unzip / 7z extracting into sensitive control directories
+    for cmd in (
+        "unzip a.zip -d .git",
+        "unzip a.zip -d.git/hooks",
+        "unzip -od.git/hooks a.zip",
+        "unzip -qd .vscode a.zip",
+        "7z x a.7z -o.git/hooks",
+        "7za x a.7z -o .git",
+        "unzip a.zip -d .vscode",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Low: symlink/hardlink aliases built from globs or cp -s / cp -l
+    for cmd in (
+        "ln -s .g* g && tar xf a.tar",
+        "cp -s .git g",
+        "cp --symbolic-link .git g",
+        "cp -l .git/config g",
+        "ln -s {.git,} g",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Benign brace expansion & unzip still pass
+    for cmd in ("cp {a,b}.txt dir/", "unzip pkg.zip -d vendor/", "7z x pkg.7z -ovendor"):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+
+
 
 
