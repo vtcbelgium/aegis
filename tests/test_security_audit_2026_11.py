@@ -261,3 +261,74 @@ def test_a10_keyed_ledger_detects_forged_unkeyed_rewrite(tmp_path):
     res_forged = verify(path, signing_key="super-secret-hmac-key")
     assert not res_forged.ok
 
+
+# ---------------------------------------------------------------------------
+# Round-2 Audit Fixes: M2 (D11 absent crew + digest), L2 (ADS regex), L3 (backoff)
+# ---------------------------------------------------------------------------
+
+def test_r2_m2_d11_config_parity_flags_rogue_runtime_crew_and_tampered_digest(tmp_path):
+    import json
+    from aegis.detective.verifier import verify_production_path, verify_reply
+
+    tmpl = tmp_path / "forge_crews.json"
+    rt = tmp_path / "crews.json"
+    tmpl.write_text(json.dumps({"crews": [{"id": "othrys", "enabled": True, "engine": "custom"}]}), encoding="utf-8")
+    rt.write_text(
+        json.dumps({
+            "crews": [
+                {"id": "othrys", "enabled": True, "engine": "custom"},
+                {"id": "rogue", "enabled": True, "engine": "codex-local"},
+            ]
+        }),
+        encoding="utf-8",
+    )
+    report = verify_production_path([
+        {
+            "id": "template_parity",
+            "kind": "config_parity",
+            "templatePath": str(tmpl),
+            "runtimePath": str(rt),
+            "listKey": "crews",
+            "idKey": "id",
+            "field": "engine",
+            "filterField": "enabled",
+            "filterValue": True,
+        }
+    ])
+    assert report["status"] == "FAIL"
+    assert any("rogue" in m and "absent" in m for m in report["probes"][0]["mismatches"])
+
+    # Forged PASS report with tampered digest must be rejected by verify_reply
+    forged = dict(report)
+    forged["status"] = "PASS"
+    forged["passed"] = True
+    res = verify_reply(
+        "Deployed live to production.",
+        cwd=str(tmp_path),
+        mode="strict",
+        allow_git_subprocess=False,
+        production_path=forged,
+    )
+    assert res["decision"] == "block"
+    assert any(f["code"] == "INCOMPLETE_DEPLOYMENT_VERIFICATION" for f in res["findings"])
+
+
+def test_r2_l2_windows_ads_rejects_embedded_digits_colon_trick(tmp_path):
+    from aegis.clans.labyrinth import LabyrinthClan
+
+    v_ads = LabyrinthClan.inspect_path(str(tmp_path / "notes12:34x"), base_dir=str(tmp_path))
+    assert v_ads.level == L.DENY
+    v_iso = LabyrinthClan.inspect_path(str(tmp_path / "2026-11-24T12:34:56Z.log"), base_dir=str(tmp_path))
+    assert v_iso.level == L.PASS
+
+
+def test_r2_l3_reset_session_backoff_never_overflows_after_1500_failures(tmp_path):
+    from aegis.core import AegisGate
+
+    gate = AegisGate(base_dir=str(tmp_path), owner_secret="secret-token")
+    gate._reset_failures = 1500
+    gate._reset_locked_until = 0.0
+    assert gate.reset_session("wrong-token") is False
+    assert gate._reset_locked_until > 0.0
+
+

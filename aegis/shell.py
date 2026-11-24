@@ -1900,7 +1900,8 @@ def _project_tool(name: str, args: List[str], ctx: _Ctx) -> None:
                 _check_url(ctx, val)
             elif any(c in val for c in "/\\~") or val.startswith("$"):
                 _check_path(ctx, val, "read")
-    _project_exec(ctx, f"{name} {' '.join(args[:2])}".strip())
+    if name in PROJECT_TOOLS:
+        _project_exec(ctx, f"{name} {' '.join(args[:2])}".strip())
 
 
 def _pattern_tool(name: str, args: List[str], ctx: _Ctx) -> None:

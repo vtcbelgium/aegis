@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -221,7 +222,9 @@ def verify_production_path(probes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 if filter_field is not None and item.get(filter_field) != filter_value:
                     continue
                 ident = str(item.get(id_key) or "")
-                if ident not in t_map:
+                if not ident or ident not in t_map:
+                    checked += 1
+                    mismatches.append(f"{ident or '<missing-id>'}: absent from template")
                     continue
                 checked += 1
                 exp_val = t_map[ident].get(field)
@@ -493,8 +496,22 @@ def verify_reply(
             })
         else:
             p_status = str(prod_report.get("status") or "UNKNOWN").upper()
+            probes = prod_report.get("probes") if isinstance(prod_report.get("probes"), list) else []
+            req_probes = [p for p in probes if isinstance(p, dict) and p.get("required", True)]
+            req_count = int(prod_report.get("requiredCount")) if prod_report.get("requiredCount") is not None else len(req_probes)
+            digest_ok = True
+            if prod_report.get("schema") == "aegis.production-path.v1":
+                claimed_digest = str(prod_report.get("digest") or "")
+                body_no_digest = {k: v for k, v in prod_report.items() if k != "digest"}
+                expected_digest = hashlib.sha256(
+                    json.dumps(body_no_digest, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+                ).hexdigest()
+                digest_ok = bool(claimed_digest) and hmac.compare_digest(
+                    expected_digest.encode("utf-8"),
+                    claimed_digest.encode("utf-8"),
+                )
             if p_status == "FAIL":
-                failed_ids = [p["id"] for p in (prod_report.get("probes") or []) if p.get("status") == "FAIL"]
+                failed_ids = [p["id"] for p in probes if isinstance(p, dict) and p.get("status") == "FAIL"]
                 findings.append({
                     "class": "D11",
                     "code": "PRODUCTION_PATH_MISMATCH",
@@ -505,8 +522,19 @@ def verify_reply(
                         f"but production-path verification FAILED on probe(s): {', '.join(failed_ids) or 'unknown'}."
                     ),
                 })
-            elif p_status != "PASS":
-                unk_ids = [p["id"] for p in (prod_report.get("probes") or []) if p.get("status") == "UNKNOWN"]
+            elif p_status != "PASS" or not digest_ok or req_count < 1 or not any(
+                isinstance(p, dict) and p.get("status") == "PASS" for p in req_probes
+            ):
+                unk_ids = [p["id"] for p in probes if isinstance(p, dict) and p.get("status") == "UNKNOWN"]
+                reason_bits = []
+                if not digest_ok:
+                    reason_bits.append("invalid report digest")
+                if req_count < 1:
+                    reason_bits.append("requiredCount < 1")
+                if p_status != "PASS":
+                    reason_bits.append(f"status={p_status}")
+                elif not any(isinstance(p, dict) and p.get("status") == "PASS" for p in req_probes):
+                    reason_bits.append("no passing required probes")
                 findings.append({
                     "class": "D11",
                     "code": "INCOMPLETE_DEPLOYMENT_VERIFICATION",
@@ -514,8 +542,9 @@ def verify_reply(
                     "unknownProbes": unk_ids,
                     "detail": (
                         f"Reply claimed deployment readiness ({phrase!r}), "
-                        f"but production-path status is {p_status} (unverified probe(s): {', '.join(unk_ids) or 'none'}). "
-                        "Missing evidence is UNKNOWN, never PASS."
+                        f"but production-path verification is incomplete ({', '.join(reason_bits) or p_status}; "
+                        f"unverified probe(s): {', '.join(unk_ids) or 'none'}). "
+                        "Missing or tampered evidence is UNKNOWN, never PASS."
                     ),
                 })
 

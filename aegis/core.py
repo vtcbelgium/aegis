@@ -189,9 +189,10 @@ class AegisGate:
                 return True
             self._reset_failures += 1
             if self._reset_failures >= self.RESET_MAX_ATTEMPTS:
+                exponent = min(self._reset_failures - self.RESET_MAX_ATTEMPTS, 30)
                 backoff = min(
                     self.RESET_MAX_BACKOFF_SECONDS,
-                    float(2 ** (self._reset_failures - self.RESET_MAX_ATTEMPTS)),
+                    float(2 ** exponent),
                 )
                 self._reset_locked_until = now + backoff
             return False

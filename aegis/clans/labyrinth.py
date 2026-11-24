@@ -21,7 +21,9 @@ from ..policy import SENSITIVE_PATH_PATTERNS, classify_sensitive  # noqa: F401  
 
 _WIN_DRIVE_RELATIVE_RE = re.compile(r"^[A-Za-z]:(?![\\/]|$)")
 _WIN_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:$")
-_ISO_TIME_RE = re.compile(r"\d{2}:\d{2}")
+_ISO_TIMESTAMP_COMPONENT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T_ ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?(?:\.[A-Za-z0-9_-]+)?$"
+)
 
 
 def _has_windows_ads(path: str) -> bool:
@@ -37,7 +39,7 @@ def _has_windows_ads(path: str) -> bool:
             continue
         if idx == 0 and _WIN_DRIVE_PREFIX_RE.match(part):
             continue
-        if ":" in part and not _ISO_TIME_RE.search(part):
+        if ":" in part and not _ISO_TIMESTAMP_COMPONENT_RE.match(part):
             return True
     return False
 
