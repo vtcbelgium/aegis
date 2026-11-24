@@ -177,7 +177,9 @@
     input[type="text"]:focus, textarea:focus { border-color: var(--border-strong); }
     textarea { min-height: 92px; resize: vertical; line-height: 1.5; }
 
-    button.btn {
+    .btn {
+      display: inline-flex;
+      align-items: center;
       background: transparent;
       border: 1px solid var(--border);
       border-radius: 7px;
@@ -188,19 +190,20 @@
       padding: 7px 13px;
       cursor: pointer;
       white-space: nowrap;
+      text-decoration: none;
       transition: border-color 120ms ease, opacity 120ms ease;
     }
-    button.btn:hover:not(:disabled) { border-color: var(--border-strong); }
-    button.btn.primary {
+    .btn:hover:not(:disabled) { border-color: var(--border-strong); }
+    .btn.primary {
       background: var(--fg);
       color: var(--bg);
       border-color: var(--fg);
     }
-    button.btn.danger-outline:hover:not(:disabled) {
+    .btn.danger-outline:hover:not(:disabled) {
       border-color: var(--danger);
       color: var(--danger);
     }
-    button.btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
     .samples {
       display: flex;

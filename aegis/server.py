@@ -275,13 +275,23 @@ def _build_handler(state: AegisAppState, port: int):
             self._send_headers(status, "application/json; charset=utf-8")
             self.wfile.write(body)
 
+        def _drain_small_body(self) -> None:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if 0 < length <= 4096:
+                    self.rfile.read(length)
+            except (ValueError, OSError):
+                pass
+
         def _check_origin(self) -> bool:
             sec_fetch = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
             if sec_fetch and sec_fetch not in ("same-origin", "none"):
+                self._drain_small_body()
                 self._send_json(403, {"error": f"Cross-origin request blocked ({sec_fetch})"})
                 return False
             origin = (self.headers.get("Origin") or "").strip().rstrip("/")
             if origin and origin not in allowed_origins:
+                self._drain_small_body()
                 self._send_json(403, {"error": f"Origin '{origin}' is not permitted"})
                 return False
             return True
@@ -289,6 +299,7 @@ def _build_handler(state: AegisAppState, port: int):
         def _require_token(self) -> bool:
             token = self.headers.get("X-Aegis-Token", "")
             if not state.verify_token(token):
+                self._drain_small_body()
                 self._send_json(403, {"error": "Valid X-Aegis-Token header is required"})
                 return False
             return True
