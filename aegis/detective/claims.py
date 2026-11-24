@@ -26,6 +26,13 @@ _PASS_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+_DEPLOYMENT_CLAIM_RE = re.compile(
+    r"\b(?:successfully\s+deployed|deployed\s+(?:live|and\s+operational|to\s+(?:production|prod|t590|cloudflare|vercel))|"
+    r"operational\s+on\s+[A-Za-z0-9._-]+|live\s+in\s+production|production\s+(?:deploy|deployment|cutover)\s+(?:complete|succeeded|operational)|"
+    r"service\s+(?:is\s+)?active\s+in\s+production|rolled\s+out\s+to\s+production)\b",
+    re.IGNORECASE,
+)
+
 _COUNT_PASSED_RE = re.compile(r"\b(\d+)\s+(?:/\s*\d+\s+)?(?:tests?\s+)?passed\b", re.IGNORECASE)
 _FILE_URI_RE = re.compile(r"file:///([A-Za-z]:/[^\s)#]+|/[^\s)#]+)(?:#L(\d+)(?:-L?(\d+))?)?")
 _BACKTICK_FILE_RE = re.compile(
@@ -50,9 +57,11 @@ def extract_claims(reply_text: str) -> Dict[str, Any]:
     """Extract structured, verifiable claims from a draft reply."""
     text = reply_text or ""
     pass_matches = [m.group(0) for m in _PASS_CLAIM_RE.finditer(text)]
-    # Ignore a pass claim only if the reply is strictly reporting failure/blocked without claiming pass
+    deploy_matches = [m.group(0) for m in _DEPLOYMENT_CLAIM_RE.finditer(text)]
+    # Ignore a pass/deployment claim only if the reply is strictly reporting failure/blocked without claiming pass
     claims_passing = bool(pass_matches)
-    honest_block = bool(_HONEST_NEGATION_RE.search(text)) and not claims_passing
+    claims_deployment = bool(deploy_matches)
+    honest_block = bool(_HONEST_NEGATION_RE.search(text)) and not claims_passing and not claims_deployment
 
     claimed_counts: List[int] = []
     for m in _COUNT_PASSED_RE.finditer(text):
@@ -91,8 +100,10 @@ def extract_claims(reply_text: str) -> Dict[str, Any]:
 
     return {
         "claimsPassing": claims_passing,
+        "claimsDeployment": claims_deployment,
         "honestBlock": honest_block,
         "passPhrases": pass_matches[:10],
+        "deploymentPhrases": deploy_matches[:10],
         "claimedPassedCounts": claimed_counts,
         "fileRefs": file_refs[:50],
         "commitShas": commit_shas[:20],

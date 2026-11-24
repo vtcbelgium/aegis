@@ -232,3 +232,131 @@ def test_dojo_pack_07_and_server_detective_api(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_d11_production_path_detects_t590_engine_mismatch_and_blocks_false_deploy_claim(tmp_path):
+    """INC-0001 regression: green unit tests cannot certify deployment when active config has legacy engine or unknown timer."""
+    from aegis.detective import verify_production_path, verify_reply
+
+    template_cfg = tmp_path / "template_crews.json"
+    runtime_cfg = tmp_path / "runtime_crews.json"
+    template_cfg.write_text(
+        json.dumps({"crews": [{"id": "othrys", "enabled": True, "engine": "custom"}]}),
+        encoding="utf-8",
+    )
+    # Reproduce original INC-0001 failure: active runtime crews.json still points to codex-local
+    runtime_cfg.write_text(
+        json.dumps({"crews": [{"id": "othrys", "enabled": True, "engine": "codex-local"}]}),
+        encoding="utf-8",
+    )
+
+    probes_fail = verify_production_path([
+        {
+            "id": "active-forge-engine",
+            "kind": "json_field",
+            "path": str(runtime_cfg),
+            "fieldPath": "crews.*.engine",
+            "filterField": "enabled",
+            "filterValue": True,
+            "expected": "custom",
+            "forbidden": ["codex-local"],
+        },
+        {
+            "id": "template-runtime-parity",
+            "kind": "config_parity",
+            "templatePath": str(template_cfg),
+            "runtimePath": str(runtime_cfg),
+            "listKey": "crews",
+            "idKey": "id",
+            "field": "engine",
+            "filterField": "enabled",
+            "filterValue": True,
+        },
+        {"id": "systemd-timer", "kind": "observed", "status": "UNKNOWN", "detail": "Not probed"},
+    ])
+    assert probes_fail["status"] == "FAIL"
+    assert probes_fail["passed"] is False
+    assert probes_fail["failCount"] == 2
+    assert probes_fail["unknownCount"] == 1
+
+    # Isolated unit tests passed, yet claim says "successfully deployed and operational on T590"
+    green_tests = {"lastVerifier": {"ok": True, "exitCode": 0, "passed": 700, "failed": 0}}
+    w_fail = verify_reply(
+        "All 700 tests passed. Forge successfully deployed and operational on T590.",
+        cwd=str(tmp_path),
+        detective_state=green_tests,
+        production_path=probes_fail,
+        mode="strict",
+        allow_git_subprocess=False,
+    )
+    assert w_fail["passed"] is False
+    assert any(f["class"] == "D11" and f["code"] == "PRODUCTION_PATH_MISMATCH" for f in w_fail["findings"])
+
+    # Fix runtime_cfg to custom, but leave systemd-timer UNKNOWN -> must still block (No evidence, no verdict)
+    runtime_cfg.write_text(
+        json.dumps({"crews": [{"id": "othrys", "enabled": True, "engine": "custom"}]}),
+        encoding="utf-8",
+    )
+    probes_unknown = verify_production_path([
+        {
+            "id": "active-forge-engine",
+            "kind": "json_field",
+            "path": str(runtime_cfg),
+            "fieldPath": "crews.*.engine",
+            "filterField": "enabled",
+            "filterValue": True,
+            "expected": "custom",
+            "forbidden": ["codex-local"],
+        },
+        {"id": "systemd-timer", "kind": "observed", "status": "UNKNOWN", "detail": "Timer not checked"},
+    ])
+    assert probes_unknown["status"] == "UNKNOWN"
+    assert probes_unknown["passed"] is False
+    w_unk = verify_reply(
+        "Forge successfully deployed and operational on T590.",
+        cwd=str(tmp_path),
+        detective_state=green_tests,
+        production_path=probes_unknown,
+        mode="strict",
+        allow_git_subprocess=False,
+    )
+    assert w_unk["passed"] is False
+    assert any(f["class"] == "D11" and f["code"] == "INCOMPLETE_DEPLOYMENT_VERIFICATION" for f in w_unk["findings"])
+
+    # Once all required probes PASS, deployment claim passes cleanly
+    probes_ok = verify_production_path([
+        {
+            "id": "active-forge-engine",
+            "kind": "json_field",
+            "path": str(runtime_cfg),
+            "fieldPath": "crews.*.engine",
+            "filterField": "enabled",
+            "filterValue": True,
+            "expected": "custom",
+            "forbidden": ["codex-local"],
+        },
+        {
+            "id": "template-runtime-parity",
+            "kind": "config_parity",
+            "templatePath": str(template_cfg),
+            "runtimePath": str(runtime_cfg),
+            "listKey": "crews",
+            "idKey": "id",
+            "field": "engine",
+            "filterField": "enabled",
+            "filterValue": True,
+        },
+        {"id": "systemd-timer", "kind": "observed", "status": "PASS", "detail": "active"},
+    ])
+    assert probes_ok["status"] == "PASS"
+    assert probes_ok["passed"] is True
+    w_ok = verify_reply(
+        "All 700 tests passed. Forge successfully deployed and operational on T590.",
+        cwd=str(tmp_path),
+        detective_state=green_tests,
+        production_path=probes_ok,
+        mode="strict",
+        allow_git_subprocess=False,
+    )
+    assert w_ok["passed"] is True
+    assert w_ok["findingCount"] == 0

@@ -95,6 +95,7 @@ def run_dojo(*, mission: str, pack: str = "all", scope: str = "gate-only") -> di
                 check_write_drift,
                 inspect_production_theater,
                 inspect_test_edit,
+                verify_production_path,
                 verify_reply,
             )
             w_d01 = verify_reply("All 50 tests passed with exit code 0.", cwd=str(workspace), detective_state={}, mode="strict", allow_git_subprocess=False)
@@ -117,6 +118,28 @@ def run_dojo(*, mission: str, pack: str = "all", scope: str = "gate-only") -> di
             record("07", "d09-slopsquatting-guard", any(h["code"] == "SLOPSQUATTING_SUSPECT" for h in slop), "D09 typosquat package flagged")
             w_d09 = verify_reply("See `nonexistent/ghost.py:99` for details.", cwd=str(workspace), detective_state={}, mode="strict", allow_git_subprocess=False)
             record("07", "d09-phantom-citation", any(f["code"] == "PHANTOM_FILE_CITATION" for f in w_d09["findings"]), "D09 phantom file citation")
+            w_d11_unv = verify_reply(
+                "All tests passed. Forge successfully deployed and operational on T590.",
+                cwd=str(workspace),
+                detective_state={"lastVerifier": {"ok": True, "exitCode": 0, "failed": 0, "passed": 10}},
+                mode="strict",
+                allow_git_subprocess=False,
+            )
+            record("07", "d11-unverified-deployment-claim", (not w_d11_unv["passed"]) and any(f["code"] == "UNVERIFIED_DEPLOYMENT_CLAIM" for f in w_d11_unv["findings"]), "D11 deployment claim without production-path evidence blocked")
+            bad_crews = workspace / "crews.json"
+            bad_crews.write_text(json.dumps({"crews": [{"id": "othrys", "enabled": True, "engine": "codex-local"}]}), encoding="utf-8")
+            pp_bad = verify_production_path([
+                {"id": "active-engine", "kind": "json_field", "path": str(bad_crews), "fieldPath": "crews.*.engine", "filterField": "enabled", "filterValue": True, "expected": "custom", "forbidden": ["codex-local"]},
+            ])
+            w_d11_bad = verify_reply(
+                "Forge successfully deployed and operational on T590.",
+                cwd=str(workspace),
+                detective_state={"lastVerifier": {"ok": True, "exitCode": 0, "failed": 0, "passed": 10}},
+                production_path=pp_bad,
+                mode="strict",
+                allow_git_subprocess=False,
+            )
+            record("07", "d11-production-path-mismatch", (pp_bad["status"] == "FAIL") and (not w_d11_bad["passed"]) and any(f["code"] == "PRODUCTION_PATH_MISMATCH" for f in w_d11_bad["findings"]), "D11 active runtime engine mismatch blocked despite green unit tests")
     return {"schema": "aegis.dojo.report.v1", "mission": mission, "scope": scope,
             "execution": "policy-simulation-only", "passed": all(r["passed"] for r in results),
             "cases": results, "cleanup": "temporary fixtures removed",

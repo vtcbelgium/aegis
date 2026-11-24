@@ -1,4 +1,4 @@
-"""Deterministic Claim-to-Evidence Cross-Examiner (D01-D10) & Truth Receipt Generator."""
+"""Deterministic Claim-to-Evidence Cross-Examiner (D01-D11) & Truth Receipt Generator."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .baseline import compute_dirty_delta, latest_turn_id, load_turn_baseline
 from .claims import extract_claims
@@ -81,6 +82,224 @@ def build_truth_receipt(
     return receipt
 
 
+def _resolve_json_targets(data: Any, field_path: str, *, filter_field: Optional[str] = None, filter_value: Any = None) -> List[tuple[str, Any]]:
+    """Resolve a dotted JSON field path supporting one wildcard list segment (e.g. 'crews.*.engine')."""
+    parts = [p for p in str(field_path or "").split(".") if p]
+    if not parts:
+        return [("", data)]
+    cur: List[tuple[str, Any]] = [("", data)]
+    for idx, part in enumerate(parts):
+        nxt: List[tuple[str, Any]] = []
+        for prefix, obj in cur:
+            if part == "*":
+                if not isinstance(obj, list):
+                    return []
+                for i, item in enumerate(obj):
+                    if filter_field is not None:
+                        if not isinstance(item, dict) or item.get(filter_field) != filter_value:
+                            continue
+                    label = str(item.get("id") or i) if isinstance(item, dict) else str(i)
+                    nxt.append((f"{prefix}[{label}]" if prefix else f"[{label}]", item))
+            elif isinstance(obj, dict) and part in obj:
+                nxt.append((f"{prefix}.{part}" if prefix else part, obj[part]))
+            else:
+                # Missing key -> record sentinel so callers treat missing field as mismatch, never silent pass
+                nxt.append((f"{prefix}.{part}" if prefix else part, None))
+        cur = nxt
+    return cur
+
+
+def verify_production_path(probes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Deterministically evaluate active runtime/deployment probes (tri-state: PASS | FAIL | UNKNOWN).
+
+    Enforces strict R0 semantics:
+      - Missing or unreadable evidence yields UNKNOWN (never PASS).
+      - Any required FAIL -> overall FAIL.
+      - Any required UNKNOWN (with no FAIL) -> overall UNKNOWN.
+      - Overall PASS requires >=1 probe and every required probe == PASS.
+    """
+    results: List[Dict[str, Any]] = []
+    for idx, spec in enumerate(probes or ()):
+        if not isinstance(spec, dict):
+            results.append({
+                "id": f"probe_{idx}",
+                "kind": "invalid",
+                "required": True,
+                "status": "UNKNOWN",
+                "detail": "Probe spec is not a dictionary.",
+                "mismatches": [],
+            })
+            continue
+        pid = str(spec.get("id") or f"probe_{idx}")
+        kind = str(spec.get("kind") or "observed").strip().lower()
+        required = bool(spec.get("required", True))
+
+        if kind == "observed":
+            raw_status = str(spec.get("status") or "UNKNOWN").strip().upper()
+            status = raw_status if raw_status in ("PASS", "FAIL", "UNKNOWN") else "UNKNOWN"
+            results.append({
+                "id": pid,
+                "kind": kind,
+                "required": required,
+                "status": status,
+                "detail": str(spec.get("detail") or f"Observed status: {status}"),
+                "mismatches": list(spec.get("mismatches") or []),
+            })
+            continue
+
+        if kind == "json_field":
+            raw_path = spec.get("path")
+            if not raw_path:
+                results.append({"id": pid, "kind": kind, "required": required, "status": "UNKNOWN", "detail": "No config path supplied.", "mismatches": []})
+                continue
+            p = Path(str(raw_path))
+            if not p.is_file():
+                results.append({"id": pid, "kind": kind, "required": required, "status": "FAIL", "detail": f"Active runtime config not found: {p}", "mismatches": [str(p)]})
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                results.append({"id": pid, "kind": kind, "required": required, "status": "FAIL", "detail": f"Unreadable JSON config {p}: {exc}", "mismatches": [str(p)]})
+                continue
+            targets = _resolve_json_targets(
+                data,
+                str(spec.get("fieldPath") or ""),
+                filter_field=spec.get("filterField"),
+                filter_value=spec.get("filterValue"),
+            )
+            if not targets:
+                results.append({
+                    "id": pid,
+                    "kind": kind,
+                    "required": required,
+                    "status": "UNKNOWN" if spec.get("allowEmpty") else "FAIL",
+                    "detail": f"No matching entries found for {spec.get('fieldPath')!r} in {p.name}.",
+                    "mismatches": [],
+                })
+                continue
+            has_expected = "expected" in spec and spec.get("expected") is not None
+            expected = spec.get("expected")
+            forbidden = set(spec.get("forbidden") or [])
+            mismatches: List[str] = []
+            for label, val in targets:
+                if val in forbidden:
+                    mismatches.append(f"{label}={val!r} (forbidden)")
+                elif has_expected and val != expected:
+                    mismatches.append(f"{label}={val!r} (expected {expected!r})")
+            status = "FAIL" if mismatches else "PASS"
+            detail = (
+                f"{len(mismatches)}/{len(targets)} active entries failed {spec.get('fieldPath')!r}: {', '.join(mismatches[:5])}"
+                if mismatches
+                else f"Verified {len(targets)} active entry/entries in {p.name}."
+            )
+            results.append({"id": pid, "kind": kind, "required": required, "status": status, "detail": detail, "mismatches": mismatches})
+            continue
+
+        if kind == "config_parity":
+            t_path = Path(str(spec.get("templatePath") or ""))
+            r_path = Path(str(spec.get("runtimePath") or ""))
+            if not t_path.is_file() or not r_path.is_file():
+                missing = [str(x) for x in (t_path, r_path) if not x.is_file()]
+                results.append({"id": pid, "kind": kind, "required": required, "status": "FAIL", "detail": f"Missing config file(s): {', '.join(missing)}", "mismatches": missing})
+                continue
+            try:
+                t_data = json.loads(t_path.read_text(encoding="utf-8"))
+                r_data = json.loads(r_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                results.append({"id": pid, "kind": kind, "required": required, "status": "FAIL", "detail": f"JSON parse error: {exc}", "mismatches": []})
+                continue
+            list_key = str(spec.get("listKey") or "crews")
+            id_key = str(spec.get("idKey") or "id")
+            field = str(spec.get("field") or "engine")
+            filter_field = spec.get("filterField")
+            filter_value = spec.get("filterValue")
+            t_map = {str(item.get(id_key)): item for item in (t_data.get(list_key) or []) if isinstance(item, dict) and item.get(id_key)}
+            r_items = [item for item in (r_data.get(list_key) or []) if isinstance(item, dict)]
+            mismatches = []
+            checked = 0
+            for item in r_items:
+                if filter_field is not None and item.get(filter_field) != filter_value:
+                    continue
+                ident = str(item.get(id_key) or "")
+                if ident not in t_map:
+                    continue
+                checked += 1
+                exp_val = t_map[ident].get(field)
+                act_val = item.get(field)
+                if act_val != exp_val:
+                    mismatches.append(f"{ident}.{field}={act_val!r} (template {exp_val!r})")
+            if checked == 0:
+                status = "UNKNOWN"
+                detail = f"No overlapping entries compared between {t_path.name} and {r_path.name}."
+            else:
+                status = "FAIL" if mismatches else "PASS"
+                detail = (
+                    f"{len(mismatches)}/{checked} runtime parity drift(s): {', '.join(mismatches[:5])}"
+                    if mismatches
+                    else f"{checked}/{checked} active entries match committed {t_path.name} on '{field}'."
+                )
+            results.append({"id": pid, "kind": kind, "required": required, "status": status, "detail": detail, "mismatches": mismatches})
+            continue
+
+        if kind == "file_freshness":
+            raw_path = spec.get("path")
+            max_age = float(spec.get("maxAgeSeconds", 86400))
+            now_epoch = float(spec.get("nowEpoch") if spec.get("nowEpoch") is not None else time.time())
+            p = Path(str(raw_path or ""))
+            if not raw_path or not p.is_file():
+                results.append({"id": pid, "kind": kind, "required": required, "status": "UNKNOWN", "detail": f"State file absent: {raw_path}", "mismatches": []})
+                continue
+            age = max(0.0, now_epoch - p.stat().st_mtime)
+            status = "PASS" if age <= max_age else "FAIL"
+            results.append({
+                "id": pid,
+                "kind": kind,
+                "required": required,
+                "status": status,
+                "detail": f"{p.name} age={int(age)}s (max {int(max_age)}s).",
+                "mismatches": [] if status == "PASS" else [f"{p.name}:age={int(age)}s>{int(max_age)}s"],
+            })
+            continue
+
+        results.append({
+            "id": pid,
+            "kind": kind,
+            "required": required,
+            "status": "UNKNOWN",
+            "detail": f"Unsupported production-path probe kind: {kind}",
+            "mismatches": [],
+        })
+
+    required_results = [r for r in results if r["required"]]
+    pass_count = sum(1 for r in results if r["status"] == "PASS")
+    fail_count = sum(1 for r in results if r["status"] == "FAIL")
+    unknown_count = sum(1 for r in results if r["status"] == "UNKNOWN")
+
+    if not required_results:
+        overall = "UNKNOWN"
+    elif any(r["status"] == "FAIL" for r in required_results):
+        overall = "FAIL"
+    elif any(r["status"] == "UNKNOWN" for r in required_results):
+        overall = "UNKNOWN"
+    else:
+        overall = "PASS"
+
+    report: Dict[str, Any] = {
+        "schema": "aegis.production-path.v1",
+        "status": overall,
+        "passed": overall == "PASS",
+        "passCount": pass_count,
+        "failCount": fail_count,
+        "unknownCount": unknown_count,
+        "requiredCount": len(required_results),
+        "probes": results,
+    }
+    report["digest"] = hashlib.sha256(
+        json.dumps(report, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    return report
+
+
 def verify_reply(
     reply_text: str,
     *,
@@ -90,6 +309,7 @@ def verify_reply(
     mode: Optional[str] = None,
     ledger_tip: Optional[str] = None,
     allow_git_subprocess: bool = True,
+    production_path: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Cross-examine a draft agent reply against recorded PostToolUse telemetry and live disk/git state."""
     workspace = os.path.abspath(cwd or os.getcwd())
@@ -255,6 +475,49 @@ def verify_reply(
                     "but git history or an Aegis Detective turn checkpoint is available for recovery."
                 ),
             })
+
+    # D11 — Production-Path Deployment Verification (isolated tests/builds never certify live deployment)
+    prod_report = production_path if production_path is not None else state.get("productionPath")
+    if claims.get("claimsDeployment") and not claims["honestBlock"]:
+        phrase = (claims.get("deploymentPhrases") or ["deployed"])[0]
+        if not isinstance(prod_report, dict):
+            findings.append({
+                "class": "D11",
+                "code": "UNVERIFIED_DEPLOYMENT_CLAIM",
+                "severity": "DENY",
+                "detail": (
+                    f"Reply claimed deployment/operational readiness ({phrase!r}), "
+                    "but no deterministic production-path verification evidence was recorded. "
+                    "Isolated unit tests or builds do not verify active runtime configuration."
+                ),
+            })
+        else:
+            p_status = str(prod_report.get("status") or "UNKNOWN").upper()
+            if p_status == "FAIL":
+                failed_ids = [p["id"] for p in (prod_report.get("probes") or []) if p.get("status") == "FAIL"]
+                findings.append({
+                    "class": "D11",
+                    "code": "PRODUCTION_PATH_MISMATCH",
+                    "severity": "DENY",
+                    "failedProbes": failed_ids,
+                    "detail": (
+                        f"Reply claimed deployment readiness ({phrase!r}), "
+                        f"but production-path verification FAILED on probe(s): {', '.join(failed_ids) or 'unknown'}."
+                    ),
+                })
+            elif p_status != "PASS":
+                unk_ids = [p["id"] for p in (prod_report.get("probes") or []) if p.get("status") == "UNKNOWN"]
+                findings.append({
+                    "class": "D11",
+                    "code": "INCOMPLETE_DEPLOYMENT_VERIFICATION",
+                    "severity": "DENY",
+                    "unknownProbes": unk_ids,
+                    "detail": (
+                        f"Reply claimed deployment readiness ({phrase!r}), "
+                        f"but production-path status is {p_status} (unverified probe(s): {', '.join(unk_ids) or 'none'}). "
+                        "Missing evidence is UNKNOWN, never PASS."
+                    ),
+                })
 
     has_blocking = any(f.get("severity") in ("DENY", "LOCK") for f in findings)
     decision = "block" if (has_blocking and eff_mode == "strict") else ("warn" if findings else "allow")

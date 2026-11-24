@@ -29,7 +29,7 @@ from .drift import (
 )
 from .outcomes import infer_exit_code, is_test_file, is_verifier_command, parse_verifier_output, sha256_text
 from .resolver import mutate_probe, undo_turn, verify_clean
-from .verifier import build_truth_receipt, verify_reply
+from .verifier import build_truth_receipt, verify_production_path, verify_reply
 
 __all__ = [
     "build_truth_receipt",
@@ -59,5 +59,6 @@ __all__ = [
     "start_turn_baseline",
     "undo_turn",
     "verify_clean",
+    "verify_production_path",
     "verify_reply",
 ]
