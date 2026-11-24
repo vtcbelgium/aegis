@@ -101,6 +101,60 @@ class AegisAppState:
             )
         return load_policy_file()
 
+    def set_workspace(self, path: str) -> Dict[str, Any]:
+        cleaned = (path or "").strip()
+        if not cleaned or not os.path.isdir(cleaned):
+            raise ValueError(f"Directory does not exist: {cleaned or '(empty)'}")
+        abs_dir = os.path.abspath(cleaned)
+        pol = build_policy_from_sources(abs_dir)
+        with self._lock:
+            prev_level = self.gate.current_level
+            self.base_dir = abs_dir
+            self.policy = pol
+            self.gate = AegisGate(
+                base_dir=self.base_dir,
+                owner_secret=self.owner_secret,
+                policy=self.policy,
+                ledger=self.ledger,
+            )
+            # Monotonic invariant: changing workspace can never clear an active LOCK/DENY
+            if prev_level > self.gate.current_level:
+                self.gate.current_level = prev_level
+            self.harness = AegisHarness(gate=self.gate, base_dir=self.base_dir)
+        return {"ok": True, "baseDir": self.base_dir}
+
+    def build_diagnostics(self) -> Dict[str, Any]:
+        from .detective import load_detective_config
+
+        doc = run_doctor()
+        v = self.ledger.verify()
+        tk = tekton_bridge.get_tekton_status(include_relay=False)
+        tk_doc = tk.get("doctor") if isinstance(tk.get("doctor"), dict) else None
+        return {
+            "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "version": __version__,
+            "baseDir": self.base_dir,
+            "gate": self.gate.snapshot(),
+            "policyPath": default_policy_path(),
+            "ledgerPath": default_ledger_path(),
+            "ledger": {
+                "ok": v.ok,
+                "count": v.count,
+                "problem": v.problem,
+                "tip": v.tip,
+            },
+            "detective": load_detective_config(),
+            "sandbox": doc.get("sandbox"),
+            "tripwires": doc.get("tripwires"),
+            "tekton": {
+                "installed": tk.get("installed", False),
+                "version": tk_doc.get("version") if tk_doc else None,
+                "aegisGateVersion": tk_doc.get("aegis_gate_version") if tk_doc else None,
+                "policyFloor": tk_doc.get("policy_floor") if tk_doc else None,
+                "nodeId": tk_doc.get("node_id") if tk_doc else None,
+            },
+        }
+
     def evaluate_live(self, tool: str, arguments: Any) -> Dict[str, Any]:
         verdict = self.harness.evaluate_tool_call(tool, arguments)
         out = verdict.to_dict()
@@ -344,6 +398,28 @@ def _build_handler(state: AegisAppState, port: int):
                 self._send_json(200, tekton_bridge.get_tekton_status(include_relay=include_relay))
                 return
 
+            if path == "/api/diagnostics":
+                self._send_json(200, state.build_diagnostics())
+                return
+
+            if path == "/api/ledger/export":
+                entries = list(reversed(state.ledger.tail(200)))
+                v = state.ledger.verify()
+                body = json.dumps({
+                    "exportedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "version": __version__,
+                    "verify": {"ok": v.ok, "count": v.count, "problem": v.problem, "tip": v.tip},
+                    "entries": entries,
+                }, indent=2, default=str).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="aegis-decision-diary.json"')
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             self._send_json(404, {"error": "Not found"})
 
         def do_POST(self) -> None:
@@ -580,6 +656,19 @@ def _build_handler(state: AegisAppState, port: int):
             if path == "/api/tekton/unlock":
                 res = tekton_bridge.unlock_tekton_session()
                 self._send_json(200 if res.get("ok") else 400, res)
+                return
+
+            if path == "/api/workspace":
+                try:
+                    res = state.set_workspace(str(payload.get("path") or ""))
+                    self._send_json(200, res)
+                except ValueError as exc:
+                    self._send_json(400, {"error": str(exc)})
+                return
+
+            if path == "/api/shutdown":
+                self._send_json(200, {"ok": True, "message": "Aegis Control Center stopping cleanly."})
+                threading.Timer(0.15, self.server.shutdown).start()
                 return
 
             self._send_json(404, {"error": "Not found"})

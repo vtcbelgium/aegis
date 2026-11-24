@@ -116,15 +116,40 @@ def test_server_tekton_endpoints_and_ui_presence(monkeypatch, tmp_path: Path):
         assert 'data-view="tekton"' in html
         assert "Tekton integration" in html
         assert "Open Tekton GUI" in html
+        assert 'data-view="help"' in html
+        assert "Help and quick manual" in html
+        assert "Stop server" in html
 
         code, body = _http_json(base + "/api/tekton")
         assert code == 200
         assert body["installed"] is True
         assert body["doctor"]["version"] == "1.5.0"
 
-        # Mutating endpoint requires valid X-Aegis-Token
+        code_diag, diag = _http_json(base + "/api/diagnostics")
+        assert code_diag == 200
+        assert diag["baseDir"] == str(tmp_path)
+        assert "owner_secret" not in json.dumps(diag)
+
+        code_exp, exp = _http_json(base + "/api/ledger/export")
+        assert code_exp == 200
+        assert "verify" in exp and "entries" in exp
+
+        # Mutating endpoints require valid X-Aegis-Token
         code_unauth, _ = _http_json(base + "/api/tekton/launch-gui", method="POST", body={})
         assert code_unauth == 403
+        code_ws_unauth, _ = _http_json(base + "/api/workspace", method="POST", body={"path": str(tmp_path)})
+        assert code_ws_unauth == 403
+        code_sd_unauth, _ = _http_json(base + "/api/shutdown", method="POST", body={})
+        assert code_sd_unauth == 403
+
+        sub_ws = tmp_path / "other-project"
+        sub_ws.mkdir()
+        code_ws, ws_res = _http_json(base + "/api/workspace", method="POST", body={"path": str(sub_ws)}, token=state.owner_secret)
+        assert code_ws == 200
+        assert ws_res["baseDir"] == str(sub_ws)
+
+        code_bad_ws, _ = _http_json(base + "/api/workspace", method="POST", body={"path": str(tmp_path / "missing")}, token=state.owner_secret)
+        assert code_bad_ws == 400
 
         code_auth, res = _http_json(base + "/api/tekton/launch-gui", method="POST", body={}, token=state.owner_secret)
         assert code_auth == 200
