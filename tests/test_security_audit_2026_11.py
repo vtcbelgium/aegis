@@ -116,12 +116,17 @@ def test_a6_powershell_dot_source_scriptblock_is_analyzed(tmp_path, command, min
     assert v.level >= minimum, (command, v.level.name, v.reasons)
 
 
-@pytest.mark.parametrize("command", ["rg TODO src", "watch -n 2 ls", "busybox ls", "less notes.txt"])
-def test_benign_wrapper_use_still_passes(tmp_path, command):
+@pytest.mark.parametrize("command,expected", [
+    ("rg TODO src", L.PASS),
+    ("watch -n 2 ls", L.ASK),
+    ("busybox ls", L.ASK),
+    ("less notes.txt", L.ASK),
+])
+def test_benign_wrapper_use_still_passes(tmp_path, command, expected):
     (tmp_path / "src").mkdir()
     (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
     v = analyze_command(command, base_dir=str(tmp_path), cwd=str(tmp_path))
-    assert v.level < L.ASK, (command, v.level.name, v.reasons)
+    assert v.level == expected, (command, v.level.name, v.reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -439,13 +444,14 @@ def test_r4_c1_python_module_checks_windows_paths_and_json_tool_write(tmp_path):
     )
     assert v_escape.level >= L.DENY, (v_escape.level.name, v_escape.reasons)
 
-    # 3. Benign in-workspace isolated json.tool still passes
+    # 3. Under No-Shell PASS, python -m json.tool routes to ASK (not DENY/LOCK); python --version passes
     (ws / "x.json").write_text("{}", encoding="utf-8")
     v_ok = analyze_command(
         "python -I -m json.tool x.json",
         base_dir=str(ws), cwd=str(ws), policy=AegisPolicy(project_exec="ask"), windows=True,
     )
-    assert v_ok.level == L.PASS, (v_ok.level.name, v_ok.reasons)
+    assert v_ok.level == L.ASK, (v_ok.level.name, v_ok.reasons)
+    assert analyze_command("python --version", base_dir=str(ws), cwd=str(ws), windows=True).level == L.PASS
 
 
 def test_r4_c2_attached_output_flags_and_positional_outputs_checked_as_write(tmp_path):
@@ -501,10 +507,11 @@ def test_r4_c2_attached_output_flags_and_positional_outputs_checked_as_write(tmp
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_ws)
         assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
 
-    # Benign read-only tool usage still passes (including sort -t/ field separator)
+    # Under No-Shell PASS, sort/uniq/tree route to ASK (not DENY/LOCK) while strict read-only ls/cat pass
     for cmd in ("sort -u data.txt", "sort -t/ -k2 data.txt", "uniq -c data.txt", "tree -L 2 ."):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_ws)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
+    assert analyze_command("ls -la", base_dir=str(ws), cwd=str(ws), policy=pol_ws).level == L.PASS
 
 
 def test_r4_h1_python_module_cwd_shadowing_and_plugin_linters_require_ask(tmp_path):
@@ -545,7 +552,7 @@ def test_r4_h1_python_module_cwd_shadowing_and_plugin_linters_require_ask(tmp_pa
         v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol)
         assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
 
-    # Isolated (-I) or safe-path (-P) safe stdlib inspection still passes cleanly
+    # Under No-Shell PASS, isolated stdlib -m calls route to ASK (< DENY) while version checks pass
     for cmd in (
         "python -I -m platform",
         "python -P -m platform",
@@ -554,7 +561,8 @@ def test_r4_h1_python_module_cwd_shadowing_and_plugin_linters_require_ask(tmp_pa
         "python -Im platform",
     ):
         v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
+    assert analyze_command("python --version", base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol).level == L.PASS
 
 
 
@@ -591,11 +599,11 @@ def test_r5_h1_abbreviated_long_output_options_checked_as_write(tmp_path):
     v = analyze_command(f"sort x.json --bogus='{cfg_posix}'", base_dir=str(ws), cwd=str(ws), policy=pol_shared)
     assert v.level == L.LOCK, (v.level.name, v.reasons)
 
-    # Benign abbreviations still pass
+    # Under No-Shell PASS, sort routes to ASK (< DENY) while strict read-only cat passes
     pol_ws = AegisPolicy()
     for cmd in ("sort --uniq data.txt", "sort --rev data.txt", "sort --field-sep=, -k2 data.txt"):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_ws)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
 
 
 def test_r5_h2_abbreviated_exec_options_require_ask(tmp_path):
@@ -629,9 +637,9 @@ def test_r5_h3_cmd_set_of_sensitive_env_vars_requires_ask(tmp_path):
     for cmd in ("set AEGIS_MODE=off", "set TEKTON_AEGIS_MODE=off"):
         v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol, windows=True)
         assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
-    # Harmless cmd set still passes
+    # Under No-Shell PASS, cmd set routes to ASK (< DENY) instead of PASS
     v = analyze_command("set FOO=bar", base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol, windows=True)
-    assert v.level == L.PASS, (v.level.name, v.reasons)
+    assert v.level == L.ASK, (v.level.name, v.reasons)
 
 
 def test_r5_c1_json_tool_stdin_dash_preserves_write_position(tmp_path):
@@ -664,12 +672,12 @@ def test_r5_c1_json_tool_stdin_dash_preserves_write_position(tmp_path):
         )
         assert v.level >= L.ASK, (autoexec, v.level.name, v.reasons)
 
-    # Reading from stdin only (no output file) still passes under -I
+    # Under No-Shell PASS, stdin json.tool routes to ASK (< DENY)
     v_ok = analyze_command(
         "python -I -m json.tool -",
         base_dir=str(ws), cwd=str(ws), policy=AegisPolicy(project_exec="ask"), windows=True,
     )
-    assert v_ok.level == L.PASS, (v_ok.level.name, v_ok.reasons)
+    assert v_ok.level == L.ASK, (v_ok.level.name, v_ok.reasons)
 
 
 def test_r5_c2_sed_attached_write_and_script_files(tmp_path):
@@ -702,10 +710,10 @@ def test_r5_c2_sed_attached_write_and_script_files(tmp_path):
     v_lock = analyze_command(f"sed -n 'w{cfg_posix}' in.txt", base_dir=str(ws), cwd=str(ws), policy=pol_shared)
     assert v_lock.level == L.LOCK, (v_lock.level.name, v_lock.reasons)
 
-    # Benign sed/awk usage still passes
+    # Under No-Shell PASS, sed/awk route to ASK (< DENY)
     for cmd in ("sed -n '1,10p' src/app.py", "sed -i 's/foo/bar/g' src/app.py", "awk '{print $1}' data.txt"):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
 
 
 def test_r5_c2_tar_clustered_create_flags_checked_as_write(tmp_path):
@@ -743,10 +751,10 @@ def test_r5_c2_tar_clustered_create_flags_checked_as_write(tmp_path):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared)
         assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
 
-    # Benign tar create/extract inside workspace still passes
+    # Under No-Shell PASS, tar routes to ASK (< DENY)
     for cmd in ("tar -xzf archive.tar.gz", "tar czf backup.tgz src/", "tar -cf out.tar in.txt"):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
 
 
 def test_r6_h2_h3_fail_closed_sed_awk_and_tar_allowlists(tmp_path):
@@ -793,7 +801,7 @@ def test_r6_h2_h3_fail_closed_sed_awk_and_tar_allowlists(tmp_path):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
         assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
 
-    # Benign sed/awk/tar usage still passes cleanly
+    # Under No-Shell PASS, sed/awk/tar route to ASK (< DENY)
     for cmd in (
         "sed -n '1,10p' src/app.py",
         r"sed -i 's/a\/b/c/g' src/app.py",
@@ -804,7 +812,7 @@ def test_r6_h2_h3_fail_closed_sed_awk_and_tar_allowlists(tmp_path):
         "tar -cf out.tar in.txt",
     ):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
 
 
 def test_r7_env_flags_awk_allowlist_and_tar_oldstyle_and_git_extract(tmp_path):
@@ -852,7 +860,7 @@ def test_r7_env_flags_awk_allowlist_and_tar_oldstyle_and_git_extract(tmp_path):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
         assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
 
-    # Benign env / awk / tar still pass
+    # Under No-Shell PASS, env/awk/tar route to ASK (< DENY)
     for cmd in (
         "env FOO=bar sort -u data.txt",
         "awk -F, '{print $1, $2}' data.csv",
@@ -860,7 +868,7 @@ def test_r7_env_flags_awk_allowlist_and_tar_oldstyle_and_git_extract(tmp_path):
         "tar -xzf archive.tar.gz",
     ):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
 
 
 def test_r8_env_clusters_git_env_awk_argv_and_tar_globs(tmp_path):
@@ -922,7 +930,7 @@ def test_r8_env_clusters_git_env_awk_argv_and_tar_globs(tmp_path):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
         assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
 
-    # Benign env/cd/tar/awk still pass
+    # Under No-Shell PASS, env/export/cd&&ls/tar route to ASK (< DENY) while direct ls src passes
     for cmd in (
         "env NODE_ENV=production sort -u data.txt",
         "export NODE_ENV=production",
@@ -930,7 +938,8 @@ def test_r8_env_clusters_git_env_awk_argv_and_tar_globs(tmp_path):
         "tar -xzf archive.tar.gz",
     ):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
+    assert analyze_command("ls src", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.PASS
 
 
 def test_r9_brace_expansion_unzip_7z_and_symlink_globs(tmp_path):
@@ -975,10 +984,10 @@ def test_r9_brace_expansion_unzip_7z_and_symlink_globs(tmp_path):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
         assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
 
-    # Benign brace expansion & unzip still pass
+    # Under No-Shell PASS, braces and archive extractors require ASK (< DENY)
     for cmd in ("cp {a,b}.txt dir/", "unzip pkg.zip -d vendor/", "7z x pkg.7z -ovendor"):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
 
 
 def test_r10_nested_posix_bash_under_windows_shell_expands_braces(tmp_path):
@@ -1063,15 +1072,17 @@ def test_r11_h1_glob_sensitive_dirs_and_hard_boundaries(tmp_path):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared, windows=win)
         assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
 
-    # Disk glob expansion: cat *.json passes with only package.json, asks once credentials.json exists
+    # Under No-Shell PASS, globs in paths require ASK; literal workspace read passes
     (ws / "package.json").write_text("{}", encoding="utf-8")
-    assert analyze_command("cat *.json", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.PASS
+    assert analyze_command("cat package.json", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.PASS
+    assert analyze_command("cat *.json", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.ASK
     (ws / "credentials.json").write_text("{}", encoding="utf-8")
     assert analyze_command("cat *.json", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.ASK
 
     (ws / ".git").mkdir()
     (ws / ".git" / "config").write_text("[core]\n", encoding="utf-8")
-    assert analyze_command("cat */config", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.PASS
+    assert analyze_command("cat */config", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.ASK
+    assert analyze_command("cat .git/config", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.ASK
     assert analyze_command("echo x > */config", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.ASK
 
 
@@ -1151,7 +1162,7 @@ def test_r11_windows_links_python_formatters_and_benign_nonregression(tmp_path):
     ):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol, windows=True)
         assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
-    assert analyze_command("New-Item -ItemType File -Path notes.txt", base_dir=str(ws), cwd=str(ws), policy=pol, windows=True).level == L.PASS
+    assert analyze_command("New-Item -ItemType File -Path notes.txt", base_dir=str(ws), cwd=str(ws), policy=pol, windows=True).level == L.ASK
 
     # Python -I -m mutating formatters (black/isort/ruff) check writes
     for cmd in (
@@ -1177,14 +1188,13 @@ def test_r11_windows_links_python_formatters_and_benign_nonregression(tmp_path):
         "python -I -m ruff check conftest.py",
     ):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol, windows=True)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
 
-    # cd / env --chdir into sensitive control dirs must ASK, benign dirs PASS
+    # cd / env --chdir / control dirs require ASK; direct workspace reads PASS cleanly
     assert analyze_command("cd .git && ls", base_dir=str(ws), cwd=str(ws), policy=pol).level >= L.ASK
     assert analyze_command("env --chdir=.git ls", base_dir=str(ws), cwd=str(ws), policy=pol).level >= L.ASK
-    assert analyze_command("cd src && ls", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.PASS
+    assert analyze_command("cd src && ls", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.ASK
 
-    # Benign non-regression checks must all PASS
     for cmd in (
         "cp {a,b}.txt dir/",
         "mkdir -p src/{a,b,c}",
@@ -1195,13 +1205,17 @@ def test_r11_windows_links_python_formatters_and_benign_nonregression(tmp_path):
         "jq '{a: .x, b: .y}' data.json",
         "chmod +x scripts/*.sh",
         "gzip logs/*.log",
-        "cat .env.example",
         "cat .git/config",
         "cat .gi?/config",
         "find . -name '*.txt' -exec echo {} ';'",
     ):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
-        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
+
+    (ws / "src").mkdir(exist_ok=True)
+    for cmd in ("cat .env.example", "rg TODO src", "ls -la", "git status"):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.PASS and v.metadata.get("direct_exec") is True, (cmd, v.level.name, v.reasons)
 
 
 

@@ -196,7 +196,8 @@ class AegisHarness:
         return role
 
     def _check(self, tool_name: str, key_path: str, val: str, role: str, windows: bool = False,
-               effects: Optional[set] = None, cmd_cwd: Optional[str] = None) -> Optional[Verdict]:
+               effects: Optional[set] = None, cmd_cwd: Optional[str] = None,
+               direct_meta: Optional[dict] = None) -> Optional[Verdict]:
         """Return a non-PASS verdict for one string argument, or None if it is fine.
 
         Any session effects (read_private, fetch, egress) are added to the ``effects`` set
@@ -214,8 +215,18 @@ class AegisHarness:
         if role == CONFIG:
             worse(Verdict(DecisionLevel.ASK, [f"{tool_name} changes connector/device configuration ({key_path})"], "AegisHarness"))
         elif role == COMMAND:
-            worse(TartarusClan.inspect_command(val, base_dir=self.base_dir, cwd=cmd_cwd or self.cwd,
-                                              policy=self.policy, windows=windows))
+            v_cmd = TartarusClan.inspect_command(val, base_dir=self.base_dir, cwd=cmd_cwd or self.cwd,
+                                                 policy=self.policy, windows=windows)
+            if direct_meta is not None:
+                direct_meta["_cmd_count"] = direct_meta.get("_cmd_count", 0) + 1
+                if v_cmd.passed and v_cmd.metadata and v_cmd.metadata.get("direct_exec"):
+                    direct_meta.update({
+                        "direct_exec": True,
+                        "direct_binary": v_cmd.metadata.get("direct_binary"),
+                        "direct_argv": list(v_cmd.metadata.get("direct_argv") or ()),
+                        "needs_workspace": bool(v_cmd.metadata.get("needs_workspace", True)),
+                    })
+            worse(v_cmd)
         elif role == SQL:
             worse(TartarusClan.inspect_sql(val))
         elif role == URL or (role not in (CONTENT, CONFIG) and looks_like_url(val)):
@@ -343,6 +354,7 @@ class AegisHarness:
             sensitive_target: Optional[str] = None
             destructive = []
             impact = []
+            direct_meta: dict = {}
             for key_path, val in walk_arguments(arguments):
                 # Canary token in any argument (a decoy the agent is trying to use) -> LOCK.
                 if minotaur is not None and isinstance(val, str):
@@ -350,7 +362,8 @@ class AegisHarness:
                     if trip is not None:
                         return self.gate.record(trip)
                 role = self._role(tool_name, key_path)
-                v = self._check(tool_name, key_path, val, role, windows=windows, effects=effects, cmd_cwd=cmd_cwd)
+                v = self._check(tool_name, key_path, val, role, windows=windows, effects=effects,
+                                cmd_cwd=cmd_cwd, direct_meta=direct_meta)
                 if v is not None:
                     destructive.extend(v.metadata.get("destructive") or [])
                     impact.extend(v.metadata.get("impact") or [])
@@ -378,7 +391,10 @@ class AegisHarness:
                 return self.gate.record(worst)
 
             # All clans passed -> Zero authority added
-            return self.gate.record(Verdict(DecisionLevel.PASS, ["Tool call verified safe"], "AegisHarness"))
+            pass_meta = {}
+            if direct_meta.get("_cmd_count") == 1 and direct_meta.get("direct_exec"):
+                pass_meta = {k: v for k, v in direct_meta.items() if k != "_cmd_count"}
+            return self.gate.record(Verdict(DecisionLevel.PASS, ["Tool call verified safe"], "AegisHarness", metadata=pass_meta))
 
         except Exception as exc:
             # Fail closed on any malformed input or unhandled exception

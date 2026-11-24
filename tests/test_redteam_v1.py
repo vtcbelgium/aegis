@@ -32,6 +32,12 @@ def cmd(c, ws, windows=False, policy=None):
                            windows=windows)
 
 
+NORMAL_DIRECT_PASS = [
+    "git status", "git log --oneline -20", "git branch --show-current", "git rev-parse --short HEAD",
+    "ls -la", "cat src/app.py", "head -n 50 README.md", "rg TODO src",
+    "hostname", "whoami", "uname -srm", "lscpu", "ipconfig", "netstat -an", "python --version", "node --version",
+]
+
 NORMAL_WORK = [
     "git status", "git add -A", "git commit -m 'feat: x'", "git pull", "git push origin main",
     "git log --oneline -20", "git diff HEAD~1", "git checkout -b feature", "git stash", "git stash pop",
@@ -67,10 +73,16 @@ ADVERSARIAL = [
 ]
 
 
-@pytest.mark.parametrize("c", NORMAL_WORK)
-def test_normal_work_is_never_blocked(c, ws):
+@pytest.mark.parametrize("c", NORMAL_DIRECT_PASS)
+def test_direct_readonly_work_passes(c, ws):
     v = cmd(c, ws)
-    assert v.level < L.ASK, f"false positive: {c!r} -> {v.level.name}: {v.reasons}"
+    assert v.level == L.PASS and v.metadata.get("direct_exec"), f"false positive: {c!r} -> {v.level.name}: {v.reasons}"
+
+
+@pytest.mark.parametrize("c", NORMAL_WORK)
+def test_normal_work_is_never_blocked_to_deny(c, ws):
+    v = cmd(c, ws)
+    assert v.level < L.DENY, f"unexpected DENY/LOCK: {c!r} -> {v.level.name}: {v.reasons}"
 
 
 @pytest.mark.parametrize("c", ADVERSARIAL)

@@ -10,7 +10,7 @@ from .mcp_proxy import AegisMcpProxy
 from .clans import LabyrinthClan, TartarusClan, CustodyClan, HecatoncheiresClan, MinotaurClan, Tripwires
 from .ledger import DecisionLedger
 
-__version__ = "2.0.11"
+__version__ = "2.1.0"
 __all__ = [
     "AegisGate",
     "DecisionLevel",

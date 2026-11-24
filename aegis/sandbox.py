@@ -41,6 +41,12 @@ class SandboxUnavailable(RuntimeError):
     """bwrap cannot confine on this host; the caller must decide what to do."""
 
 
+_SKIP_WALK_DIRS = frozenset({
+    "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next",
+})
+_SKIP_GIT_WALK_DIRS = frozenset({"objects", "logs", "refs"})
+
+
 @dataclass
 class SandboxProfile:
     workspace: str
@@ -48,15 +54,27 @@ class SandboxProfile:
     network: bool = False
     allow_home_read: bool = False
     tmp_writable: bool = True
+    readonly_workspace: bool = False
+    empty_workspace: bool = False
     hide: List[str] = field(default_factory=lambda: list(HIDE_HOME_SUBPATHS))
     protected_paths: List[str] = field(default_factory=list)
     backup_paths: List[str] = field(default_factory=list)
 
     @classmethod
-    def from_policy(cls, policy, workspace: str, network: bool = False) -> "SandboxProfile":
+    def from_policy(
+        cls,
+        policy,
+        workspace: str,
+        network: bool = False,
+        *,
+        readonly_workspace: bool = False,
+        empty_workspace: bool = False,
+    ) -> "SandboxProfile":
         roots = [r for r in (getattr(policy, "extra_roots", None) or []) if r]
         return cls(workspace=os.path.abspath(workspace), extra_roots=[os.path.abspath(r) for r in roots],
                    network=network,
+                   readonly_workspace=readonly_workspace,
+                   empty_workspace=empty_workspace,
                    protected_paths=list(getattr(policy, "protected_paths", []) or [])
                        + list(getattr(policy, "secret_paths", []) or [])
                        + list(getattr(policy, "log_paths", []) or []),
@@ -117,9 +135,6 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
     bw = bwrap_path()
     if not available() or not bw:
         raise SandboxUnavailable("bubblewrap unavailable (needs Linux, bwrap and user namespaces)")
-    ws = os.path.realpath(profile.workspace)
-    if not os.path.isdir(ws):
-        raise SandboxUnavailable(f"workspace does not exist: {ws}")
 
     argv: List[str] = [bw, "--die-with-parent", "--new-session",
                        "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup"]
@@ -136,7 +151,21 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
         if profile.network and os.path.exists(extra):
             argv += ["--ro-bind", extra, extra]
 
-    # Writable workspace and declared extra roots.
+    if profile.empty_workspace:
+        argv += ["--chdir", "/tmp", "--clearenv",
+                 "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                 "--setenv", "HOME", "/tmp", "--setenv", "TMPDIR", "/tmp",
+                 "--setenv", "LANG", os.environ.get("LANG", "C.UTF-8"),
+                 "--setenv", "AEGIS_SANDBOXED", "1"]
+        argv += ["--"] + _as_command(command, shell)
+        return argv
+
+    ws = os.path.realpath(profile.workspace)
+    if not os.path.isdir(ws):
+        raise SandboxUnavailable(f"workspace does not exist: {ws}")
+
+    # Workspace and declared extra roots (read-only when readonly_workspace=True, else writable).
+    ws_bind_flag = "--ro-bind" if profile.readonly_workspace else "--bind"
     seen = set()
     for root in sorted([ws] + [os.path.realpath(r) for r in profile.extra_roots], key=len):
         if root in (os.path.abspath(os.sep),) or root in SYSTEM_RO or root in ("/proc", "/dev", "/sys", "/tmp"):
@@ -144,10 +173,10 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
         if not os.path.isdir(root):
             raise SandboxUnavailable(f"allowed root does not exist: {root}")
         if root not in seen:
-            argv += ["--bind", root, root]
+            argv += [ws_bind_flag, root, root]
             seen.add(root)
 
-    # Hide credential stores / Aegis state even when they sit under an allowed root.
+    # Hide credential stores / Aegis state and lock autoexec paths read-only inside allowed roots.
     home = os.path.realpath(os.path.expanduser("~"))
     from .boundaries import aegis_home, is_backup_path, package_dir
     from .policy import classify_sensitive
@@ -159,35 +188,51 @@ def build_argv(profile: SandboxProfile, command: List[str], *, shell: Optional[s
     hidden.update([os.path.realpath(aegis_home()), package_dir()])
     hidden.update(os.path.realpath(p) for p in profile.protected_paths)
     readonly = {os.path.realpath(p) for p in profile.backup_paths}
-    # Protect secrets and backups inside writable projects as well as in the host home.
+
     scanned = 0
     entries = 0
+
     def scan_error(exc):
+        fname = str(getattr(exc, "filename", "") or "").rstrip(os.sep)
+        if os.path.basename(fname) == "lost+found":
+            hidden.add(os.path.realpath(fname))
+            return
         raise SandboxUnavailable("allowed root could not be inspected safely") from exc
+
     for root in seen:
         for directory, dirs, files in os.walk(root, followlinks=False, onerror=scan_error):
+            if os.path.basename(directory) == ".git":
+                dirs[:] = [d for d in dirs if d not in _SKIP_GIT_WALK_DIRS]
+            else:
+                dirs[:] = [d for d in dirs if d not in _SKIP_WALK_DIRS]
             scanned += 1
             entries += len(dirs) + len(files)
             if scanned > 20000 or entries > 200000:
                 raise SandboxUnavailable("allowed roots too large to inspect safely")
             for name in dirs[:] + files:
                 target = os.path.join(directory, name)
-                if classify_sensitive(target) in ("critical", "secret", "startup", "autoexec"):
+                sens = classify_sensitive(target)
+                if sens in ("critical", "secret", "startup"):
                     hidden.add(target)
-                elif not any(target == p or target.startswith(p.rstrip(os.sep) + os.sep)
-                             for p in readonly) and is_backup_path(target):
+                elif sens == "autoexec" or (
+                    not any(target == p or target.startswith(p.rstrip(os.sep) + os.sep) for p in readonly)
+                    and is_backup_path(target)
+                ):
                     readonly.add(target)
-                # Backups are immutable, but still need scanning for secrets inside.
                 # Hidden trees need no traversal because their entire contents are masked.
                 if target in hidden:
                     if name in dirs:
                         dirs.remove(name)
+
     def exposed(target):
         return any(target == r or target.startswith(r.rstrip(os.sep) + os.sep) for r in seen)
+
     for target in sorted(readonly, key=len):
-        if exposed(target) and os.path.exists(target):
+        if exposed(target) and os.path.lexists(target):
+            if any(target == h or target.startswith(h.rstrip(os.sep) + os.sep) for h in hidden):
+                continue
             if os.path.islink(target):
-                raise SandboxUnavailable(f"backup path is a symlink: {target}")
+                raise SandboxUnavailable(f"backup or autoexec path is a symlink: {target}")
             argv += ["--ro-bind", target, target]
     masked = []
     for target in sorted(hidden, key=len):
@@ -236,6 +281,17 @@ def run(profile: SandboxProfile, command, *, shell: Optional[str] = None, timeou
 
 
 def wrap_for_policy(policy, workspace: str, command, *, network: bool = False,
-                    shell: Optional[str] = None) -> List[str]:
+                    shell: Optional[str] = None, readonly_workspace: bool = False,
+                    empty_workspace: bool = False) -> List[str]:
     """Convenience: build the confined argv straight from an AegisPolicy."""
-    return build_argv(SandboxProfile.from_policy(policy, workspace, network=network), command, shell=shell)
+    return build_argv(
+        SandboxProfile.from_policy(
+            policy,
+            workspace,
+            network=network,
+            readonly_workspace=readonly_workspace,
+            empty_workspace=empty_workspace,
+        ),
+        command,
+        shell=shell,
+    )

@@ -15,9 +15,10 @@ class TestHarness(unittest.TestCase):
     def test_safe_tool_call_passes(self):
         v = self.harness.evaluate_tool_call(
             "run_command",
-            {"command": "pytest tests/"}
+            {"command": "git status"},
         )
         self.assertTrue(v.passed)
+        self.assertTrue(v.metadata.get("direct_exec"))
         self.assertEqual(self.gate.current_level, DecisionLevel.PASS)
 
     def test_ssrf_tool_call_locked(self):

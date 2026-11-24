@@ -182,9 +182,11 @@ class TestClaudeAuditFalsePositives(unittest.TestCase):
         self.assertTrue(v2.passed, f"sample_app.py blocked: {v2.reasons}")
 
     def test_false_positive_python_graceful_shutdown(self):
-        """python graceful_shutdown.py must PASS inspection."""
+        """python graceful_shutdown.py is not destructive/LOCK (routed cleanly to owner ASK under no-shell PASS)."""
         verdict = TartarusClan.inspect_command("python graceful_shutdown.py")
-        self.assertTrue(verdict.passed, f"graceful_shutdown.py blocked: {verdict.reasons}")
+        self.assertEqual(verdict.level, DecisionLevel.ASK)
+        v_ver = TartarusClan.inspect_command("python --version")
+        self.assertTrue(v_ver.passed, f"python --version blocked: {v_ver.reasons}")
 
     def test_false_positive_rm_rf_inside_workspace(self):
         """rm -rf /tmp/build confined within base_dir must NOT trigger LOCK."""

@@ -152,21 +152,30 @@ class TestRound3And4(unittest.TestCase):
                   'cmd /c "rd /s /q C:\\Users"', "chmod -R 777 /", "export T=/etc; rm -rf $T"]:
             self.assertEqual(self.cmd(c).level, L.LOCK, c)
 
-    def test_normal_work_corpus_passes(self):
+    def test_normal_work_corpus_never_false_blocks(self):
+        # Direct read-only subset must PASS with direct_exec=True
+        for c in ("ls -la", "pwd", "cat README.md", "head -n 20 src/app.py", "tail -n 50 logs/app.log",
+                  "rg foo .", "git status", "git diff", "git log --oneline -5", "git rev-parse --short HEAD",
+                  "node --version", "whoami", "diff -u a.txt b.txt"):
+            v = self.cmd(c)
+            self.assertEqual(v.level, L.PASS, f"direct PASS regression: {c!r} -> {v.level.name}: {v.reasons}")
+        # Shell/mutating commands under strict No-Shell PASS require ASK (never auto-PASS and never DENY/LOCK)
         for c in NORMAL:
             v = self.cmd(c)
-            self.assertTrue(v.passed, f"false positive: {c!r} -> {v.level.name}: {v.reasons}")
+            self.assertLess(v.level, L.DENY, f"unexpected DENY/LOCK: {c!r} -> {v.level.name}: {v.reasons}")
 
     def test_by_design_asks(self):
         for c in BY_DESIGN_ASK:
             self.assertEqual(self.cmd(c).level, L.ASK, c)
 
     def test_project_exec_policy(self):
-        strict = AegisGate(base_dir=self.tmpdir, policy=AegisPolicy(project_exec="ask"))
         for c in ["bash -c 'python3 tool.py'", "pwsh -File wipe.ps1", "python3 cleanup.py", "npm test"]:
-            self.assertEqual(self.cmd(c).level, L.PASS, c)
-            self.assertEqual(self.cmd(c, gate=AegisGate(base_dir=self.tmpdir, policy=AegisPolicy(project_exec="ask"))).level, L.ASK, c)
-        self.assertIsNotNone(strict)
+            self.assertEqual(self.cmd(c).level, L.ASK, c)
+            self.assertEqual(
+                self.cmd(c, gate=AegisGate(base_dir=self.tmpdir, policy=AegisPolicy(project_exec="ask"))).level,
+                L.ASK,
+                c,
+            )
 
     def test_windows_paths_on_posix_host(self):
         self.assertEqual(self.cmd("Remove-Item -Recurse -Force C:\\Users\\me\\Documents").level, L.DENY)

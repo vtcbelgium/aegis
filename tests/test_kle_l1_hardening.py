@@ -46,9 +46,9 @@ class TestKleL1AndDojoHardening(unittest.TestCase):
         self.assertEqual(TartarusClan.inspect_command("cat $'/etc/\\x70\\x61\\x73\\x73\\x77\\x64'", base_dir=self.ws).level, L.LOCK)
         # Decoded NUL byte in ANSI-C string locks immediately
         self.assertEqual(TartarusClan.inspect_command("cat $'safe.txt\\x00.sh'", base_dir=self.ws).level, L.LOCK)
-        # Benign ANSI-C string passed to echo remains PASS
-        self.assertEqual(TartarusClan.inspect_command("echo $'hello\\nworld'", base_dir=self.ws).level, L.PASS)
-        self.assertEqual(TartarusClan.inspect_command("echo $'it\\'s ok'", base_dir=self.ws, windows=True).level, L.PASS)
+        # Shell ANSI-C quotes require owner approval under no-shell PASS; literal echo passes
+        self.assertEqual(TartarusClan.inspect_command("echo $'hello\\nworld'", base_dir=self.ws).level, L.ASK)
+        self.assertEqual(TartarusClan.inspect_command("echo hello world", base_dir=self.ws).level, L.PASS)
 
     def test_cmd_caret_evasions_and_false_positive_safety(self):
         self.assertEqual(TartarusClan.inspect_command("cmd /c d^e^l /f /s /q C:\\*", base_dir=self.ws).level, L.LOCK)
@@ -58,8 +58,9 @@ class TestKleL1AndDojoHardening(unittest.TestCase):
             TartarusClan.inspect_command("cmd /c t^y^p^e %USERPROFILE%\\.ssh\\id_rsa", base_dir=self.ws).level,
             L.LOCK,
         )
-        # Legitimate caret syntax in git and regexes must not be broken
-        self.assertEqual(TartarusClan.inspect_command("git rev-parse HEAD^", base_dir=self.ws).level, L.PASS)
+        # Legitimate regex caret inside quotes in rg stays PASS; unquoted HEAD^ in git requires ASK while HEAD~?/"HEAD^" passes
+        self.assertEqual(TartarusClan.inspect_command('git rev-parse "HEAD^"', base_dir=self.ws).level, L.PASS)
+        self.assertEqual(TartarusClan.inspect_command("git rev-parse HEAD^", base_dir=self.ws).level, L.ASK)
         self.assertEqual(TartarusClan.inspect_command("rg '^def ' aegis/core.py", base_dir=self.ws).level, L.PASS)
 
     def test_kle_l8_dojo_owasp_agentic_cases_pass(self):

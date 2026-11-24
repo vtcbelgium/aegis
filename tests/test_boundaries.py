@@ -76,7 +76,8 @@ def test_registry_unreadable_ledger_readable(ws):
     pol = AegisPolicy(extra_roots=[str(ws.parent)], log_paths=[str(ws.parent / ".aegis" / "ledger.jsonl")])
     v = cmd("cat ~/.aegis/minotaur.json", ws, pol)
     assert v.level == L.DENY and v.metadata.get("boundary") is None or v.level == L.DENY
-    assert cmd("cat ~/.aegis/ledger.jsonl", ws, pol).level == L.PASS
+    assert cmd(str(ws.parent / ".aegis" / "ledger.jsonl").join(["cat ", ""]), ws, pol).level == L.PASS
+    assert cmd("cat ~/.aegis/ledger.jsonl", ws, pol).level == L.ASK
     assert locked(cmd("printf '' > ~/.aegis/ledger.jsonl", ws, pol), POLICY_TAMPER)
 
 
@@ -98,8 +99,9 @@ def test_sentinel_takeover(c, windows, ws):
 
 
 def test_guard_service_reads_are_not_takeover(ws):
-    # Reading the guard's status is fine; killing an unrelated process asks but never locks.
-    assert cmd("systemctl --user status tekton-relay", ws).level == L.PASS
+    # Reading the guard's status asks under no-shell PASS policy (never locks as takeover); killing asks but never locks.
+    v_stat = cmd("systemctl --user status tekton-relay", ws)
+    assert not locked(v_stat, SENTINEL_TAKEOVER) and v_stat.level == L.ASK
     for c in ("pkill node", "taskkill /im notepad.exe"):
         v = cmd(c, ws, windows=c.startswith("taskkill"))
         assert L.PASS < v.level < L.LOCK, (c, v)
@@ -136,7 +138,9 @@ def test_backup_destruction(c, windows, ws):
 def test_backups_by_directory_not_by_file_name(ws):
     assert not is_backup_path(str(ws / "src" / "backup_service.py"))
     assert is_backup_path(str(ws / "backups" / "db.sql"))
-    assert cmd("rm src/backup_service.py", ws).level == L.PASS
+    v_rm = cmd("rm src/backup_service.py", ws)
+    assert not locked(v_rm, BACKUP_DESTRUCTION) and v_rm.level == L.ASK
+    assert cmd("cat src/backup_service.py", ws).level == L.PASS
     assert cmd("cp src/backup_service.py backups/", ws).level == L.ASK
 
 

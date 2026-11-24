@@ -51,6 +51,10 @@ class TestTektonSupport(unittest.TestCase):
         query = "Get-ComputerInfo | Select-Object CsName, OsName"
         self.assertEqual(
             h.evaluate_tool_call("start_process", {"command": query, "shell": "powershell"}).level,
+            L.ASK,
+        )
+        self.assertEqual(
+            h.evaluate_tool_call("start_process", {"command": "hostname"}).level,
             L.PASS,
         )
         self.assertEqual(
@@ -77,40 +81,48 @@ class TestTektonSupport(unittest.TestCase):
             allowed_loopback_ports={11434},
             strict_tools=True,
         )
-        # Workspace inline Python & loopback Ollama API pass without ASK prompts
+        # Under No-Shell PASS, inline Python & curl require owner approval (ASK), not auto-PASS or DENY
         py_ollama = (
             "python -c \"import urllib.request; "
             "print(urllib.request.urlopen('http://127.0.0.1:11434/api/tags').read())\""
         )
-        self.assertEqual(h.evaluate_tool_call("start_process", {"command": py_ollama}).level, L.PASS)
+        self.assertEqual(h.evaluate_tool_call("start_process", {"command": py_ollama}).level, L.ASK)
         curl_ollama = (
             "curl -s -X POST http://127.0.0.1:11434/api/generate "
             "-d '{\"model\":\"qwen2.5-coder:7b\",\"prompt\":\"ping\"}'"
         )
-        self.assertEqual(h.evaluate_tool_call("start_process", {"command": curl_ollama}).level, L.PASS)
-        # Local ollama CLI verbs pass; serving/pushing still require approval
+        self.assertEqual(h.evaluate_tool_call("start_process", {"command": curl_ollama}).level, L.ASK)
+        # Direct ollama CLI verbs PASS; serving/pushing require approval
         self.assertEqual(h.evaluate_tool_call("start_process", {"command": "ollama list"}).level, L.PASS)
         self.assertEqual(h.evaluate_tool_call("start_process", {"command": "ollama ps"}).level, L.PASS)
         self.assertEqual(h.evaluate_tool_call("start_process", {"command": "ollama serve"}).level, L.ASK)
-        # Safe git -c keys pass; executable git -c keys still require approval
+        # Direct read-only git status PASSes; global git -c requires approval
+        self.assertEqual(
+            h.evaluate_tool_call("start_process", {"command": "git status"}).level,
+            L.PASS,
+        )
         self.assertEqual(
             h.evaluate_tool_call("start_process", {"command": "git -c core.autocrlf=false status"}).level,
-            L.PASS,
+            L.ASK,
         )
         self.assertEqual(
             h.evaluate_tool_call("start_process", {"command": "git -c core.sshCommand=evil fetch"}).level,
             L.ASK,
         )
-        # PowerShell variable assignment + hardware/service inspection pass; guard env tamper LOCKs
+        # PowerShell variable assignment + cmdlets require ASK under No-Shell PASS
         ps_ok = "$svc = Get-Service; nvidia-smi; Get-CimInstance Win32_VideoController"
         self.assertEqual(
             h.evaluate_tool_call("start_process", {"command": ps_ok, "shell": "powershell"}).level,
-            L.PASS,
+            L.ASK,
         )
         # Desktop Commander parity schemas under strict_tools=True
         self.assertEqual(
-            h.evaluate_tool_call("start_process", {"command": "pytest -q", "cwd": self.b}).level,
+            h.evaluate_tool_call("start_process", {"command": "pytest --version", "cwd": self.b}).level,
             L.PASS,
+        )
+        self.assertEqual(
+            h.evaluate_tool_call("start_process", {"command": "pytest -q", "cwd": self.b}).level,
+            L.ASK,
         )
         self.assertEqual(
             h.evaluate_tool_call("start_process", {"command": "pytest -q", "cwd": "/etc"}).level,
@@ -159,6 +171,9 @@ class TestTektonSupport(unittest.TestCase):
         ]
         for cmd in safe_cmds:
             v = h.evaluate_tool_call("start_process", {"command": cmd, "shell": "powershell"})
+            self.assertEqual(v.level, L.ASK, f"Expected ASK under No-Shell PASS for {cmd!r}, got {v.level}: {v.reasons}")
+        for cmd in ("echo ok", "date", "hostname"):
+            v = h.evaluate_tool_call("start_process", {"command": cmd})
             self.assertEqual(v.level, L.PASS, f"Expected PASS for {cmd!r}, got {v.level}: {v.reasons}")
 
         # Dangerous inner commands or unsafe methods/types must stay guarded
@@ -273,8 +288,9 @@ class TestTektonSupport(unittest.TestCase):
         self.assertEqual(eval_fresh(f"powershell -enc {b64_u16('Write-Output ok')}").level, L.ASK)
         self.assertEqual(eval_fresh("powershell -ec !!!").level, L.DENY)
 
-        # POSIX pure arithmetic remains PASS while nested command arithmetic still LOCKs
-        self.assertEqual(eval_fresh("echo $((1 + 2))", shell="bash").level, L.PASS)
+        # POSIX arithmetic substitution requires shell so it asks, while direct echo passes and nested rm LOCKs
+        self.assertEqual(eval_fresh("echo $((1 + 2))", shell="bash").level, L.ASK)
+        self.assertEqual(eval_fresh("echo 3").level, L.PASS)
         self.assertEqual(eval_fresh("echo $(( $(rm -rf /) + 1 ))", shell="bash").level, L.LOCK)
 
     def test_ledger_rotate_on_damage_preserves_evidence_and_recovers_active_chain(self):

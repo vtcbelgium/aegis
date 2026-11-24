@@ -44,9 +44,9 @@ def test_large_recursive_delete_asks_with_the_numbers(ws):
     assert v.metadata["impact"][0]["exceeded"] is True
 
 
-def test_small_delete_passes_but_is_measured(ws):
+def test_small_delete_asks_and_is_measured(ws):
     v = cmd("rm -rf small", ws)
-    assert v.level == L.PASS
+    assert v.level == L.ASK
     assert v.metadata["impact"][0]["entries"] == 4
 
 
@@ -89,10 +89,16 @@ def test_git_that_discards_work_asks(c, ws):
 
 
 @pytest.mark.parametrize("c", [
-    "git status", "git checkout -b feature", "git checkout main", "git restore --staged src/a.py",
+    "git checkout -b feature", "git checkout main", "git restore --staged src/a.py",
     "git restore src/a.py", "git stash", "git stash pop", "git branch -d merged", "git clean -n",
     "git clean -nd", "git push", "git push origin main", "git reset --soft HEAD~1", "git reset src/a.py",
     "git gc", "git commit -m 'x'",
 ])
-def test_everyday_git_still_passes(c, ws):
-    assert cmd(c, ws).level == L.PASS, (c, cmd(c, ws))
+def test_everyday_mutating_git_asks_under_direct_exec(c, ws):
+    assert cmd(c, ws).level == L.ASK, (c, cmd(c, ws))
+
+
+@pytest.mark.parametrize("c", ["git status", "git diff", "git log --oneline -5"])
+def test_read_only_git_still_passes(c, ws):
+    v = cmd(c, ws)
+    assert v.level == L.PASS and v.metadata.get("direct_exec") is True, (c, v)
