@@ -40,7 +40,11 @@ METADATA_HOSTS = {
     "169.254.169.254",          # AWS EC2 / Azure IMDS / GCP / OpenStack
     "metadata.google.internal",  # GCP Metadata Server
     "metadata.internal",
+    "metadata",                 # GCP short name (resolved via the google.internal search domain)
+    "instance-data",            # AWS EC2 metadata short name
+    "instance-data.ec2.internal",
     "100.100.100.200",          # Alibaba Cloud Metadata
+    "fd00:ec2::254",            # AWS IMDS over IPv6
 }
 
 
@@ -97,7 +101,8 @@ class CustodyClan:
         except Exception:
             return Verdict(DecisionLevel.DENY, ["Malformed URL structure"], cls.NAME)
 
-        clean_host = host.lower().strip()
+        # A trailing dot is the same DNS name ("metadata.google.internal." == "metadata.google.internal").
+        clean_host = host.lower().strip().rstrip(".")
         reasons: List[str] = []
 
         # 1. Cloud instance metadata check -> Immediate LOCK

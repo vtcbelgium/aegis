@@ -1323,6 +1323,15 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
         _add(ctx, L.ASK, "popd changes to an unknown directory")
         return
     if name in ("source", "."):
+        if args and args[0].startswith("{"):
+            # PowerShell dot-sourcing a script block runs its body: `. { ... }`
+            body = " ".join(args).strip()
+            body = body[1:]
+            if body.endswith("}"):
+                body = body[:-1]
+            if body.strip():
+                _analyze_nested(body, ctx)
+            return
         if args:
             if _check_path(ctx, args[0], "exec") is not None:
                 _project_exec(ctx, f"sources shell file {args[0]}")
@@ -1335,6 +1344,12 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
         _analyze_nested(joined, ctx)
         return
 
+    if name == "busybox":
+        # `busybox APPLET ARGS...` is exactly `APPLET ARGS...`
+        if args and not args[0].startswith("-"):
+            return _dispatch(args, Segment(words=args, redirects=seg.redirects, piped_in=seg.piped_in,
+                                           heredoc=seg.heredoc, herestring=seg.herestring), ctx)
+        return
     if name in SHELLS:
         return _shell(name, args, seg, ctx)
     if name in POWERSHELLS:
@@ -1351,6 +1366,9 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
     if name in READ_BINARIES:
         if name in ("dir", "ls", "gci", "get-childitem") and any(re.match(r"^env:", a, re.I) for a in args):
             _add(ctx, L.ASK, "Environment variable dump via env: drive")
+            return
+        if name in ("less", "more") and any(a.startswith("+") and ("!" in a or "|" in a) for a in args):
+            _add(ctx, L.ASK, f"{name} +command runs a shell command (owner approval)")
             return
         return _paths(ctx, args, "read", windows=name in CMD_BUILTINS)
     if name in PATTERN_FIRST:
@@ -1454,6 +1472,10 @@ def _wrapper(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
             opt = rest.pop(0)
             if opt in ("-n", "-c", "-i", "-o", "-e", "-d", "--interval") and rest and not rest[0].startswith("-"):
                 rest.pop(0)
+        if name == "watch" and rest:
+            # watch joins its arguments and runs them through `sh -c` (unless -x): analyze that text.
+            _analyze_nested(" ".join(rest), ctx)
+            return
     elif name in ("command", "builtin", "exec"):
         while rest and rest[0].startswith("-"):
             rest.pop(0)
@@ -1883,6 +1905,9 @@ def _project_tool(name: str, args: List[str], ctx: _Ctx) -> None:
 
 def _pattern_tool(name: str, args: List[str], ctx: _Ctx) -> None:
     rest = list(args)
+    if name == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in rest):
+        _add(ctx, L.ASK, "rg --pre runs an arbitrary program on every searched file (owner approval)")
+        return
     pattern_given = any(a in ("-e", "--regexp", "-f", "--file", "-Pattern", "-pattern") for a in rest)
     skip_next = False
     first_positional = True

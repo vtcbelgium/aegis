@@ -252,6 +252,10 @@ class AegisAppState:
 
 def _build_handler(state: AegisAppState, port: int):
     allowed_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    # DNS-rebinding defence: a page on evil.example rebound to 127.0.0.1 still sends its own
+    # Host header. Only the loopback names this server listens on may read the UI (which
+    # carries the owner secret) or any API.
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
 
     class AegisHTTPHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -284,6 +288,14 @@ def _build_handler(state: AegisAppState, port: int):
                     self.rfile.read(length)
             except (ValueError, OSError):
                 pass
+
+        def _check_host(self) -> bool:
+            hosts = self.headers.get_all("Host") or []
+            if len(hosts) == 1 and hosts[0].strip().lower() in allowed_hosts:
+                return True
+            self._drain_small_body()
+            self._send_json(421, {"error": "Host header is not a loopback address of this server"})
+            return False
 
         def _check_origin(self) -> bool:
             sec_fetch = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
@@ -321,6 +333,8 @@ def _build_handler(state: AegisAppState, port: int):
             return data
 
         def do_GET(self) -> None:
+            if not self._check_host():
+                return
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             qs = urllib.parse.parse_qs(parsed.query)
@@ -456,7 +470,7 @@ def _build_handler(state: AegisAppState, port: int):
             self._send_json(404, {"error": "Not found"})
 
         def do_POST(self) -> None:
-            if not self._check_origin():
+            if not self._check_host() or not self._check_origin():
                 return
             path = urllib.parse.urlparse(self.path).path
 

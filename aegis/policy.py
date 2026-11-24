@@ -202,9 +202,24 @@ def _norm_for_match(path: str) -> str:
     return p
 
 
+_WIN32_TRAILING_RE = re.compile(r"[. ]+(?=/|$)")
+
+
+def _win32_alias(path: str) -> str:
+    """The name Win32 actually opens: trailing dots and spaces of every component are dropped.
+
+    'conftest.py.' and '.envrc . ' create 'conftest.py' and '.envrc' on Windows, so the
+    sensitive classes must see that spelling too ('.' and '..' components are kept).
+    """
+    parts = path.replace("\\", "/").split("/")
+    return "/".join(p if p in (".", "..") else (_WIN32_TRAILING_RE.sub("", p) or p) for p in parts)
+
+
 def classify_sensitive(*paths: str) -> Optional[str]:
     """Return 'critical', 'startup', 'secret', 'autoexec' or None for the given path spellings."""
-    candidates = [_norm_for_match(p) for p in paths if p]
+    spellings = [p for p in paths if p]
+    spellings += [a for a in (_win32_alias(p) for p in spellings) if a not in spellings]
+    candidates = [_norm_for_match(p) for p in spellings]
     for cls_name, patterns in (("critical", SENSITIVE_CRITICAL),
                                ("startup", SENSITIVE_STARTUP),
                                ("secret", SENSITIVE_SECRET_FILE),
