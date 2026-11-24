@@ -748,3 +748,62 @@ def test_r5_c2_tar_clustered_create_flags_checked_as_write(tmp_path):
         v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
         assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
 
+
+def test_r6_h2_h3_fail_closed_sed_awk_and_tar_allowlists(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+
+    # All Round-6 H-2 sed vectors + gawk -i inplace must fail closed (ASK/DENY/LOCK)
+    for cmd in (
+        "sed -l 1 'w .git/hooks/pre-commit' in.txt",
+        "sed -l1 'w .git/hooks/pre-commit' in.txt",
+        "sed --line-length 1 'w .envrc' in.txt",
+        "sed --e='w .git/hooks/pre-commit' in.txt",
+        "sed -n '/a/Iw .git/hooks/pre-commit' in.txt",
+        "sed -n '/a/Mw .git/hooks/pre-commit' in.txt",
+        r"sed -n '\%a%w .envrc' in.txt",
+        r"sed 's/a\/b/c/w .git/hooks/pre-commit' in.txt",
+        "sed --i -e 's/a/PWNED/' .envrc",
+        "gawk -i inplace '{print \"PWNED\"}' .envrc",
+        "awk -l evil '{print}' in.txt",
+        "awk -E evil.awk in.txt",
+        "awk 'BEGIN { @include \"x\" }' in.txt",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # All Round-6 H-3 tar vectors must fail closed (ASK/DENY/LOCK)
+    for cmd in (
+        "tar cbf 20 .git/hooks/pre-commit in.txt",
+        "tar cfg out.tar .git/hooks/pre-commit in.txt",
+        "tar -c -g .git/hooks/pre-commit -f out.tar in.txt",
+        "tar --listed-incremental .git/hooks/pre-commit -cf out.tar in.txt",
+        "tar -cv --index-file .envrc -f out.tar in.txt",
+        "TAPE=.git/hooks/pre-commit tar -c in.txt",
+        "TAR_OPTIONS='-f .envrc' tar -c in.txt",
+        "tar -A -f .git/hooks/pre-commit in.tar",
+        "tar --concatenate -f .git/hooks/pre-commit in.tar",
+        "tar --delete -f .git/hooks/pre-commit x",
+        "tar --transform='s|.*|.git/hooks/pre-commit|' -xf a.tar",
+        "tar -P -xf a.tar",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Benign sed/awk/tar usage still passes cleanly
+    for cmd in (
+        "sed -n '1,10p' src/app.py",
+        r"sed -i 's/a\/b/c/g' src/app.py",
+        "sed '/foo/d; /bar/p' src/app.py",
+        "awk '{print $1}' data.txt",
+        "tar -xzf archive.tar.gz",
+        "tar czf backup.tgz src/",
+        "tar -cf out.tar in.txt",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+

@@ -251,7 +251,8 @@ SAFE_PS_STATIC_ROOTS = frozenset({
 DANGEROUS_ENV_OVERRIDES = {"PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
                            "DYLD_LIBRARY_PATH", "PYTHONPATH", "PYTHONSTARTUP", "NODE_OPTIONS",
                            "BASH_ENV", "ENV", "PROMPT_COMMAND", "GIT_SSH_COMMAND", "GIT_SSH",
-                           "GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL", "PERL5OPT", "RUBYOPT"}
+                           "GIT_EXEC_PATH", "GIT_CONFIG_GLOBAL", "PERL5OPT", "RUBYOPT",
+                           "TAPE", "TAR_OPTIONS", "AWKPATH", "AWKLIBPATH"}
 SECRET_VAR_RE = re.compile(
     r"(?:\$\{?|\$env:|%)([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|AUTH)[A-Za-z0-9_]*)",
     re.IGNORECASE,
@@ -2271,13 +2272,130 @@ def _pattern_tool(name: str, args: List[str], ctx: _Ctx) -> None:
         _check_path(ctx, a, "write" if in_place else "read")
 
 
+def _sed_script_is_pure(script: str) -> bool:
+    """Strict allowlist for side-effect-free sed scripts (p/d/q/=, pure s///[gpIiMm0-9]*, y///).
+
+    Fails closed (returns False -> ASK) on any write/read/exec command (w/W/r/R/e),
+    alternate address delimiters (\\%..\\%), blocks ({...}), branches, or unrecognized syntax.
+    """
+    n = len(script)
+    i = 0
+
+    def _skip_delimited(pos: int, delim: str) -> int:
+        while pos < n:
+            ch = script[pos]
+            if ch == "\\" and pos + 1 < n:
+                pos += 2
+                continue
+            if ch == delim:
+                return pos + 1
+            pos += 1
+        return -1
+
+    def _skip_simple_addr(pos: int) -> int:
+        while pos < n and script[pos] in " \t":
+            pos += 1
+        if pos >= n:
+            return pos
+        if script[pos] == "/":
+            nxt = _skip_delimited(pos + 1, "/")
+            if nxt < 0:
+                return -1
+            pos = nxt
+            while pos < n and script[pos] in "IMim":
+                pos += 1
+            return pos
+        if script[pos].isdigit() or script[pos] in "$+~":
+            while pos < n and (script[pos].isdigit() or script[pos] in "$+~"):
+                pos += 1
+            return pos
+        return pos
+
+    saw_cmd = False
+    while i < n:
+        while i < n and script[i] in " \t;\r\n":
+            i += 1
+        if i >= n:
+            break
+        # Optional 1 or 2 simple addresses separated by ','
+        p1 = _skip_simple_addr(i)
+        if p1 < 0:
+            return False
+        i = p1
+        while i < n and script[i] in " \t":
+            i += 1
+        if i < n and script[i] == ",":
+            i += 1
+            p2 = _skip_simple_addr(i)
+            if p2 < 0:
+                return False
+            i = p2
+            while i < n and script[i] in " \t":
+                i += 1
+        if i < n and script[i] == "!":
+            i += 1
+            while i < n and script[i] in " \t":
+                i += 1
+        if i >= n:
+            return False
+        cmd = script[i]
+        i += 1
+        saw_cmd = True
+        if cmd in ("p", "d", "q", "="):
+            while i < n and script[i] in " \t":
+                i += 1
+            if i < n and script[i] not in ";\r\n":
+                return False
+        elif cmd in ("s", "y"):
+            if i >= n or script[i] in "\\ \t\r\n":
+                return False
+            delim = script[i]
+            i = _skip_delimited(i + 1, delim)
+            if i < 0:
+                return False
+            i = _skip_delimited(i, delim)
+            if i < 0:
+                return False
+            if cmd == "s":
+                while i < n and script[i] in "gpIiMm0123456789":
+                    i += 1
+            while i < n and script[i] in " \t":
+                i += 1
+            if i < n and script[i] not in ";\r\n":
+                return False
+        else:
+            return False
+    return saw_cmd
+
+
+def _sed_check_embedded_paths(script: str, ctx: _Ctx) -> None:
+    """Inspect any file targets referenced inside a non-pure sed script so protected paths LOCK/DENY."""
+    for m in re.finditer(r"(?:^|[;\n{}\s!/])([wWrR])\s*([^\s;}\n]+)", script):
+        kind, target = m.group(1), m.group(2).strip("'\"")
+        if target and (_looks_like_path_token(target) or "." in target):
+            _check_path(ctx, target, "write" if kind in ("w", "W") else "read")
+    for tok in re.split(r"[\s;{}]+", script):
+        tok = tok.strip("'\"")
+        if tok and _looks_like_path_token(tok):
+            for pref in ("w", "W", "r", "R"):
+                if tok.startswith(pref) and len(tok) > 1 and _looks_like_path_token(tok[1:]):
+                    _check_path(ctx, tok[1:], "write" if pref in ("w", "W") else "read")
+                    break
+            else:
+                if not tok.startswith(("s/", "s|", "s#", "s:", "/")):
+                    _check_path(ctx, tok, "write")
+
+
 def _sed(args: List[str], ctx: _Ctx) -> None:
     in_place = False
+    unknown_opt = False
     scripts: List[str] = []
     files: List[str] = []
     explicit = False
     end_of_opts = False
     rest = list(args)
+    safe_long_bool = ("--quiet", "--silent", "--regexp-extended", "--unbuffered",
+                      "--separate", "--null-data", "--posix", "--sandbox")
     while rest:
         a = rest.pop(0)
         if a == "--" and not end_of_opts:
@@ -2285,23 +2403,36 @@ def _sed(args: List[str], ctx: _Ctx) -> None:
             continue
         if not end_of_opts and a.startswith("--") and len(a) > 2:
             opt, eq, val = a.partition("=")
-            if "--in-place".startswith(opt) and len(opt) >= 4:
+            if "--in-place".startswith(opt):
                 in_place = True
-            elif "--expression".startswith(opt) and len(opt) >= 4:
+            elif "--expression".startswith(opt):
                 explicit = True
                 scripts.append(val if eq else (rest.pop(0) if rest else ""))
-            elif "--file".startswith(opt) and len(opt) >= 4:
+            elif "--file".startswith(opt):
                 explicit = True
                 sf = val if eq else (rest.pop(0) if rest else "")
                 if sf:
                     _check_path(ctx, sf, "read")
                     _project_exec(ctx, f"sed -f {sf}")
+            elif "--line-length".startswith(opt):
+                if not eq and rest:
+                    rest.pop(0)
+            elif any(o.startswith(opt) for o in safe_long_bool):
+                pass
+            else:
+                unknown_opt = True
+                _add(ctx, L.ASK, f"sed uses unrecognized option '{a}' (owner approval)")
+                if eq and _looks_like_path_token(val):
+                    _check_path(ctx, val, "write")
             continue
         if not end_of_opts and a.startswith("-") and len(a) > 1 and not a.startswith("--"):
             chars = a[1:]
             k = 0
             while k < len(chars):
                 ch = chars[k]
+                if ch in ("n", "r", "E", "u", "s", "z"):
+                    k += 1
+                    continue
                 if ch == "i":
                     in_place = True
                     break  # remaining chars are optional backup suffix
@@ -2316,67 +2447,102 @@ def _sed(args: List[str], ctx: _Ctx) -> None:
                         _check_path(ctx, sf, "read")
                         _project_exec(ctx, f"sed -f {sf}")
                     break
-                k += 1
+                if ch == "l":
+                    if k + 1 >= len(chars) and rest:
+                        rest.pop(0)
+                    break
+                unknown_opt = True
+                _add(ctx, L.ASK, f"sed uses unrecognized flag '-{ch}' (owner approval)")
+                break
             continue
         if not explicit and not scripts:
             scripts.append(a)
         else:
             files.append(a)
-    # Match sed address + e/W/w (with OR without whitespace before filename/cmd) and s///...e|w[file]
-    sed_addr = r"(?:(?:/(?:\\.|[^/])*/|\d+|\$|[~+,-]|\s)*!?\s*)"
     for s in scripts:
-        m_ew = re.search(rf"(?:^|[;\n{{}}])\s*{sed_addr}([eWw])([^\n;}}]*)", s)
-        m_sub = re.search(r"s(.)(?:(?!\1).)*\1(?:(?!\1).)*\1[gpIiMm0-9]*([ew])([^\n;}]*)", s)
-        if m_ew or m_sub:
-            _add(ctx, L.ASK, "sed script executes commands or writes files (owner approval)")
-            for m in (m_ew, m_sub):
-                if m and m.group(1) in ("w", "W"):
-                    target = m.group(2).strip()
-                    if target:
-                        _check_path(ctx, target, "write")
-        for m_r in re.finditer(rf"(?:^|[;\n{{}}])\s*{sed_addr}[rR]\s*([^\n;}}]+)", s):
-            target = m_r.group(1).strip()
-            if target:
-                _check_path(ctx, target, "read")
+        if not _sed_script_is_pure(s):
+            _add(ctx, L.ASK, "sed script uses commands outside the pure read/substitute allowlist (owner approval)")
+            _sed_check_embedded_paths(s, ctx)
+    file_mode = "write" if (in_place or unknown_opt) else "read"
     for f in files:
-        _check_path(ctx, f, "write" if in_place else "read")
+        _check_path(ctx, f, file_mode)
 
 
 def _awk(args: List[str], ctx: _Ctx) -> None:
     rest = list(args)
     program = None
     files: List[str] = []
+    mutating = False
+    end_of_opts = False
     while rest:
         a = rest.pop(0)
-        if a in ("-f", "--file") and rest:
-            sf = rest.pop(0)
-            _check_path(ctx, sf, "read")
-            _project_exec(ctx, f"awk -f {sf}")
-            program = ""
-        elif a.startswith("--file="):
-            sf = a.split("=", 1)[1]
-            _check_path(ctx, sf, "read")
-            _project_exec(ctx, f"awk -f {sf}")
-            program = ""
-        elif a.startswith("-f") and len(a) > 2 and not a.startswith("--"):
-            sf = a[2:]
-            _check_path(ctx, sf, "read")
-            _project_exec(ctx, f"awk -f {sf}")
-            program = ""
-        elif a in ("-v", "-F", "--assign", "--field-separator") and rest:
-            rest.pop(0)
-        elif _is_option(a):
+        if a == "--" and not end_of_opts:
+            end_of_opts = True
             continue
-        elif program is None:
+        if not end_of_opts and a.startswith("--") and len(a) > 2:
+            opt, eq, val = a.partition("=")
+            if "--file".startswith(opt) or "--exec".startswith(opt):
+                sf = val if eq else (rest.pop(0) if rest else "")
+                if sf:
+                    _check_path(ctx, sf, "read")
+                    _project_exec(ctx, f"awk {opt} {sf}")
+                program = ""
+            elif "--include".startswith(opt) or "--load".startswith(opt):
+                mutating = True
+                ext = val if eq else (rest.pop(0) if rest else "")
+                _add(ctx, L.ASK, f"awk {opt} loads an extension or script ({ext})")
+                if ext and _looks_like_path_token(ext):
+                    _check_path(ctx, ext, "read")
+            elif "--assign".startswith(opt) or "--field-separator".startswith(opt):
+                if not eq and rest:
+                    rest.pop(0)
+            elif "--sandbox".startswith(opt) or "--posix".startswith(opt) or "--traditional".startswith(opt):
+                pass
+            else:
+                mutating = True
+                _add(ctx, L.ASK, f"awk uses unrecognized option '{a}' (owner approval)")
+            continue
+        if not end_of_opts and a.startswith("-") and len(a) > 1 and not a.startswith("--"):
+            chars = a[1:]
+            k = 0
+            while k < len(chars):
+                ch = chars[k]
+                if ch in ("f", "E"):
+                    sf = chars[k + 1:] if k + 1 < len(chars) else (rest.pop(0) if rest else "")
+                    if sf:
+                        _check_path(ctx, sf, "read")
+                        _project_exec(ctx, f"awk -{ch} {sf}")
+                    program = ""
+                    break
+                if ch in ("i", "l"):
+                    mutating = True
+                    ext = chars[k + 1:] if k + 1 < len(chars) else (rest.pop(0) if rest else "")
+                    _add(ctx, L.ASK, f"awk -{ch} loads an extension or inplace writer ({ext})")
+                    if ext and _looks_like_path_token(ext):
+                        _check_path(ctx, ext, "read")
+                    break
+                if ch in ("v", "F"):
+                    if k + 1 >= len(chars) and rest:
+                        rest.pop(0)
+                    break
+                if ch in ("S", "P", "W"):
+                    k += 1
+                    continue
+                mutating = True
+                _add(ctx, L.ASK, f"awk uses unrecognized flag '-{ch}' (owner approval)")
+                break
+            continue
+        if program is None:
             program = a
         else:
             files.append(a)
-    if program and re.search(r"system\s*\(|\|\s*getline|getline\s*<|print[f]?\b[^;}]*[>|]", program):
+    if program and re.search(r"system\s*\(|\bgetline\b|@load\b|@include\b|[>|]", program):
         _inline_code(ctx, "awk", program)
+        mutating = True
     for f in files:
         if "=" in f and not ("/" in f.split("=", 1)[0] or "\\" in f.split("=", 1)[0]):
             continue
-        _check_path(ctx, f, "read")
+        _check_path(ctx, f, "write" if mutating else "read")
 
 
 FIND_FILTERS = {"-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-type", "-newer",
@@ -2542,38 +2708,72 @@ def _chmod(args: List[str], ctx: _Ctx) -> None:
 
 
 def _tar(args: List[str], ctx: _Ctx) -> None:
+    """Fail-closed allowlist parser for tar.
+
+    Only standard create/extract/list flags (-c/-x/-t/-z/-j/-J/-v/-p/-k/-O/-h/-f/-C/-T/-X
+    and their long equivalents) are permitted without asking. Any other flag or long option
+    (e.g. -g/--listed-incremental, --index-file, -b, -A/--concatenate, --delete, --transform,
+    -I/-F/--to-command) fails closed to ASK and checks all path arguments in "write" mode.
+    """
     rest = list(args)
-    exec_long = (
-        "--to-command", "--checkpoint-action", "--use-compress-program",
-        "--rsh-command", "--info-script", "--new-volume-script",
+    if ctx.variables.get("TAPE"):
+        _check_path(ctx, ctx.variables["TAPE"], "write")
+
+    safe_bool_short = set("cxtzjJvpOkhmnla")
+    safe_val_short = set("fCTX")
+    safe_long_bool = (
+        "--create", "--extract", "--get", "--list", "--gzip", "--gunzip",
+        "--bzip2", "--xz", "--verbose", "--preserve-permissions", "--keep-old-files",
+        "--to-stdout", "--dereference", "--auto-compress", "--no-same-owner",
+        "--no-same-permissions", "--one-file-system", "--strip-components",
     )
-    # Pre-scan to know whether this tar invocation creates/updates an archive (so -f/--file is checked as "write" regardless of option order).
+    safe_long_val_write = ("--directory",)
+    safe_long_val_archive = ("--file",)
+    safe_long_val_read = ("--files-from", "--exclude-from")
+    safe_long_val_nonpath = ("--exclude", "--strip-components")
+
     creating = False
+    unknown_mode = False
     for idx, a in enumerate(rest):
         if a == "--":
             break
         if a.startswith("--") and len(a) > 2:
             opt = a.split("=", 1)[0]
-            if any(long_o.startswith(opt) and len(opt) >= 4 for long_o in exec_long):
-                _add(ctx, L.ASK, f"tar option executes a program: {a}")
-                return
-            if any(m.startswith(opt) and len(opt) >= 4 for m in ("--create", "--append", "--update")):
+            if "--create".startswith(opt) and len(opt) >= 3:
                 creating = True
+            elif any(o.startswith(opt) and len(opt) >= 3 for o in (
+                "--append", "--update", "--catenate", "--concatenate", "--delete",
+                "--listed-incremental", "--index-file", "--transform", "--xform",
+                "--to-command", "--checkpoint-action", "--use-compress-program",
+                "--rsh-command", "--info-script", "--new-volume-script",
+            )):
+                creating = True
+                unknown_mode = True
+                _add(ctx, L.ASK, f"tar option '{a}' modifies archives or runs programs (owner approval)")
+            elif not any(o.startswith(opt) and len(opt) >= 3 for o in (
+                safe_long_bool + safe_long_val_write + safe_long_val_archive
+                + safe_long_val_read + safe_long_val_nonpath
+            )):
+                unknown_mode = True
+                _add(ctx, L.ASK, f"tar uses unrecognized option '{a}' (owner approval)")
         elif a.startswith("-") and not a.startswith("--") and len(a) > 1:
             for ch in a[1:]:
-                if ch in ("I", "F"):
-                    _add(ctx, L.ASK, f"tar option executes a program: {a}")
-                    return
-                if ch in ("c", "r", "u"):
+                if ch == "c":
                     creating = True
-                if ch in ("f", "C", "T", "X"):
+                if ch in safe_val_short:
+                    break
+                if ch not in safe_bool_short:
+                    unknown_mode = True
+                    _add(ctx, L.ASK, f"tar uses advanced/unallowlisted flag '-{ch}' in '{a}' (owner approval)")
                     break
         elif idx == 0 and re.match(r"^[A-Za-z]+$", a) and any(c in a for c in "cxtruf"):
-            if any(c in a for c in "IF"):
-                _add(ctx, L.ASK, f"tar option executes a program: {a}")
-                return
-            if any(c in a for c in "cru"):
-                creating = True
+            for ch in a:
+                if ch == "c":
+                    creating = True
+                if ch not in safe_bool_short and ch not in safe_val_short:
+                    unknown_mode = True
+                    _add(ctx, L.ASK, f"tar uses advanced/unallowlisted flag '{ch}' in '{a}' (owner approval)")
+                    break
 
     def _check_tar_archive(val: str) -> None:
         if not val:
@@ -2581,7 +2781,7 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
         if "://" in val or (re.match(r"^[\w.-]+@[\w.-]+:", val) and not looks_windows_path(val)):
             _add(ctx, L.ASK, f"tar to a remote archive: {val}")
             return
-        _check_path(ctx, val, "write" if creating else "read")
+        _check_path(ctx, val, "write" if (creating or unknown_mode) else "read")
 
     end_of_opts = False
     i = 0
@@ -2596,28 +2796,32 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
         if not end_of_opts:
             if a.startswith("--") and len(a) > 2:
                 opt, eq, val = a.partition("=")
-                if "--directory".startswith(opt) and len(opt) >= 4:
+                if "--directory".startswith(opt) and len(opt) >= 3:
                     target = val if eq else (rest[i] if i < n else "")
                     if not eq and i < n:
                         i += 1
                     if target:
                         _check_path(ctx, target, "write")
                     continue
-                if "--file".startswith(opt) and len(opt) >= 4:
+                if "--file".startswith(opt) and len(opt) >= 3:
                     target = val if eq else (rest[i] if i < n else "")
                     if not eq and i < n:
                         i += 1
                     _check_tar_archive(target)
                     continue
-                if any(o.startswith(opt) and len(opt) >= 4 for o in ("--files-from", "--exclude-from")):
+                if any(o.startswith(opt) and len(opt) >= 3 for o in safe_long_val_read):
                     target = val if eq else (rest[i] if i < n else "")
                     if not eq and i < n:
                         i += 1
                     if target:
                         _check_path(ctx, target, "read")
                     continue
+                if any(o.startswith(opt) and len(opt) >= 3 for o in safe_long_val_nonpath):
+                    if not eq and i < n:
+                        i += 1
+                    continue
                 if eq and _looks_like_path_token(val):
-                    _check_path(ctx, val, "write" if creating else "read")
+                    _check_path(ctx, val, "write")
                 continue
             if a.startswith("-") and not a.startswith("--") and len(a) > 1:
                 chars = a[1:]
@@ -2644,24 +2848,30 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
                         if target:
                             _check_path(ctx, target, "read")
                         break
+                    if ch not in safe_bool_short:
+                        # Fail closed: check any attached suffix as write
+                        if k + 1 < len(chars) and _looks_like_path_token(chars[k + 1:]):
+                            _check_path(ctx, chars[k + 1:], "write")
+                        break
                     k += 1
                 continue
             if is_first and re.match(r"^[A-Za-z]+$", a) and any(c in a for c in "cxtruf"):
-                for ch in a:
-                    if ch == "f" and i < n:
-                        _check_tar_archive(rest[i])
-                        i += 1
-                    elif ch == "C" and i < n:
-                        _check_path(ctx, rest[i], "write")
-                        i += 1
-                    elif ch in ("T", "X") and i < n:
-                        _check_path(ctx, rest[i], "read")
-                        i += 1
+                if not unknown_mode:
+                    for ch in a:
+                        if ch == "f" and i < n:
+                            _check_tar_archive(rest[i])
+                            i += 1
+                        elif ch == "C" and i < n:
+                            _check_path(ctx, rest[i], "write")
+                            i += 1
+                        elif ch in ("T", "X") and i < n:
+                            _check_path(ctx, rest[i], "read")
+                            i += 1
                 continue
         if "://" in a or (re.match(r"^[\w.-]+@[\w.-]+:", a) and not looks_windows_path(a)):
             _add(ctx, L.ASK, f"tar to a remote archive: {a}")
             continue
-        _check_path(ctx, a, "read")
+        _check_path(ctx, a, "write" if unknown_mode else "read")
 
 
 def _rsync(args: List[str], ctx: _Ctx) -> None:
