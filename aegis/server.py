@@ -49,6 +49,7 @@ from .setup_wizard import (
     vscode_mcp_path,
 )
 from .shell import analyze_command
+from . import tekton_bridge
 
 MAX_BODY_BYTES = 1024 * 1024
 _UI_INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
@@ -281,6 +282,7 @@ def _build_handler(state: AegisAppState, port: int):
                     "gate": state.gate.snapshot(),
                     "doctor": doc,
                     "pendingApprovalCount": sum(1 for a in approvals if a["status"] == "pending"),
+                    "tektonDetected": bool(tekton_bridge.find_tekton_binary()),
                 })
                 return
 
@@ -335,6 +337,11 @@ def _build_handler(state: AegisAppState, port: int):
                     "git": snap,
                     "tips": get_tips(det),
                 })
+                return
+
+            if path == "/api/tekton":
+                include_relay = (qs.get("relay") or ["1"])[0] not in ("0", "false", "no")
+                self._send_json(200, tekton_bridge.get_tekton_status(include_relay=include_relay))
                 return
 
             self._send_json(404, {"error": "Not found"})
@@ -533,6 +540,46 @@ def _build_handler(state: AegisAppState, port: int):
 
                 res = undo_turn(payload.get("turnId"), dry_run=bool(payload.get("dryRun", False)))
                 self._send_json(200 if res.get("ok") else 404, res)
+                return
+
+            if path == "/api/tekton/launch-gui":
+                res = tekton_bridge.launch_tekton_gui()
+                self._send_json(200 if res.get("ok") else 400, res)
+                return
+
+            if path == "/api/tekton/sync-policy-floor":
+                res = tekton_bridge.sync_policy_floor()
+                self._send_json(200 if res.get("ok") else 400, res)
+                return
+
+            if path == "/api/tekton/allow-dir":
+                res = tekton_bridge.allow_workspace_dir(str(payload.get("path") or ""))
+                self._send_json(200 if res.get("ok") else 400, res)
+                return
+
+            if path == "/api/tekton/remove-dir":
+                res = tekton_bridge.remove_workspace_dir(str(payload.get("path") or ""))
+                self._send_json(200 if res.get("ok") else 400, res)
+                return
+
+            if path == "/api/tekton/approve":
+                res = tekton_bridge.decide_tekton_approval(str(payload.get("id") or ""), "approve")
+                self._send_json(200 if res.get("ok") else 400, res)
+                return
+
+            if path == "/api/tekton/deny":
+                res = tekton_bridge.decide_tekton_approval(str(payload.get("id") or ""), "deny")
+                self._send_json(200 if res.get("ok") else 400, res)
+                return
+
+            if path == "/api/tekton/pair-approve":
+                res = tekton_bridge.approve_pair_request(str(payload.get("id") or ""))
+                self._send_json(200 if res.get("ok") else 400, res)
+                return
+
+            if path == "/api/tekton/unlock":
+                res = tekton_bridge.unlock_tekton_session()
+                self._send_json(200 if res.get("ok") else 400, res)
                 return
 
             self._send_json(404, {"error": "Not found"})

@@ -462,7 +462,9 @@ def run_detective_cli(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    from . import __version__
     parser = argparse.ArgumentParser(description="Aegis: deterministic negative security gate & firewall for AI agents")
+    parser.add_argument("--version", action="version", version=f"aegis-gate {__version__}")
     sub = parser.add_subparsers(dest="subcommand")
     dojo = sub.add_parser("dojo", help="Run bounded offline simulations from the knowledge packs")
     dojo.add_argument("--mission", required=True)
@@ -550,6 +552,11 @@ def main() -> None:
     uip.add_argument("--base-dir", default=".")
     uip.add_argument("--no-open", action="store_true", help="Do not automatically launch a browser tab")
 
+    deskp = sub.add_parser("desktop", help="Launch Aegis Control Center as a standalone single-instance desktop app")
+    deskp.add_argument("--port", type=int, default=9999)
+    deskp.add_argument("--base-dir", default=".")
+    deskp.add_argument("--no-open", action="store_true", help="Do not open a desktop window")
+
     docp = sub.add_parser("doctor", help="Check Aegis health, ledger integrity, tripwires, and connected AI apps")
     docp.add_argument("--json", action="store_true", help="Emit structured JSON diagnostics")
 
@@ -563,6 +570,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.subcommand == "ui":
         run_daemon(args.port, base_dir=args.base_dir, open_browser=not args.no_open)
+    elif args.subcommand == "desktop":
+        from .desktop import launch_desktop
+        sys.exit(launch_desktop(port=args.port, base_dir=args.base_dir, no_open=args.no_open))
     elif args.subcommand == "doctor":
         sys.exit(run_doctor_cli(as_json=args.json))
     elif args.subcommand == "setup":

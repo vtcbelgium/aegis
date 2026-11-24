@@ -345,6 +345,7 @@
           <button class="nav-btn" data-view="detective" data-active="false"><span>Detective</span><span class="count" id="navDetMode">passive</span></button>
           <button class="nav-btn" data-view="approvals" data-active="false"><span>Approvals</span><span class="count" id="navPending">0</span></button>
           <button class="nav-btn" data-view="apps" data-active="false"><span>Apps</span></button>
+          <button class="nav-btn" data-view="tekton" data-active="false"><span>Tekton</span><span class="count" id="navTektonState">off</span></button>
           <button class="nav-btn" data-view="settings" data-active="false"><span>Settings</span></button>
         </nav>
       </div>
@@ -353,6 +354,7 @@
         <div class="side-row"><span>Gate</span><span class="side-val ok" id="sideStatus">PASS</span></div>
         <div class="side-row"><span>Diary</span><span class="side-val" id="sideLedger">Checking</span></div>
         <div class="side-row"><span>Sandbox</span><span class="side-val" id="sideSandbox">Checking</span></div>
+        <div class="side-row"><span>Tekton</span><span class="side-val" id="sideTekton">Checking</span></div>
         <div class="side-row"><span>Network</span><span class="side-val">127.0.0.1</span></div>
       </div>
     </aside>
@@ -479,6 +481,69 @@
         <div class="list" id="appsList"></div>
       </section>
 
+      <!-- TEKTON INTEGRATION -->
+      <section id="view-tekton" class="pane">
+        <div class="pane-head">
+          <div>
+            <h1>Tekton integration</h1>
+            <p class="sub" id="tektonSub">Connects Aegis to a local Tekton MCP runtime enforced by pinned aegis-gate and a monotonic policy floor.</p>
+          </div>
+          <div class="inline-actions" style="margin-top:0;">
+            <button class="btn" id="refreshTektonBtn">Refresh</button>
+            <button class="btn" id="syncFloorBtn">Sync policy floor</button>
+            <button class="btn primary" id="launchTektonGuiBtn">Open Tekton GUI</button>
+          </div>
+        </div>
+        <div id="tektonActionOut" class="result-line hidden" style="margin-top:-12px;margin-bottom:22px;"></div>
+
+        <div id="tektonMissing" class="section hidden">
+          <p class="muted">No local Tekton runtime was detected on this machine. Install Tekton and refresh to manage its Aegis interlock, workspaces, and fleet nodes from here.</p>
+        </div>
+
+        <div id="tektonBody">
+          <div class="section">
+            <h2>Runtime interlock</h2>
+            <div class="list">
+              <div class="row"><span class="muted">Tekton runtime</span><span class="mono fg" id="tkVersion">Loading</span></div>
+              <div class="row"><span class="muted">Pinned aegis-gate</span><span class="mono fg" id="tkAegisVer">Loading</span></div>
+              <div class="row"><span class="muted">Enforcement mode</span><span class="mono fg" id="tkMode">Loading</span></div>
+              <div class="row"><span class="muted">Policy floor</span><span class="mono fg" id="tkFloor">Loading</span></div>
+              <div class="row"><span class="muted">Tekton ledger</span><span class="mono fg" id="tkLedger">Loading</span></div>
+              <div class="row"><span class="muted">Node identity</span><span class="mono fg" id="tkNodeId">Loading</span></div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;">
+              <h2 style="margin:0;">Fleet nodes</h2>
+              <span class="sub" id="tkFleetMeta" style="margin:0;">Checking relay</span>
+            </div>
+            <div class="list" id="tkFleetList"></div>
+            <div id="tkPairsWrap" class="hidden" style="margin-top:16px;">
+              <h2>Pending pair requests</h2>
+              <div class="list" id="tkPairsList"></div>
+            </div>
+          </div>
+
+          <div class="section">
+            <h2>Allowed workspaces</h2>
+            <div class="list" id="tkDirsList"></div>
+            <div class="field-row" style="margin-top:12px;">
+              <input id="tkDirInput" type="text" placeholder="Add directory path to Tekton workspace allowlist">
+              <button class="btn" id="tkAddDirBtn">Add folder</button>
+            </div>
+          </div>
+
+          <div class="section">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;">
+              <h2 style="margin:0;">Pending Tekton approvals</h2>
+              <button class="btn danger-outline" id="tkUnlockBtn">Unlock Tekton session</button>
+            </div>
+            <div class="list" id="tkApprovalsList"></div>
+          </div>
+        </div>
+      </section>
+
       <!-- SETTINGS -->
       <section id="view-settings" class="pane">
         <div class="pane-head">
@@ -539,6 +604,7 @@
         if (btn.dataset.view === "detective") loadDetective();
         if (btn.dataset.view === "approvals") loadApprovals();
         if (btn.dataset.view === "apps") loadApps();
+        if (btn.dataset.view === "tekton") loadTekton();
         if (btn.dataset.view === "settings") loadSettings();
       });
     });
@@ -563,6 +629,13 @@
 
         const sb = ov.doctor?.sandbox || {};
         document.getElementById("sideSandbox").textContent = sb.works ? "Bubblewrap" : "Rules only";
+
+        const stTk = document.getElementById("sideTekton");
+        stTk.textContent = ov.tektonDetected ? "Linked" : "Not found";
+        stTk.className = "side-val " + (ov.tektonDetected ? "ok" : "");
+        if (!ov.tektonDetected) {
+          document.getElementById("navTektonState").textContent = "off";
+        }
 
         const pending = ov.pendingApprovalCount || 0;
         const np = document.getElementById("navPending");
@@ -1024,8 +1097,258 @@
       }
     });
 
+    // TEKTON INTEGRATION
+    function setTektonNote(msg, cls) {
+      const out = document.getElementById("tektonActionOut");
+      out.classList.remove("hidden");
+      out.className = "result-line " + (cls || "muted");
+      out.textContent = msg;
+    }
+
+    async function loadTekton() {
+      try {
+        const data = await api("/api/tekton");
+        const navBadge = document.getElementById("navTektonState");
+        const sideTk = document.getElementById("sideTekton");
+        if (!data.installed) {
+          document.getElementById("tektonMissing").classList.remove("hidden");
+          document.getElementById("tektonBody").classList.add("hidden");
+          document.getElementById("launchTektonGuiBtn").disabled = true;
+          document.getElementById("syncFloorBtn").disabled = true;
+          navBadge.textContent = "off";
+          sideTk.textContent = "Not found";
+          sideTk.className = "side-val";
+          return;
+        }
+        document.getElementById("tektonMissing").classList.add("hidden");
+        document.getElementById("tektonBody").classList.remove("hidden");
+        document.getElementById("launchTektonGuiBtn").disabled = false;
+        document.getElementById("syncFloorBtn").disabled = false;
+
+        const doc = data.doctor || {};
+        document.getElementById("tkVersion").textContent = doc.version ? `v${doc.version}` : "Unavailable";
+        document.getElementById("tkAegisVer").textContent = doc.aegis_gate_version ? `v${doc.aegis_gate_version}` : "Unknown";
+        document.getElementById("tkMode").textContent = doc.aegis_mode || "enforce";
+
+        const pf = doc.policy_floor || {};
+        const pfEl = document.getElementById("tkFloor");
+        pfEl.textContent = pf.active ? `Active (${pf.path})` : `Not synced (${pf.path || "none"})`;
+        pfEl.className = "mono " + (pf.active ? "ok" : "muted");
+
+        const led = doc.ledger || {};
+        const ledEl = document.getElementById("tkLedger");
+        ledEl.textContent = led.ok ? `Verified (${led.count || 0} entries)` : (led.problem || "Unverified");
+        ledEl.className = "mono " + (led.ok ? "ok" : "danger");
+
+        document.getElementById("tkNodeId").textContent = doc.node_id || "Unregistered";
+
+        const summary = data.fleetSummary || { online: 0, total: 0, pendingPairs: 0 };
+        navBadge.textContent = summary.total > 0 ? `${summary.online}/${summary.total}` : (doc.version ? `v${doc.version}` : "on");
+        navBadge.className = "count" + (summary.pendingPairs > 0 || (data.pendingApprovalCount || 0) > 0 ? " warn" : "");
+        sideTk.textContent = doc.version ? `v${doc.version}` : "Linked";
+        sideTk.className = "side-val ok";
+
+        // Fleet nodes
+        const fleetMeta = document.getElementById("tkFleetMeta");
+        const fleetList = document.getElementById("tkFleetList");
+        fleetList.textContent = "";
+        const devices = data.relay?.devices || [];
+        if (data.relayError && devices.length === 0) {
+          fleetMeta.textContent = "Relay unreachable";
+          const row = document.createElement("div");
+          row.className = "row muted";
+          row.textContent = data.relayError;
+          fleetList.appendChild(row);
+        } else if (devices.length === 0) {
+          fleetMeta.textContent = "0 registered nodes";
+          const row = document.createElement("div");
+          row.className = "row muted";
+          row.textContent = "No remote relay devices registered yet.";
+          fleetList.appendChild(row);
+        } else {
+          fleetMeta.textContent = `${summary.online}/${summary.total} online`;
+          devices.forEach((dev) => {
+            const row = document.createElement("div");
+            row.className = "row";
+            const left = document.createElement("div");
+            const title = document.createElement("div");
+            title.className = "fg";
+            title.style.fontWeight = "500";
+            title.textContent = dev.display_name || dev.node_id;
+            const sub = document.createElement("div");
+            sub.className = "mono muted";
+            sub.textContent = `${dev.node_id || ""} (${dev.last_op || "idle"})`;
+            left.append(title, sub);
+            const right = document.createElement("span");
+            right.className = "mono tabular " + (dev.online ? "ok" : "muted");
+            const age = typeof dev.heartbeat_age_seconds === "number" ? `${dev.heartbeat_age_seconds}s ago` : "";
+            right.textContent = dev.online ? `online ${age}`.trim() : "offline";
+            row.append(left, right);
+            fleetList.appendChild(row);
+          });
+        }
+
+        // Pending pair requests
+        const pairs = data.relay?.pending_pairs || [];
+        const pairsWrap = document.getElementById("tkPairsWrap");
+        const pairsList = document.getElementById("tkPairsList");
+        pairsList.textContent = "";
+        pairsWrap.classList.toggle("hidden", pairs.length === 0);
+        pairs.forEach((p) => {
+          const row = document.createElement("div");
+          row.className = "row";
+          const left = document.createElement("div");
+          left.className = "mono trunc";
+          left.textContent = `${p.display_name || "Device"} (${p.id || p.pair_id || ""})`;
+          const btn = document.createElement("button");
+          btn.className = "btn primary";
+          btn.textContent = "Approve pair";
+          btn.addEventListener("click", async () => {
+            try {
+              await api("/api/tekton/pair-approve", { method: "POST", body: { id: p.id || p.pair_id } });
+              setTektonNote("Approved relay pair request.", "ok");
+              loadTekton();
+            } catch (err) {
+              setTektonNote(err.message, "danger");
+            }
+          });
+          row.append(left, btn);
+          pairsList.appendChild(row);
+        });
+
+        // Allowed workspaces
+        const dirsList = document.getElementById("tkDirsList");
+        dirsList.textContent = "";
+        const dirs = doc.allowed_directories || [];
+        if (dirs.length === 0) {
+          const row = document.createElement("div");
+          row.className = "row muted";
+          row.textContent = "No allowed workspace directories configured.";
+          dirsList.appendChild(row);
+        } else {
+          dirs.forEach((dir) => {
+            const row = document.createElement("div");
+            row.className = "row";
+            const label = document.createElement("span");
+            label.className = "mono trunc";
+            label.textContent = dir;
+            const rm = document.createElement("button");
+            rm.className = "btn danger-outline";
+            rm.textContent = "Remove";
+            rm.addEventListener("click", async () => {
+              try {
+                await api("/api/tekton/remove-dir", { method: "POST", body: { path: dir } });
+                setTektonNote(`Removed workspace ${dir}.`, "ok");
+                loadTekton();
+              } catch (err) {
+                setTektonNote(err.message, "danger");
+              }
+            });
+            row.append(label, rm);
+            dirsList.appendChild(row);
+          });
+        }
+
+        // Pending Tekton approvals
+        const apprList = document.getElementById("tkApprovalsList");
+        apprList.textContent = "";
+        const apprs = data.approvals || [];
+        if (apprs.length === 0) {
+          const row = document.createElement("div");
+          row.className = "row muted";
+          row.textContent = "No pending Tekton ASK approvals.";
+          apprList.appendChild(row);
+        } else {
+          apprs.forEach((item) => {
+            const box = document.createElement("div");
+            box.className = "row-col";
+            const t = document.createElement("div");
+            t.className = "warn mono";
+            t.style.fontWeight = "600";
+            t.textContent = `${item.tool || "action"}: ${item.summary || item.id}`;
+            const r = document.createElement("div");
+            r.className = "muted";
+            r.textContent = (item.reasons || []).join("; ") || item.status || "pending";
+            const actions = document.createElement("div");
+            actions.className = "inline-actions";
+            const deny = document.createElement("button");
+            deny.className = "btn danger-outline";
+            deny.textContent = "Deny";
+            deny.addEventListener("click", async () => {
+              try {
+                await api("/api/tekton/deny", { method: "POST", body: { id: item.id } });
+                setTektonNote(`Denied Tekton approval ${item.id}.`, "ok");
+                loadTekton();
+              } catch (err) {
+                setTektonNote(err.message, "danger");
+              }
+            });
+            const approve = document.createElement("button");
+            approve.className = "btn primary";
+            approve.textContent = "Approve once";
+            approve.addEventListener("click", async () => {
+              try {
+                await api("/api/tekton/approve", { method: "POST", body: { id: item.id } });
+                setTektonNote(`Approved Tekton action ${item.id}.`, "ok");
+                loadTekton();
+              } catch (err) {
+                setTektonNote(err.message, "danger");
+              }
+            });
+            actions.append(deny, approve);
+            box.append(t, r, actions);
+            apprList.appendChild(box);
+          });
+        }
+      } catch (err) {
+        setTektonNote(err.message, "danger");
+      }
+    }
+
+    document.getElementById("refreshTektonBtn").addEventListener("click", loadTekton);
+    document.getElementById("launchTektonGuiBtn").addEventListener("click", async () => {
+      try {
+        await api("/api/tekton/launch-gui", { method: "POST", body: {} });
+        setTektonNote("Launched native Tekton Control Center window.", "ok");
+      } catch (err) {
+        setTektonNote(err.message, "danger");
+      }
+    });
+    document.getElementById("syncFloorBtn").addEventListener("click", async () => {
+      try {
+        const res = await api("/api/tekton/sync-policy-floor", { method: "POST", body: {} });
+        setTektonNote(`Synced Aegis policy floor to ${res.target}.`, "ok");
+        loadTekton();
+      } catch (err) {
+        setTektonNote(err.message, "danger");
+      }
+    });
+    document.getElementById("tkAddDirBtn").addEventListener("click", async () => {
+      const inp = document.getElementById("tkDirInput");
+      const val = inp.value.trim();
+      if (!val) return;
+      try {
+        await api("/api/tekton/allow-dir", { method: "POST", body: { path: val } });
+        inp.value = "";
+        setTektonNote(`Added allowed workspace ${val}.`, "ok");
+        loadTekton();
+      } catch (err) {
+        setTektonNote(err.message, "danger");
+      }
+    });
+    document.getElementById("tkUnlockBtn").addEventListener("click", async () => {
+      try {
+        await api("/api/tekton/unlock", { method: "POST", body: {} });
+        setTektonNote("Cleared quarantined Tekton Aegis session.", "ok");
+        loadTekton();
+      } catch (err) {
+        setTektonNote(err.message, "danger");
+      }
+    });
+
     loadOverview();
     loadDetective();
+    loadTekton();
   </script>
 </body>
 </html>
