@@ -12,6 +12,7 @@ without touching the clans. The defaults are deliberately conservative:
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 from dataclasses import dataclass, field
@@ -192,6 +193,83 @@ SENSITIVE_AUTOEXEC = [
 
 SENSITIVE_PATH_PATTERNS = SENSITIVE_CRITICAL + SENSITIVE_STARTUP + SENSITIVE_SECRET_FILE + SENSITIVE_AUTOEXEC
 
+_SENSITIVE_CRITICAL_TEMPLATES = (
+    (".ssh",), (".aws",), (".gnupg",), (".netrc",), (".git-credentials",), (".pypirc",),
+    (".azure",), (".password-store",),
+    ("id_rsa",), ("id_rsa.pub",), ("id_dsa",), ("id_dsa.pub",),
+    ("id_ecdsa",), ("id_ecdsa.pub",), ("id_ed25519",), ("id_ed25519.pub",),
+    ("etc", "passwd"), ("etc", "shadow"), ("etc", "gshadow"), ("etc", "sudoers"),
+    ("etc", "sudoers.d"), ("etc", "master.passwd"),
+    ("windows", "system32", "config", "sam"),
+    ("windows", "system32", "config", "system"),
+    ("windows", "system32", "config", "security"),
+    (".kube", "config"), (".docker", "config.json"), (".config", "gcloud"),
+    (".local", "share", "keyrings"), ("library", "keychains"),
+    (".mozilla", "firefox"), ("google", "chrome", "user data"),
+    (".config", "google-chrome"),
+    ("proc", "kcore"), ("proc", "self", "environ"),
+    ("dev", "mem"), ("dev", "kmem"), ("dev", "port"),
+)
+
+_SENSITIVE_STARTUP_TEMPLATES = (
+    (".bashrc",), (".zshrc",), (".profile",), (".bash_profile",), (".bash_login",),
+    (".zprofile",), (".zshenv",), (".bash_logout",), (".gitconfig",),
+    (".bash_history",), (".zsh_history",),
+    (".config", "autostart"), (".config", "systemd", "user"),
+    ("etc", "crontab"), ("etc", "cron.d"), ("etc", "cron.daily"),
+    ("etc", "cron.hourly"), ("etc", "cron.weekly"), ("etc", "cron.monthly"),
+    ("var", "spool", "cron"), ("library", "launchagents"), ("library", "launchdaemons"),
+    ("start menu", "programs", "startup"),
+    ("documents", "powershell", "microsoft.powershell_profile.ps1"),
+    ("documents", "powershell", "profile.ps1"),
+    ("documents", "windowspowershell", "microsoft.powershell_profile.ps1"),
+    ("documents", "windowspowershell", "profile.ps1"),
+)
+
+_SENSITIVE_SECRET_TEMPLATES = (
+    (".env",), (".env.local",), (".env.production",), (".env.prod",),
+    (".env.development",), (".env.dev",), (".env.staging",), (".env.secret",),
+    (".npmrc",), ("credentials.json",),
+    ("service-account.json",), ("service_account.json",), ("serviceaccount.json",),
+    ("secret.json",), ("secrets.json",), ("secret.yaml",), ("secrets.yaml",),
+    ("secret.yml",), ("secrets.yml",), ("secret.toml",), ("secrets.toml",),
+    ("secret.env",), ("secrets.env",),
+)
+
+_SENSITIVE_AUTOEXEC_TEMPLATES = (
+    (".githooks",), (".husky",), (".envrc",),
+    ("sitecustomize.py",), ("usercustomize.py",), ("conftest.py",),
+    (".git", "hooks"), (".git", "config"),
+    (".vscode", "tasks.json"), (".github", "workflows"),
+)
+
+_SENSITIVE_DIR_TEMPLATES = frozenset({
+    (".ssh",), (".aws",), (".gnupg",), (".azure",), (".password-store",),
+    (".githooks",), (".husky",),
+})
+
+_GENERIC_WILDCARD_RE = re.compile(r"\*+(?:\.[a-z0-9_*]+)?")
+
+
+def has_glob(text: str) -> bool:
+    """Return True when *text* contains shell/PowerShell wildcard syntax."""
+    return bool(text) and (any(c in text for c in "*?") or ("[" in text and "]" in text))
+
+
+def is_generic_wildcard(part: str) -> bool:
+    """Return True for uninformative globs like '*', '**', '*.py', '*.json', '*.*'."""
+    return bool(_GENERIC_WILDCARD_RE.fullmatch((part or "").lower()))
+
+
+def glob_component_matches(pattern_part: str, literal_target: str) -> bool:
+    """Case-insensitive fnmatch of one path component, translating '[^...]' to '[!...]'."""
+    p = (pattern_part or "").lower()
+    t = (literal_target or "").lower()
+    if not has_glob(p):
+        return p == t
+    pat = re.sub(r"\[\^", "[!", p)
+    return fnmatch.fnmatchcase(t, pat)
+
 
 def _norm_for_match(path: str) -> str:
     p = (path or "").replace("\\", "/").lower()
@@ -224,7 +302,7 @@ def _win32_alias(path: str) -> str:
     return "/".join(out)
 
 
-def classify_sensitive(*paths: str) -> Optional[str]:
+def classify_sensitive(*paths: str, write_mode: bool = False) -> Optional[str]:
     """Return 'critical', 'startup', 'secret', 'autoexec' or None for the given path spellings."""
     spellings = [p for p in paths if p]
     spellings += [a for a in (_win32_alias(p) for p in spellings) if a not in spellings]
@@ -237,6 +315,37 @@ def classify_sensitive(*paths: str) -> Optional[str]:
             for pat in patterns:
                 if re.search(pat, c):
                     return cls_name
+    if any(has_glob(c) for c in candidates):
+        for cls_name, templates in (("critical", _SENSITIVE_CRITICAL_TEMPLATES),
+                                    ("startup", _SENSITIVE_STARTUP_TEMPLATES),
+                                    ("secret", _SENSITIVE_SECRET_TEMPLATES),
+                                    ("autoexec", _SENSITIVE_AUTOEXEC_TEMPLATES)):
+            allow_generic = (cls_name == "autoexec" and write_mode)
+            for c in candidates:
+                if not has_glob(c):
+                    continue
+                parts = [p for p in c.split("/") if p]
+                for tpl in templates:
+                    m = len(tpl)
+                    if len(parts) < m:
+                        continue
+                    for start in range(len(parts) - m + 1):
+                        window = parts[start : start + m]
+                        if not any(has_glob(w) for w in window):
+                            continue
+                        if m == 1:
+                            if tpl not in _SENSITIVE_DIR_TEMPLATES and start != len(parts) - 1:
+                                continue
+                            if is_generic_wildcard(window[0]) and not allow_generic:
+                                continue
+                        elif cls_name in ("critical", "startup"):
+                            if any(has_glob(w) and is_generic_wildcard(w) for w in window):
+                                continue
+                        else:
+                            if all(is_generic_wildcard(w) for w in window) and not allow_generic:
+                                continue
+                        if all(glob_component_matches(w, t) for w, t in zip(window, tpl)):
+                            return cls_name
     return None
 
 

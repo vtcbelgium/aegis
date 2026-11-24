@@ -1002,6 +1002,208 @@ def test_r10_nested_posix_bash_under_windows_shell_expands_braces(tmp_path):
         assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
 
 
+def test_r11_h1_glob_sensitive_dirs_and_hard_boundaries(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_file = protected / "config.json"
+    cfg_file.write_text('{"aegisMode":"enforce"}', encoding="utf-8")
+    tmp_posix = str(tmp_path).replace("\\", "/")
+
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+    pol_shared = AegisPolicy(extra_roots=[str(tmp_path)], protected_paths=[str(protected)])
+
+    # H-1: bash globs hiding sensitive directory names or sensitive filenames
+    for cmd in (
+        "echo TAMPERED > .gi?/config",
+        "echo x > .gi[t]/config",
+        "echo x > .git*/config",
+        "echo x > */config",
+        "cp z.sh .gi?/hooks/pre-commit",
+        "cp config .gi?",
+        "echo x > .vscod?/tasks.json",
+        "echo x > .husk?/pre-commit",
+        "echo x > .githu?/workflows/x.yml",
+        "echo x > conftes?.py",
+        "echo x > .envr?",
+        "cat .en?",
+        "cat .env*",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
+
+    for cmd in ("cat ~/.ss?/id_rsa", "cat /et?/passwd", "cat ~/.kub?/config"):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    v_startup = analyze_command("echo x > ~/.bashr?", base_dir=str(ws), cwd=str(ws), policy=pol)
+    assert v_startup.level >= L.DENY, (v_startup.level.name, v_startup.reasons)
+
+    # PowerShell wildcard parameters (both spaced and colon-attached)
+    for cmd in (
+        r"Set-Content -Path '.gi?\config' -Value x",
+        r"Set-Content -Path '.gi[t]\config' -Value x",
+        r"Add-Content -Path '.git*\config' -Value x",
+        r"Out-File -FilePath '.gi?\config' -InputObject x",
+        r"Copy-Item z.sh -Destination '.gi?\hooks\pre-commit'",
+        r"Set-Content -Path:.gi?\config -Value x",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol, windows=True)
+        assert v.level == L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Glob- and range-hidden writes to protected hard-boundary targets must LOCK
+    for cmd, win in (
+        (f"Set-Content -Path '{tmp_path}\\TektonEx?\\config.json' -Value x", True),
+        (f"Set-Content -Path '{protected}\\conf*' -Value x", True),
+        (f"echo x > {tmp_posix}/TektonEx{{d..f}}/config.json", False),
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared, windows=win)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    # Disk glob expansion: cat *.json passes with only package.json, asks once credentials.json exists
+    (ws / "package.json").write_text("{}", encoding="utf-8")
+    assert analyze_command("cat *.json", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.PASS
+    (ws / "credentials.json").write_text("{}", encoding="utf-8")
+    assert analyze_command("cat *.json", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.ASK
+
+    (ws / ".git").mkdir()
+    (ws / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    assert analyze_command("cat */config", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.PASS
+    assert analyze_command("echo x > */config", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.ASK
+
+
+def test_r11_h2_brace_wrapped_options_and_args(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_posix = str(protected / "config.json").replace("\\", "/")
+
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+    pol_shared = AegisPolicy(extra_roots=[str(tmp_path)], protected_paths=[str(protected)])
+
+    for cmd in (
+        "sort -S 1K --compress-progra{m=./z.sh,m=./z.sh} big.txt",
+        "sort -S 1K {--compress-program=./z.sh,} big.txt",
+        "sort -S 1K --compress-progra{m,}=./z.sh big.txt",
+        "sort -S 1K --compress-progra{l..n}=./z.sh big.txt",
+        "find . -name '*.txt' {-exec,} ./z.sh {} ';'",
+        "rg {--pre=./z.sh,} TODO",
+        "tar {--to-command=./z.sh,} -xf a.tar",
+        'env {-S,} \'sh -c "python -c 1"\'',
+        "{python,-c,'print(1)'}",
+        "git {-c,} core.pager=./z.sh log",
+        "less {+!./z.sh,} x.txt",
+        "sed {-e,} 'w /tmp/q' x.txt",
+        'awk {\'BEGIN{system("./z.sh")}\',}',
+        "xargs {-a,} list.txt ./z.sh",
+        "echo x > {safe.txt,.git/config}",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    for cmd in (
+        'env {-S,} \'sh -c "cat /etc/passwd"\'',
+        "env {AEGIS_MODE=off,} ls",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    for cmd in (
+        f"sort x.json {{--output={cfg_posix},}}",
+        f"sort x.json --outpu{{t={cfg_posix},t={cfg_posix}}}",
+        f"sort x.json -o{{{cfg_posix},{cfg_posix}}}",
+        f"sort x.json {{-o{cfg_posix},}}",
+        f"dd {{of={cfg_posix},}} if=x.json",
+        f"echo x > {{safe.txt,{cfg_posix}}}",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+
+def test_r11_windows_links_python_formatters_and_benign_nonregression(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_file = protected / "config.json"
+    cfg_file.write_text('{"aegisMode":"enforce"}', encoding="utf-8")
+
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+    pol_shared = AegisPolicy(
+        extra_roots=[str(tmp_path)],
+        protected_paths=[str(protected)],
+        project_exec="ask",
+    )
+
+    # Windows Junction / SymbolicLink / mklink targeting sensitive control dirs must ASK
+    for cmd in (
+        "New-Item -ItemType Junction -Path lnk -Target .git",
+        "New-Item -ItemType SymbolicLink -Path lnk -Target .git",
+        "cmd /c mklink /J lnk .git",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol, windows=True)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+    assert analyze_command("New-Item -ItemType File -Path notes.txt", base_dir=str(ws), cwd=str(ws), policy=pol, windows=True).level == L.PASS
+
+    # Python -I -m mutating formatters (black/isort/ruff) check writes
+    for cmd in (
+        f'python -I -m isort -a "import os" "{cfg_file}"',
+        f'python -I -m black "{cfg_file}"',
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared, windows=True)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    for cmd in (
+        'python -I -m isort -a "import os" .git/hooks/pre-commit.py',
+        "python -I -m black conftest.py",
+        "python -I -m ruff format conftest.py",
+        "python -I -m ruff check --fix conftest.py",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol, windows=True)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    for cmd in (
+        "python -I -m black src/app.py",
+        "python -I -m black --check conftest.py",
+        "python -I -m isort --settings-path .isort.cfg x.py",
+        "python -I -m ruff check conftest.py",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol, windows=True)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+    # cd / env --chdir into sensitive control dirs must ASK, benign dirs PASS
+    assert analyze_command("cd .git && ls", base_dir=str(ws), cwd=str(ws), policy=pol).level >= L.ASK
+    assert analyze_command("env --chdir=.git ls", base_dir=str(ws), cwd=str(ws), policy=pol).level >= L.ASK
+    assert analyze_command("cd src && ls", base_dir=str(ws), cwd=str(ws), policy=pol).level == L.PASS
+
+    # Benign non-regression checks must all PASS
+    for cmd in (
+        "cp {a,b}.txt dir/",
+        "mkdir -p src/{a,b,c}",
+        "echo {1..100}",
+        "wc -l src/*.py",
+        "ls *.json",
+        "awk '{print $1, $2}' data.txt",
+        "jq '{a: .x, b: .y}' data.json",
+        "chmod +x scripts/*.sh",
+        "gzip logs/*.log",
+        "cat .env.example",
+        "cat .git/config",
+        "cat .gi?/config",
+        "find . -name '*.txt' -exec echo {} ';'",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+
 
 
 

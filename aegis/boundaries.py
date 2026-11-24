@@ -24,6 +24,8 @@ import os
 import re
 from typing import Iterable, List, Optional, Tuple
 
+from .policy import glob_component_matches, has_glob, is_generic_wildcard
+
 POLICY_TAMPER = "AEGIS_POLICY_TAMPER"
 LOGGING_DISABLE = "SECURITY_LOGGING_DISABLE"
 BACKUP_DESTRUCTION = "BACKUP_DESTRUCTION"
@@ -83,6 +85,39 @@ def _any_inside(path: str, roots: Iterable[str]) -> Optional[str]:
     return None
 
 
+def _inside_or_glob(path: str, root: str, *, allow_generic_leaf: bool = False) -> bool:
+    if _inside(path, root):
+        return True
+    if not has_glob(path):
+        return False
+    p_parts = [s for s in _norm(path).split("/") if s]
+    r_parts = [s for s in _norm(root).split("/") if s]
+    if not r_parts or len(p_parts) < len(r_parts):
+        return False
+    if not allow_generic_leaf and len(p_parts) == len(r_parts) and is_generic_wildcard(p_parts[-1]):
+        return False
+    return all(glob_component_matches(p_parts[i], r_parts[i]) for i in range(len(r_parts)))
+
+
+def _contains_or_glob(path: str, root: str) -> bool:
+    if _inside(root, path):
+        return True
+    if not has_glob(path):
+        return False
+    p_parts = [s for s in _norm(path).split("/") if s]
+    r_parts = [s for s in _norm(root).split("/") if s]
+    if 0 < len(p_parts) <= len(r_parts) and (not is_generic_wildcard(p_parts[-1]) or len(p_parts) == len(r_parts)):
+        return all(glob_component_matches(p_parts[i], r_parts[i]) for i in range(len(p_parts)))
+    return False
+
+
+def _any_inside_or_glob(path: str, roots: Iterable[str], *, allow_generic_leaf: bool = False) -> Optional[str]:
+    for r in roots:
+        if r and _inside_or_glob(path, r, allow_generic_leaf=allow_generic_leaf):
+            return r
+    return None
+
+
 def control_paths(policy) -> List[str]:
     """Aegis's own state and code, plus whatever the host declares (Tekton's mode file, identity ...)."""
     roots = ([aegis_home()] + list(getattr(policy, "protected_paths", None) or [])
@@ -98,7 +133,7 @@ def is_backup_path(abs_path: str, policy=None, is_dir: Optional[bool] = None) ->
     Parent directories decide. The final name only counts when it is itself a directory,
     so a source file called backup_service.py is not a backup location.
     """
-    if _any_inside(abs_path, getattr(policy, "backup_paths", None) or []):
+    if _any_inside_or_glob(abs_path, getattr(policy, "backup_paths", None) or []):
         return True
     parts = [s for s in _norm(abs_path).split("/") if s]
     if not parts:
@@ -132,22 +167,28 @@ def check_path(abs_path: str, mode: str, policy) -> Optional[Tuple[str, str, str
     if not abs_path:
         return None
     changing = mode in ("write", "delete")
-    if mode in ("read", "upload", "exec") and _any_inside(abs_path, getattr(policy, "secret_paths", None) or []):
+    if mode in ("read", "upload", "exec") and _any_inside_or_glob(abs_path, getattr(policy, "secret_paths", None) or []):
         return MASTER_SECRET, "LOCK", "Hard boundary MASTER_SECRET_EXTRACTION: accesses a host-declared secret store"
-    root = _any_inside(abs_path, control_paths(policy))
+    root = _any_inside_or_glob(abs_path, control_paths(policy))
     if changing and root is None:
-        root = next((p for p in control_paths(policy) if _inside(p, abs_path)), None)
+        root = next((p for p in control_paths(policy) if _contains_or_glob(abs_path, p)), None)
     if root is not None:
         if changing:
             return POLICY_TAMPER, "LOCK", f"Hard boundary {POLICY_TAMPER}: changes Aegis's own policy, state or code ({abs_path})"
-        if _inside(abs_path, aegis_home()) and mode in ("read", "upload", "exec"):
+        ah = aegis_home()
+        if _inside_or_glob(abs_path, ah) and mode in ("read", "upload", "exec"):
             # The ledger stays readable; the tripwire registry and session state do not.
-            name = _norm(abs_path)
-            if name.endswith("/minotaur.json") or "/sessions" in name[len(_norm(aegis_home())):] or name == _norm(aegis_home()):
+            p_parts = [s for s in _norm(abs_path).split("/") if s]
+            ah_parts = [s for s in _norm(ah).split("/") if s]
+            if (
+                _inside_or_glob(abs_path, os.path.join(ah, "minotaur.json"))
+                or _inside_or_glob(abs_path, os.path.join(ah, "sessions"))
+                or (len(p_parts) == len(ah_parts) and _inside_or_glob(abs_path, ah))
+            ):
                 return POLICY_TAMPER, "DENY", f"Hard boundary {POLICY_TAMPER}: reads Aegis's tripwire registry or session state"
     if changing:
         logs = list(SYSTEM_LOG_DIRS) + list(getattr(policy, "log_paths", None) or [])
-        if _any_inside(abs_path, logs):
+        if _any_inside_or_glob(abs_path, logs):
             return LOGGING_DISABLE, "LOCK", f"Hard boundary {LOGGING_DISABLE}: changes or deletes security logs ({abs_path})"
     if mode == "delete" and is_backup_path(abs_path, policy):
         return BACKUP_DESTRUCTION, "LOCK", f"Hard boundary {BACKUP_DESTRUCTION}: deletes backup or recovery data ({abs_path})"

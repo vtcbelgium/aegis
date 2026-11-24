@@ -13,9 +13,12 @@ powershell -Command) and the working directory changes made by cd within one com
 from __future__ import annotations
 
 import base64
+import glob
+import itertools
 import os
 import re
 import shlex
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -27,8 +30,11 @@ from .policy import (
     DEFAULT_POLICY,
     AegisPolicy,
     classify_sensitive,
+    glob_component_matches,
+    has_glob,
     is_catastrophic_target,
     is_exfil_sink,
+    is_generic_wildcard,
 )
 
 NAME = "Tartarus"
@@ -269,7 +275,7 @@ _BENIGN_GIT_ENV_VARS = frozenset({
     "GIT_TERMINAL_PROMPT",
 })
 
-_SENSITIVE_CONTROL_DIRS = frozenset({".git", ".husky", ".vscode", ".github", ".devcontainer", ".idea"})
+_SENSITIVE_CONTROL_DIRS = frozenset({".git", ".githooks", ".husky", ".vscode", ".github", ".devcontainer", ".idea"})
 
 
 def _is_dangerous_env_var(name: str) -> bool:
@@ -289,7 +295,12 @@ def _touches_sensitive_control_dir(path_str: str) -> bool:
     if not path_str:
         return False
     parts = [p.rstrip(". ").lower() for p in path_str.replace("\\", "/").split("/") if p]
-    return any(p in _SENSITIVE_CONTROL_DIRS for p in parts)
+    for p in parts:
+        if p in _SENSITIVE_CONTROL_DIRS:
+            return True
+        if has_glob(p) and not is_generic_wildcard(p) and any(glob_component_matches(p, d) for d in _SENSITIVE_CONTROL_DIRS):
+            return True
+    return False
 SECRET_VAR_RE = re.compile(
     r"(?:\$\{?|\$env:|%)([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|AUTH)[A-Za-z0-9_]*)",
     re.IGNORECASE,
@@ -988,6 +999,7 @@ def _analyze(text: str, ctx: _Ctx) -> None:
     windows = windows or _detect_windows(text, ctx)
     if windows:
         ctx.force_windows = True
+    text = _expand_shell_braces(text, ctx, windows=windows)
     try:
         tokens = _strip_safe_ps_member_chains(_lex(text, windows))
     except ValueError:
@@ -1027,24 +1039,256 @@ def _is_option(word: str, windows_flags: bool = False) -> bool:
     return False
 
 
-def _expand_brace_candidates(word: str, limit: int = 16) -> Optional[List[str]]:
-    """Expand bash-style brace expressions ({a,b}, {.git/config,}) into concrete path candidates.
+def _expand_brace_sequence(inner: str, limit: int) -> Tuple[bool, Optional[List[str]]]:
+    """Expand bash {start..end[..step]} integer or single-ASCII-letter sequences up to *limit*."""
+    if not inner or any(c in inner for c in " \t\r\n'\"{},"):
+        return False, None
+    parts = inner.split("..")
+    if len(parts) not in (2, 3):
+        return False, None
+    a, b = parts[0], parts[1]
+    step_raw = parts[2] if len(parts) == 3 else None
 
-    Returns None when the expression is a range ({a..z}) or exceeds *limit* candidates
-    so the caller can fail closed to ASK.
-    """
-    m = re.search(r"\{([^{}]+)\}", word)
-    if not m:
-        return [word]
-    inner = m.group(1)
-    if ".." in inner and "," not in inner:
+    if re.fullmatch(r"[+-]?\d+", a) and re.fullmatch(r"[+-]?\d+", b) and (
+        step_raw is None or re.fullmatch(r"[+-]?\d+", step_raw)
+    ):
+        start, end = int(a), int(b)
+        raw_step = abs(int(step_raw)) if step_raw is not None else 1
+        if raw_step == 0:
+            raw_step = 1
+        step = raw_step if start <= end else -raw_step
+        count = abs(end - start) // abs(step) + 1
+        if count > limit:
+            return True, None
+
+        def _pad_width(s: str) -> int:
+            digits = s.lstrip("+-")
+            return len(digits) if (len(digits) > 1 and digits.startswith("0")) else 0
+
+        pad = max(_pad_width(a), _pad_width(b))
+        vals: List[str] = []
+        cur = start
+        while (cur <= end) if step > 0 else (cur >= end):
+            if pad:
+                sign = "-" if cur < 0 else ""
+                vals.append(f"{sign}{abs(cur):0{pad}d}")
+            else:
+                vals.append(str(cur))
+            cur += step
+        return True, vals
+
+    if (
+        len(a) == 1 and len(b) == 1 and a.isascii() and b.isascii() and a.isalpha() and b.isalpha()
+        and (step_raw is None or re.fullmatch(r"[+-]?\d+", step_raw))
+    ):
+        o1, o2 = ord(a), ord(b)
+        raw_step = abs(int(step_raw)) if step_raw is not None else 1
+        if raw_step == 0:
+            raw_step = 1
+        step = raw_step if o1 <= o2 else -raw_step
+        count = abs(o2 - o1) // abs(step) + 1
+        if count > limit:
+            return True, None
+        vals = []
+        cur = o1
+        while (cur <= o2) if step > 0 else (cur >= o2):
+            vals.append(chr(cur))
+            cur += step
+        return True, vals
+
+    return False, None
+
+
+def _find_unquoted_brace_span(
+    word: str,
+    windows: bool,
+    *,
+    respect_quotes: bool = True,
+) -> Optional[Tuple[int, int, List[str], bool]]:
+    """Find the first expandable unquoted {a,b} or {a..b} span in *word*."""
+    n = len(word)
+    i = 0
+    in_s = in_d = False
+    while i < n:
+        ch = word[i]
+        if respect_quotes:
+            if in_s:
+                if windows and ch == "'" and i + 1 < n and word[i + 1] == "'":
+                    i += 2
+                    continue
+                if ch == "'":
+                    in_s = False
+                i += 1
+                continue
+            if in_d:
+                if windows and ch == "`" and i + 1 < n:
+                    i += 2
+                    continue
+                if (not windows) and ch == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_d = False
+                i += 1
+                continue
+            if windows and ch == "`" and i + 1 < n:
+                i += 2
+                continue
+            if (not windows) and ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "'":
+                in_s = True
+                i += 1
+                continue
+            if ch == '"':
+                in_d = True
+                i += 1
+                continue
+            if (ch == "$" or (windows and ch == "@")) and i + 1 < n and word[i + 1] == "{":
+                depth = 1
+                j = i + 2
+                j_s = j_d = False
+                while j < n and depth > 0:
+                    cj = word[j]
+                    if j_s:
+                        if windows and cj == "'" and j + 1 < n and word[j + 1] == "'":
+                            j += 2
+                            continue
+                        if cj == "'":
+                            j_s = False
+                    elif j_d:
+                        if windows and cj == "`" and j + 1 < n:
+                            j += 2
+                            continue
+                        if (not windows) and cj == "\\" and j + 1 < n:
+                            j += 2
+                            continue
+                        if cj == '"':
+                            j_d = False
+                    else:
+                        if windows and cj == "`" and j + 1 < n:
+                            j += 2
+                            continue
+                        if (not windows) and cj == "\\" and j + 1 < n:
+                            j += 2
+                            continue
+                        if cj == "'":
+                            j_s = True
+                        elif cj == '"':
+                            j_d = True
+                        elif cj == "{":
+                            depth += 1
+                        elif cj == "}":
+                            depth -= 1
+                    j += 1
+                i = j
+                continue
+
+        if ch == "{":
+            depth = 1
+            j = i + 1
+            j_s = j_d = False
+            commas: List[int] = []
+            while j < n and depth > 0:
+                cj = word[j]
+                if respect_quotes:
+                    if j_s:
+                        if windows and cj == "'" and j + 1 < n and word[j + 1] == "'":
+                            j += 2
+                            continue
+                        if cj == "'":
+                            j_s = False
+                        j += 1
+                        continue
+                    if j_d:
+                        if windows and cj == "`" and j + 1 < n:
+                            j += 2
+                            continue
+                        if (not windows) and cj == "\\" and j + 1 < n:
+                            j += 2
+                            continue
+                        if cj == '"':
+                            j_d = False
+                        j += 1
+                        continue
+                    if windows and cj == "`" and j + 1 < n:
+                        j += 2
+                        continue
+                    if (not windows) and cj == "\\" and j + 1 < n:
+                        j += 2
+                        continue
+                    if cj == "'":
+                        j_s = True
+                        j += 1
+                        continue
+                    if cj == '"':
+                        j_d = True
+                        j += 1
+                        continue
+                if cj == "{":
+                    depth += 1
+                elif cj == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif cj == "," and depth == 1:
+                    commas.append(j)
+                j += 1
+
+            if depth == 0:
+                if commas:
+                    alts: List[str] = []
+                    prev = i + 1
+                    for cpos in commas:
+                        alts.append(word[prev:cpos])
+                        prev = cpos + 1
+                    alts.append(word[prev:j])
+                    return i, j, alts, False
+                inner = word[i + 1 : j]
+                if ".." in inner and _expand_brace_sequence(inner, 10**9)[0]:
+                    return i, j, [inner], True
+            i += 1
+            continue
+        i += 1
+    return None
+
+
+def _expand_brace_word(
+    word: str,
+    windows: bool,
+    limit: int = 32,
+    _depth: int = 0,
+    *,
+    respect_quotes: bool = True,
+) -> Optional[List[str]]:
+    if _depth > 16:
         return None
-    if "," not in inner:
+    span = _find_unquoted_brace_span(word, windows, respect_quotes=respect_quotes)
+    if span is None:
         return [word]
-    prefix, suffix = word[: m.start()], word[m.end() :]
+    open_idx, close_idx, items, is_seq = span
+    prefix = word[:open_idx]
+    suffix = word[close_idx + 1 :]
+    if is_seq:
+        valid, seq = _expand_brace_sequence(items[0], limit)
+        if not valid or seq is None:
+            return None
+        parts = seq
+    else:
+        parts = items
     results: List[str] = []
-    for part in inner.split(","):
-        expanded = _expand_brace_candidates(prefix + part + suffix, limit=limit - len(results))
+    for part in parts:
+        rem = limit - len(results)
+        if rem <= 0:
+            return None
+        expanded = _expand_brace_word(
+            prefix + part + suffix,
+            windows,
+            limit=rem,
+            _depth=_depth + 1,
+            respect_quotes=respect_quotes,
+        )
         if expanded is None:
             return None
         results.extend(expanded)
@@ -1053,7 +1297,144 @@ def _expand_brace_candidates(word: str, limit: int = 16) -> Optional[List[str]]:
     return results
 
 
-def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False) -> Optional[str]:
+def _expand_shell_braces(text: str, ctx: _Ctx, windows: bool = False) -> str:
+    """Expand unquoted bash brace words ({--opt=val,}, --opt{a,b}=v) before lexing."""
+    if "{" not in text or "}" not in text:
+        return text
+    out: List[str] = []
+    i = 0
+    n = len(text)
+    after_redirect = False
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r":
+            j = i + 1
+            while j < n and text[j] in " \t\r":
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+        if ch in ";&|()<>\n":
+            j = i + 1
+            while j < n and text[j] in ";&|()<>\n":
+                j += 1
+            op = text[i:j]
+            out.append(op)
+            after_redirect = "<" in op or ">" in op
+            i = j
+            continue
+        j = i
+        in_s = in_d = False
+        brace_depth = 0
+        while j < n:
+            cj = text[j]
+            if in_s:
+                if windows and cj == "'" and j + 1 < n and text[j + 1] == "'":
+                    j += 2
+                    continue
+                if cj == "'":
+                    in_s = False
+                j += 1
+                continue
+            if in_d:
+                if windows and cj == "`" and j + 1 < n:
+                    j += 2
+                    continue
+                if (not windows) and cj == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if cj == '"':
+                    in_d = False
+                j += 1
+                continue
+            if windows and cj == "`" and j + 1 < n:
+                j += 2
+                continue
+            if (not windows) and cj == "\\" and j + 1 < n:
+                j += 2
+                continue
+            if cj == "'":
+                in_s = True
+                j += 1
+                continue
+            if cj == '"':
+                in_d = True
+                j += 1
+                continue
+            if cj == "{":
+                brace_depth += 1
+                j += 1
+                continue
+            if cj == "}":
+                if brace_depth > 0:
+                    brace_depth -= 1
+                j += 1
+                continue
+            if brace_depth == 0 and cj in " \t\r;&|()<>\n":
+                break
+            if brace_depth > 0 and cj in " \t\r\n":
+                break
+            j += 1
+        word = text[i:j]
+        i = j
+        is_redir_target = after_redirect
+        after_redirect = False
+        if not is_redir_target and "{" in word and "}" in word and _find_unquoted_brace_span(word, windows) is not None:
+            expanded = _expand_brace_word(word, windows=windows, limit=32)
+            if expanded is None:
+                if not re.fullmatch(r"\{[+-]?\d+\.\.[+-]?\d+(?:\.\.[+-]?\d+)?\}", word):
+                    _add(ctx, L.ASK, f"Command uses complex shell brace expansion: {word}")
+                    for frag in re.split(r"[{},=]+", word):
+                        frag_clean = frag.strip("'\"")
+                        if not frag_clean:
+                            continue
+                        if boundaries.GUARD_ENV_RE.match(frag_clean):
+                            raise _Lock(f"Hard boundary {boundaries.POLICY_TAMPER}: sets {frag_clean}", boundaries.POLICY_TAMPER)
+                        if _looks_like_path_token(frag_clean) or classify_sensitive(frag_clean, write_mode=True) or _touches_sensitive_control_dir(frag_clean):
+                            _check_path(ctx, frag_clean, "write")
+                out.append(word)
+            else:
+                non_empty = [cand for cand in expanded if cand]
+                if non_empty:
+                    out.append(" ".join(non_empty))
+        else:
+            out.append(word)
+    return "".join(out)
+
+
+def _expand_brace_candidates(word: str, limit: int = 32) -> Optional[List[str]]:
+    """Expand bash-style brace expressions ({a,b}, {a..z}, {.git/config,}) into concrete path candidates.
+
+    Returns None when the expansion exceeds *limit* candidates so the caller can fail closed to ASK.
+    """
+    return _expand_brace_word(word, windows=True, limit=limit, respect_quotes=False)
+
+
+def _expand_fs_glob(abs_path: str, *, include_hidden: bool, limit: int = 64) -> List[str]:
+    """Expand an existing workspace glob pattern up to *limit* paths without raising."""
+    if looks_windows_path(abs_path) and os.name != "nt":
+        return []
+    if os.name == "nt" and abs_path.startswith("/") and not abs_path.startswith("//"):
+        return []
+    pat = re.sub(r"\[\^", "[!", abs_path)
+    try:
+        if sys.version_info >= (3, 11):
+            it = glob.iglob(pat, include_hidden=include_hidden)
+        else:
+            it = glob.iglob(pat)
+        return list(itertools.islice(it, limit))
+    except OSError:
+        return []
+
+
+def _check_path(
+    ctx: _Ctx,
+    raw: str,
+    mode: str = "read",
+    recursive: bool = False,
+    *,
+    _from_glob: bool = False,
+) -> Optional[str]:
     """Check one path argument; returns the resolved path (or None if it was refused)."""
     if raw is None:
         return None
@@ -1073,7 +1454,7 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
         for cand in candidates:
             if not cand:
                 continue
-            r = _check_path(ctx, cand, mode, recursive=recursive)
+            r = _check_path(ctx, cand, mode, recursive=recursive, _from_glob=_from_glob)
             if r is not None:
                 last_resolved = r
         return last_resolved
@@ -1115,12 +1496,21 @@ def _check_path(ctx: _Ctx, raw: str, mode: str = "read", recursive: bool = False
             _add(ctx, L.DENY if level == "DENY" else L.ASK, reason)
             if level == "DENY":
                 return None
-    sensitivity = classify_sensitive(word, abs_path)
+    sensitivity = classify_sensitive(word, abs_path, write_mode=(mode != "read"))
     if sensitivity == "critical":
         raise _Lock(f"Command accesses a credential or system store: {raw}", boundaries.MASTER_SECRET)
     if sensitivity == "startup" and mode != "read":
         _add(ctx, L.DENY, f"Command writes a startup/persistence file: {raw}")
         return None
+
+    if not _from_glob and not unresolved and has_glob(abs_path):
+        include_hidden = (
+            ctx.force_windows
+            or mode != "read"
+            or any(p.startswith(".") for p in abs_path.replace("\\", "/").split("/") if p)
+        )
+        for match in _expand_fs_glob(abs_path, include_hidden=include_hidden, limit=64):
+            _check_path(ctx, match, "move" if moving else mode, recursive=recursive, _from_glob=True)
 
     if mode == "delete" and not unresolved:
         ctx.destructive.append({"operation": "delete", "target": abs_path})
@@ -1460,6 +1850,7 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
                         if any(c in target for c in "*?[]{}"):
                             _add(ctx, L.ASK, f"env --chdir target contains glob/brace wildcard: {target}")
                         resolved_cd = _check_path(ctx, target, "cd")
+                        _check_cd_control_dir(ctx, target, resolved_cd, "env --chdir")
                         if resolved_cd is not None:
                             ctx.cwd = resolved_cd
                     continue
@@ -1497,6 +1888,7 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
                             if any(c in target for c in "*?[]{}"):
                                 _add(ctx, L.ASK, f"env -C target contains glob/brace wildcard: {target}")
                             resolved_cd = _check_path(ctx, target, "cd")
+                            _check_cd_control_dir(ctx, target, resolved_cd, "env -C")
                             if resolved_cd is not None:
                                 ctx.cwd = resolved_cd
                         break
@@ -1607,6 +1999,8 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
         return _copy_like(name, args, ctx)
     if name in ("chown", "chgrp"):
         return _chown(args, ctx)
+    if name in ("new-item", "ni", "mklink"):
+        return _link_or_new_item(name, args, ctx)
     if name in WRITE_BINARIES:
         return _paths(ctx, args, "write", windows=name in CMD_BUILTINS)
     if name == "git":
@@ -1659,6 +2053,13 @@ def _looks_like_path_token(val: str) -> bool:
     )
 
 
+_PS_PATH_PARAMS = ("-path", "-literalpath", "-filepath", "-destination", "-target", "-outfile", "-output")
+_PS_NON_PATH_PARAMS = frozenset({
+    "-value", "-encoding", "-inputobject", "-itemtype", "-type", "-delimiter",
+    "-force", "-confirm", "-whatif", "-raw", "-width", "-tail", "-totalcount",
+})
+
+
 def _paths(ctx: _Ctx, args: List[str], mode: str, windows: bool = False) -> None:
     end_of_opts = False
     for a in args:
@@ -1669,6 +2070,11 @@ def _paths(ctx: _Ctx, args: List[str], mode: str, windows: bool = False) -> None
             if "=" in a and a.startswith("--"):
                 val = a.split("=", 1)[1]
                 if _looks_like_path_token(val):
+                    _check_path(ctx, val, mode)
+            elif ":" in a and a.startswith("-") and not a.startswith("--"):
+                opt_name, _, val = a.partition(":")
+                low_opt = opt_name.lower()
+                if val and len(low_opt) >= 2 and low_opt not in _PS_NON_PATH_PARAMS and any(p.startswith(low_opt) for p in _PS_PATH_PARAMS):
                     _check_path(ctx, val, mode)
             continue
         if "://" in a:
@@ -1889,6 +2295,15 @@ def _xargs(args: List[str], seg: Segment, ctx: _Ctx) -> None:
     _dispatch(rest, Segment(words=rest, piped_in=seg.piped_in), ctx)
 
 
+def _check_cd_control_dir(ctx: _Ctx, target: str, resolved: Optional[str], label: str) -> None:
+    if _touches_sensitive_control_dir(target) or (
+        resolved is not None
+        and _touches_sensitive_control_dir(resolved)
+        and not _touches_sensitive_control_dir(ctx.base_dir or "")
+    ):
+        _add(ctx, L.ASK, f"{label} enters sensitive control directory '{target}' (owner approval)")
+
+
 def _cd(args: List[str], ctx: _Ctx) -> None:
     targets = [a for a in args if not _is_option(a)]
     target = targets[0] if targets else "~"
@@ -1899,6 +2314,7 @@ def _cd(args: List[str], ctx: _Ctx) -> None:
         _add(ctx, L.ASK, f"cd target contains glob/brace wildcard: {target}")
         return
     resolved = _check_path(ctx, target, "cd")
+    _check_cd_control_dir(ctx, target, resolved, "cd")
     if resolved is not None:
         ctx.cwd = resolved
 
@@ -2301,6 +2717,90 @@ def _python_module_paths(mod_l: str, rest: List[str], ctx: _Ctx) -> None:
                         _check_path(ctx, val, "read")
                 continue
             _check_path(ctx, a, "write")
+        return
+    if mod_l in ("black", "isort"):
+        read_only = any(a in ("--check", "--check-only", "--diff") or (mod_l == "isort" and a == "-c") for a in rest)
+        path_read_opts = {"--config", "--settings-path", "--settings-file", "--sp"}
+        nonpath_val_opts = {
+            "-a", "--add-import", "--rm", "--remove-import", "-l", "--line-length",
+            "--profile", "-m", "--multi-line", "-t", "--target-version",
+            "--include", "--exclude", "--extend-exclude", "--force-exclude",
+            "-s", "--skip", "--skip-glob", "-w", "--workers", "--stdin-filename",
+        }
+        if mod_l == "black":
+            nonpath_val_opts = nonpath_val_opts | {"-c", "--code"}
+        else:
+            nonpath_val_opts = nonpath_val_opts | {"--code"}
+        end_of_opts = False
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            i += 1
+            if a == "--" and not end_of_opts:
+                end_of_opts = True
+                continue
+            if not end_of_opts and a.startswith("-") and len(a) > 1:
+                if a.startswith("--") and "=" in a:
+                    opt, val = a.split("=", 1)
+                    if opt in path_read_opts:
+                        _check_path(ctx, val, "read")
+                    elif opt not in nonpath_val_opts and _looks_like_path_token(val):
+                        _check_path(ctx, val, "read")
+                elif a in path_read_opts:
+                    if i < len(rest):
+                        _check_path(ctx, rest[i], "read")
+                        i += 1
+                elif a in nonpath_val_opts:
+                    if i < len(rest):
+                        i += 1
+                continue
+            _check_path(ctx, a, "read" if read_only else "write")
+        return
+    if mod_l == "ruff":
+        mutating = (
+            ("format" in rest and not any(a in ("--check", "--diff") for a in rest))
+            or any(a == "--fix" or a.startswith("--fix-") or a == "--unsafe-fixes" for a in rest)
+        )
+        nonpath_val_opts = {
+            "--select", "--ignore", "--extend-select", "--extend-ignore", "--exclude",
+            "--extend-exclude", "--target-version", "--line-length", "--output-format",
+            "--cache-dir", "--stdin-filename",
+        }
+        end_of_opts = False
+        sub_seen = False
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            i += 1
+            if a == "--" and not end_of_opts:
+                end_of_opts = True
+                continue
+            if not end_of_opts and a.startswith("-") and len(a) > 1:
+                if a.startswith("--") and "=" in a:
+                    opt, val = a.split("=", 1)
+                    if opt == "--config":
+                        _check_path(ctx, val, "read")
+                    elif opt == "--output-file":
+                        _check_path(ctx, val, "write")
+                    elif opt not in nonpath_val_opts and _looks_like_path_token(val):
+                        _check_path(ctx, val, "read")
+                elif a == "--config":
+                    if i < len(rest):
+                        _check_path(ctx, rest[i], "read")
+                        i += 1
+                elif a in ("-o", "--output-file"):
+                    if i < len(rest):
+                        _check_path(ctx, rest[i], "write")
+                        i += 1
+                elif a in nonpath_val_opts:
+                    if i < len(rest):
+                        i += 1
+                continue
+            if not end_of_opts and not sub_seen and a in ("format", "check", "rule", "linter", "clean", "version", "help"):
+                sub_seen = True
+                continue
+            sub_seen = True
+            _check_path(ctx, a, "write" if mutating else "read")
         return
     _paths(ctx, rest, "read")
 
@@ -2811,6 +3311,11 @@ def _delete(name: str, args: List[str], ctx: _Ctx) -> None:
             recursive = True
             continue
         if not end and _is_option(a, windows):
+            if ":" in a and a.startswith("-") and not a.startswith("--"):
+                opt_l, _, val = a.partition(":")
+                if opt_l.lower() in ("-path", "-literalpath") and val:
+                    targets.append(val)
+                continue
             if low.startswith("-path") or low.startswith("-literalpath"):
                 continue
             if low == "--no-preserve-root":
@@ -2851,6 +3356,15 @@ def _copy_like(name: str, args: List[str], ctx: _Ctx) -> None:
         if low.startswith("--target-directory="):
             dest = a.split("=", 1)[1]
             continue
+        if ":" in a and a.startswith("-") and not a.startswith("--"):
+            opt_l, _, val = a.partition(":")
+            low_opt = opt_l.lower()
+            if val and low_opt.startswith("-dest") and "-destination".startswith(low_opt):
+                dest = val
+                continue
+            if val and low_opt in ("-path", "-literalpath"):
+                pos.append(val)
+                continue
         if low in value_opts and rest:
             val = rest.pop(0)
             if low in ("-path", "-literalpath"):
@@ -2874,7 +3388,61 @@ def _copy_like(name: str, args: List[str], ctx: _Ctx) -> None:
         if linking and (_touches_sensitive_control_dir(resolved_src or src) or any(c in src for c in "*?[]{}")):
             _add(ctx, L.ASK, f"{name} links sensitive or wildcard target '{src}' (owner approval)")
     if dest is not None:
-        _check_path(ctx, dest, "write")
+        resolved_dest = _check_path(ctx, dest, "write")
+        if _touches_sensitive_control_dir(resolved_dest or dest):
+            for src in pos:
+                base = src.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                if base:
+                    _check_path(ctx, dest.rstrip("/\\") + "/" + base, "write")
+
+
+def _link_or_new_item(name: str, args: List[str], ctx: _Ctx) -> None:
+    """Check Windows mklink and PowerShell New-Item / ni link creations targeting sensitive paths."""
+    _paths(ctx, args, "write", windows=True)
+    if name == "mklink":
+        for a in args:
+            if not _is_option(a, windows_flags=True):
+                resolved = _check_path(ctx, a, "read")
+                if (
+                    _touches_sensitive_control_dir(resolved or a)
+                    or classify_sensitive(a, resolved or "", write_mode=True)
+                    or any(c in a for c in "*?[]{}")
+                ):
+                    _add(ctx, L.ASK, f"mklink links sensitive or wildcard target '{a}' (owner approval)")
+        return
+    item_type = ""
+    targets: List[str] = []
+    i = 0
+    n = len(args)
+    while i < n:
+        a = args[i]
+        low = a.lower()
+        if ":" in a and a.startswith("-") and not a.startswith("--"):
+            opt_l, _, val = a.partition(":")
+            if opt_l.lower() in ("-itemtype", "-type"):
+                item_type = val.lower()
+            elif opt_l.lower() in ("-target", "-value") and val:
+                targets.append(val)
+            i += 1
+            continue
+        if low in ("-itemtype", "-type") and i + 1 < n:
+            item_type = args[i + 1].lower()
+            i += 2
+            continue
+        if low in ("-target", "-value") and i + 1 < n:
+            targets.append(args[i + 1])
+            i += 2
+            continue
+        i += 1
+    if item_type.startswith(("junction", "symboliclink", "hardlink", "symlink", "junc", "sym", "hard")):
+        for t in targets:
+            resolved = _check_path(ctx, t, "read")
+            if (
+                _touches_sensitive_control_dir(resolved or t)
+                or classify_sensitive(t, resolved or "", write_mode=True)
+                or any(c in t for c in "*?[]{}")
+            ):
+                _add(ctx, L.ASK, f"{name} links sensitive or wildcard target '{t}' (owner approval)")
 
 
 def _chown(args: List[str], ctx: _Ctx) -> None:
@@ -3090,7 +3658,7 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
         if "://" in a or (re.match(r"^[\w.-]+@[\w.-]+:", a) and not looks_windows_path(a)):
             _add(ctx, L.ASK, f"tar to a remote archive: {a}")
             continue
-        if extracting and (_touches_sensitive_control_dir(a) or classify_sensitive(a) in ("autoexec", "startup", "critical", "secret")):
+        if extracting and (_touches_sensitive_control_dir(a) or classify_sensitive(a, write_mode=True) in ("autoexec", "startup", "critical", "secret")):
             _check_path(ctx, a, "write")
             if _touches_sensitive_control_dir(a):
                 _add(ctx, L.ASK, f"tar extracts sensitive control member '{a}' (owner approval)")
@@ -3149,7 +3717,7 @@ def _archive_extract(name: str, args: List[str], ctx: _Ctx) -> None:
                     continue
                 if i == 1 and sub_7z in ("a", "d", "e", "l", "t", "u", "x"):
                     continue
-        if _touches_sensitive_control_dir(a) or classify_sensitive(a) in ("autoexec", "startup", "critical", "secret"):
+        if _touches_sensitive_control_dir(a) or classify_sensitive(a, write_mode=True) in ("autoexec", "startup", "critical", "secret"):
             _check_path(ctx, a, "write")
             if _touches_sensitive_control_dir(a):
                 _add(ctx, L.ASK, f"{name} targets sensitive control path '{a}' (owner approval)")
