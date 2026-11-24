@@ -156,6 +156,72 @@ SAFE_PY_MODULES = {"pip", "venv", "virtualenv", "pytest", "unittest", "doctest",
                    "py_compile", "compileall", "ensurepip",
                    "mypy", "black", "ruff", "flake8", "pylint", "isort", "coverage",
                    "tox", "nox", "site", "sysconfig", "platform", "this", "pyflakes"}
+# Modules that execute workspace code or load workspace plugins/hooks via config files
+# even when Python is invoked with -I or -P.
+ALWAYS_PROJECT_EXEC_PY_MODULES = {"pytest", "unittest", "tox", "nox", "doctest", "coverage",
+                                  "mypy", "pylint", "flake8"}
+
+# Per-binary option and positional-output rules for READ_BINARIES so output flags
+# (including attached -oPATH and bundled -uoPATH) and positional outputs (uniq/xxd)
+# are checked in "write" mode and exec flags (sort --compress-program, fd -x) ask.
+_READ_TOOL_SPEC: Dict[str, Dict[str, object]] = {
+    "sort": {
+        "write_opts": {"-o", "--output", "-T", "--temporary-directory"},
+        "read_opts": {"--files0-from", "--random-source"},
+        "ask_opts": {"--compress-program"},
+        "value_opts": {"-k", "--key", "-t", "--field-separator", "-S", "--buffer-size", "--batch-size", "--parallel"},
+    },
+    "iconv": {
+        "write_opts": {"-o", "--output"},
+        "value_opts": {"-f", "--from-code", "-t", "--to-code"},
+    },
+    "tree": {
+        "write_opts": {"-o"},
+        "value_opts": {"-L", "-P", "-I", "--filelimit", "-H", "-T", "--charset", "--timefmt", "--sort"},
+    },
+    "base64": {
+        "write_opts": {"-o", "--output"},
+        "read_opts": {"-i", "--input"},
+        "value_opts": {"-w", "--wrap", "-b", "--break"},
+    },
+    "less": {
+        "write_opts": {"-o", "-O", "--log-file", "--LOG-FILE"},
+        "read_opts": {"-k", "--lesskey-file", "--lesskey-src"},
+        "value_opts": {"-p", "-P", "-j", "-x", "-z", "-h", "-y", "-b", "-#"},
+    },
+    "more": {
+        "write_opts": {"-o", "-O", "--log-file", "--LOG-FILE"},
+        "value_opts": {"-n"},
+    },
+    "uniq": {
+        "write_from_pos": 1,
+        "value_opts": {"-f", "--skip-fields", "-s", "--skip-chars", "-w", "--check-chars"},
+    },
+    "xxd": {
+        "write_from_pos": 1,
+        "value_opts": {"-c", "-cols", "--cols", "-g", "-groupsize", "--groupsize",
+                       "-l", "-len", "--len", "-o", "-s", "-seek", "-n", "-name"},
+    },
+    "file": {
+        "read_opts": {"-f", "--files-from", "-m", "--magic-file"},
+        "value_opts": {"-F", "--separator", "-P", "--parameter", "-e", "--exclude"},
+    },
+    "du": {
+        "read_opts": {"--files0-from"},
+        "value_opts": {"-d", "--max-depth", "-B", "--block-size", "-t", "--threshold", "--exclude"},
+    },
+    "wc": {"read_opts": {"--files0-from"}},
+    "diff": {
+        "read_opts": {"-X", "--exclude-from"},
+        "value_opts": {"-U", "-C", "-x", "--exclude", "-I", "-L", "--label", "-W", "--width"},
+    },
+    "hexdump": {"read_opts": {"-f"}, "value_opts": {"-e", "-n", "-s"}},
+    "fd": {
+        "ask_opts": {"-x", "--exec", "-X", "--exec-batch"},
+        "value_opts": {"-d", "--max-depth", "-t", "--type", "-e", "--extension", "-E", "--exclude", "--search-path"},
+    },
+    "findstr": {"win_read_prefixes": ("/f:", "/g:", "/d:")},
+}
 
 SAFE_PS_MEMBERS = frozenset({
     "tostring", "touniversaltime", "tolocaltime", "toshortdatestring", "tolongdatestring",
@@ -1370,7 +1436,7 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
         if name in ("less", "more") and any(a.startswith("+") and ("!" in a or "|" in a) for a in args):
             _add(ctx, L.ASK, f"{name} +command runs a shell command (owner approval)")
             return
-        return _paths(ctx, args, "read", windows=name in CMD_BUILTINS)
+        return _read_tool(name, args, ctx)
     if name in PATTERN_FIRST:
         return _pattern_tool(name, args, ctx)
     if name == "sed":
@@ -1440,6 +1506,14 @@ def _project_exec(ctx: _Ctx, what: str) -> None:
         _add(ctx, L.ASK, f"Executes project code ({what}); owner approval required by policy")
 
 
+def _looks_like_path_token(val: str) -> bool:
+    return bool(val) and (
+        any(c in val for c in "/\\~$")
+        or val.startswith(".")
+        or looks_windows_path(val)
+    )
+
+
 def _paths(ctx: _Ctx, args: List[str], mode: str, windows: bool = False) -> None:
     end_of_opts = False
     for a in args:
@@ -1449,13 +1523,116 @@ def _paths(ctx: _Ctx, args: List[str], mode: str, windows: bool = False) -> None
         if not end_of_opts and _is_option(a, windows):
             if "=" in a and a.startswith("--"):
                 val = a.split("=", 1)[1]
-                if val and (any(c in val for c in "/\\~$") or val.startswith(".")):
+                if _looks_like_path_token(val):
                     _check_path(ctx, val, mode)
             continue
         if "://" in a:
             _check_url(ctx, a, allowlist=False)
             continue
         _check_path(ctx, a, mode)
+
+
+def _read_tool(name: str, args: List[str], ctx: _Ctx) -> None:
+    spec = _READ_TOOL_SPEC.get(name)
+    windows = name in CMD_BUILTINS
+    if spec is None:
+        return _paths(ctx, args, "read", windows=windows)
+    write_opts = spec.get("write_opts") or set()
+    read_opts = spec.get("read_opts") or set()
+    ask_opts = spec.get("ask_opts") or set()
+    value_opts = spec.get("value_opts") or set()
+    write_from_pos = spec.get("write_from_pos")
+    win_read_prefixes = spec.get("win_read_prefixes") or ()
+
+    end_of_opts = False
+    pos_idx = 0
+    i = 0
+    n = len(args)
+    while i < n:
+        a = args[i]
+        i += 1
+        if a == "--" and not end_of_opts:
+            end_of_opts = True
+            continue
+        if not end_of_opts:
+            if win_read_prefixes:
+                low = a.lower()
+                matched_pref = next((p for p in win_read_prefixes if low.startswith(p)), None)
+                if matched_pref is not None:
+                    val = a[len(matched_pref):]
+                    if val:
+                        _check_path(ctx, val, "read")
+                    continue
+            if a.startswith("--") and len(a) > 2:
+                opt, eq, val = a.partition("=")
+                if opt in ask_opts:
+                    _add(ctx, L.ASK, f"{name} {opt} executes an arbitrary program (owner approval)")
+                    if not eq and i < n:
+                        i += 1
+                    continue
+                if opt in write_opts:
+                    target = val if eq else (args[i] if i < n else "")
+                    if not eq and i < n:
+                        i += 1
+                    if target:
+                        _check_path(ctx, target, "write")
+                    continue
+                if opt in read_opts:
+                    target = val if eq else (args[i] if i < n else "")
+                    if not eq and i < n:
+                        i += 1
+                    if target:
+                        _check_path(ctx, target, "read")
+                    continue
+                if opt in value_opts:
+                    if not eq and i < n:
+                        i += 1
+                    continue
+                if eq and _looks_like_path_token(val):
+                    _check_path(ctx, val, "read")
+                continue
+            if a.startswith("-") and len(a) > 1 and not a.startswith("--"):
+                if a in value_opts and len(a) > 2:
+                    if i < n:
+                        i += 1
+                    continue
+                chars = a[1:]
+                k = 0
+                while k < len(chars):
+                    flag = "-" + chars[k]
+                    if flag in ask_opts:
+                        _add(ctx, L.ASK, f"{name} {flag} executes an arbitrary program (owner approval)")
+                        if k + 1 >= len(chars) and i < n:
+                            i += 1
+                        break
+                    if flag in write_opts:
+                        target = chars[k + 1:] if k + 1 < len(chars) else (args[i] if i < n else "")
+                        if k + 1 >= len(chars) and i < n:
+                            i += 1
+                        if target:
+                            _check_path(ctx, target, "write")
+                        break
+                    if flag in read_opts:
+                        target = chars[k + 1:] if k + 1 < len(chars) else (args[i] if i < n else "")
+                        if k + 1 >= len(chars) and i < n:
+                            i += 1
+                        if target:
+                            _check_path(ctx, target, "read")
+                        break
+                    if flag in value_opts:
+                        if k + 1 >= len(chars) and i < n:
+                            i += 1
+                        break
+                    k += 1
+                continue
+            if windows and _is_option(a, True):
+                continue
+        if "://" in a:
+            _check_url(ctx, a, allowlist=False)
+        else:
+            mode = "write" if (write_from_pos is not None and pos_idx >= write_from_pos) else "read"
+            _check_path(ctx, a, mode)
+        pos_idx += 1
 
 
 def _wrapper(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
@@ -1512,6 +1689,12 @@ def _xargs(args: List[str], seg: Segment, ctx: _Ctx) -> None:
                    "--delimiter", "--arg-file", "--replace"}
     while rest and rest[0].startswith("-"):
         opt = rest.pop(0)
+        if opt.startswith("--arg-file="):
+            _check_path(ctx, opt.split("=", 1)[1], "read")
+            continue
+        if opt.startswith("-a") and len(opt) > 2 and not opt.startswith("--"):
+            _check_path(ctx, opt[2:], "read")
+            continue
         if opt in takes_value and rest:
             val = rest.pop(0)
             if opt in ("-a", "--arg-file"):
@@ -1790,6 +1973,7 @@ def _interpreter(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
                     return
             _project_exec(ctx, f"{name} {sub}")
             return
+    safe_sys_path = False
     while rest:
         a = rest.pop(0)
         if a in ("-V", "--version", "-h", "--help", "-v") and not rest:
@@ -1799,13 +1983,36 @@ def _interpreter(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
             return _inline_code(ctx, name, code)
         if py and a == "-m":
             mod = rest.pop(0) if rest else ""
-            return _python_module(mod, rest, ctx)
+            return _python_module(mod, rest, ctx, safe_sys_path=safe_sys_path)
         if a == "-":
             break
+        if py and a.startswith("-") and not a.startswith("--") and len(a) > 1:
+            flags = a[1:]
+            idx = 0
+            while idx < len(flags):
+                ch = flags[idx]
+                if ch in ("I", "P"):
+                    safe_sys_path = True
+                    idx += 1
+                    continue
+                if ch == "c":
+                    code = flags[idx + 1:] if idx + 1 < len(flags) else (rest.pop(0) if rest else "")
+                    return _inline_code(ctx, name, code)
+                if ch == "m":
+                    mod = flags[idx + 1:] if idx + 1 < len(flags) else (rest.pop(0) if rest else "")
+                    return _python_module(mod, rest, ctx, safe_sys_path=safe_sys_path)
+                if ch in ("X", "W"):
+                    if idx + 1 >= len(flags) and rest:
+                        rest.pop(0)
+                    break
+                if ch.isdigit():
+                    break
+                idx += 1
+            continue
         if a in value_opts:
             if rest:
                 val = rest.pop(0)
-                if a in ("-r", "--require", "--import", "--env-file", "-I") and ("/" in val or val.startswith(".")):
+                if a in ("-r", "--require", "--import", "--env-file", "-I") and _looks_like_path_token(val):
                     _check_path(ctx, val, "exec")
             continue
         if a.startswith("-"):
@@ -1818,7 +2025,7 @@ def _interpreter(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
         if _check_path(ctx, a, "exec") is not None:
             ctx.exec_after_download = True
             _project_exec(ctx, f"{name} {a}")
-        _paths(ctx, [x for x in rest if "/" in x or x.startswith((".", "~", "$"))], "read")
+        _paths(ctx, [x for x in rest if _looks_like_path_token(x)], "read")
         return
     if seg.heredoc is not None or seg.herestring is not None:
         return _inline_code(ctx, name, seg.heredoc if seg.heredoc is not None else seg.herestring)
@@ -1831,17 +2038,95 @@ def _interpreter(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:
     _add(ctx, L.ASK, f"Interactive {name} session requires owner approval")
 
 
-def _python_module(mod: str, rest: List[str], ctx: _Ctx) -> None:
+def _python_module_paths(mod_l: str, rest: List[str], ctx: _Ctx) -> None:
+    """Inspect all path arguments to `python -m <mod>` (including Windows paths and write targets)."""
+    if mod_l == "json.tool":
+        end_of_opts = False
+        pos_idx = 0
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            i += 1
+            if a == "--" and not end_of_opts:
+                end_of_opts = True
+                continue
+            if not end_of_opts and a.startswith("-"):
+                if a == "--indent" and i < len(rest):
+                    i += 1
+                elif a.startswith("--") and "=" in a:
+                    opt, val = a.split("=", 1)
+                    if _looks_like_path_token(val):
+                        _check_path(ctx, val, "write" if opt in ("--output", "--outfile") else "read")
+                continue
+            _check_path(ctx, a, "write" if pos_idx >= 1 else "read")
+            pos_idx += 1
+        return
+    if mod_l == "py_compile":
+        _paths(ctx, rest, "write")
+        return
+    if mod_l == "compileall":
+        val_opts = {"-r", "-j", "-x", "-d", "-e", "-s", "-p", "-o", "--invalidation-mode"}
+        end_of_opts = False
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            i += 1
+            if a == "--" and not end_of_opts:
+                end_of_opts = True
+                continue
+            if not end_of_opts and a.startswith("-"):
+                if a == "-i" and i < len(rest):
+                    _check_path(ctx, rest[i], "read")
+                    i += 1
+                elif a.startswith("-i") and len(a) > 2 and not a.startswith("--"):
+                    _check_path(ctx, a[2:], "read")
+                elif a in val_opts and i < len(rest):
+                    i += 1
+                elif a.startswith("--") and "=" in a:
+                    val = a.split("=", 1)[1]
+                    if _looks_like_path_token(val):
+                        _check_path(ctx, val, "read")
+                continue
+            _check_path(ctx, a, "write")
+        return
+    if mod_l in ("venv", "virtualenv"):
+        end_of_opts = False
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            i += 1
+            if a == "--" and not end_of_opts:
+                end_of_opts = True
+                continue
+            if not end_of_opts and a.startswith("-"):
+                if a == "--prompt" and i < len(rest):
+                    i += 1
+                elif a.startswith("--") and "=" in a:
+                    val = a.split("=", 1)[1]
+                    if _looks_like_path_token(val):
+                        _check_path(ctx, val, "read")
+                continue
+            _check_path(ctx, a, "write")
+        return
+    _paths(ctx, rest, "read")
+
+
+def _python_module(mod: str, rest: List[str], ctx: _Ctx, safe_sys_path: bool = False) -> None:
     mod_l = mod.lower()
     if mod_l in ("pip", "pip3"):
-        return _pip(rest, ctx)
+        _pip(rest, ctx)
+        if not safe_sys_path:
+            _project_exec(ctx, f"python -m {mod} (without -I/-P)")
+        return
     if mod_l in ("http.server", "smtpd", "ftplib", "telnetlib"):
         _add(ctx, L.ASK, f"python -m {mod} opens a network service (owner approval)")
         return
+    _python_module_paths(mod_l, rest, ctx)
     if mod_l in SAFE_PY_MODULES:
-        _paths(ctx, [x for x in rest if not x.startswith("-") and ("/" in x or x.startswith((".", "~", "$")))], "read")
-        if mod_l in ("pytest", "unittest", "tox", "nox", "doctest", "coverage"):
+        if mod_l in ALWAYS_PROJECT_EXEC_PY_MODULES:
             _project_exec(ctx, f"python -m {mod}")
+        elif not safe_sys_path:
+            _project_exec(ctx, f"python -m {mod} (without -I/-P)")
         return
     _project_exec(ctx, f"python -m {mod}")
 
@@ -1863,10 +2148,10 @@ def _pip(args: List[str], ctx: _Ctx) -> None:
             if "://" in val or val.startswith("git+"):
                 _check_url(ctx, val.replace("git+", "", 1))
             else:
-                _check_path(ctx, val, "read")
+                _check_path(ctx, val, "write" if a in ("-t", "--target") else "read")
         elif "://" in a:
             _check_url(ctx, a.split("+", 1)[-1] if a.startswith(("git+", "hg+", "svn+")) else a)
-        elif not a.startswith("-") and ("/" in a or a.startswith((".", "~"))):
+        elif not a.startswith("-") and _looks_like_path_token(a):
             _check_path(ctx, a, "read")
     if sub in ("install", "wheel", "download", "build"):
         _project_exec(ctx, f"pip {sub}")
@@ -1897,13 +2182,13 @@ def _project_tool(name: str, args: List[str], ctx: _Ctx) -> None:
     for a in args:
         if "://" in a:
             _check_url(ctx, a.split("+", 1)[-1] if a.startswith(("git+", "hg+")) else a)
-        elif not _is_option(a) and ("/" in a or "\\" in a or a.startswith(("~", "$", ".."))):
+        elif not _is_option(a) and (_looks_like_path_token(a) or a.startswith("..")):
             _check_path(ctx, a, "read")
         elif a.startswith("--") and "=" in a:
             val = a.split("=", 1)[1]
             if "://" in val:
                 _check_url(ctx, val)
-            elif any(c in val for c in "/\\~") or val.startswith("$"):
+            elif _looks_like_path_token(val):
                 _check_path(ctx, val, "read")
     if name in PROJECT_TOOLS:
         _project_exec(ctx, f"{name} {' '.join(args[:2])}".strip())
@@ -1914,7 +2199,13 @@ def _pattern_tool(name: str, args: List[str], ctx: _Ctx) -> None:
     if name == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in rest):
         _add(ctx, L.ASK, "rg --pre runs an arbitrary program on every searched file (owner approval)")
         return
-    pattern_given = any(a in ("-e", "--regexp", "-f", "--file", "-Pattern", "-pattern") for a in rest)
+    in_place = name == "yq" and any(a in ("-i", "--inplace") or a.startswith("--inplace=") for a in rest)
+    pattern_given = any(
+        a in ("-e", "--regexp", "-f", "--file", "-Pattern", "-pattern")
+        or a.startswith(("--regexp=", "--file="))
+        or (a.startswith(("-e", "-f")) and len(a) > 2 and not a.startswith("--"))
+        for a in rest
+    )
     skip_next = False
     first_positional = True
     for i, a in enumerate(rest):
@@ -1928,6 +2219,12 @@ def _pattern_tool(name: str, args: List[str], ctx: _Ctx) -> None:
                  "--argjson"):
             skip_next = True
             continue
+        if a.startswith("--file="):
+            _check_path(ctx, a.split("=", 1)[1], "read")
+            continue
+        if a.startswith("-f") and len(a) > 2 and not a.startswith("--"):
+            _check_path(ctx, a[2:], "read")
+            continue
         if _is_option(a):
             continue
         if first_positional and not pattern_given:
@@ -1935,7 +2232,7 @@ def _pattern_tool(name: str, args: List[str], ctx: _Ctx) -> None:
             continue
         if name in ("jq", "yq") and a.startswith("."):
             continue
-        _check_path(ctx, a, "read")
+        _check_path(ctx, a, "write" if in_place else "read")
 
 
 def _sed(args: List[str], ctx: _Ctx) -> None:
@@ -1943,13 +2240,26 @@ def _sed(args: List[str], ctx: _Ctx) -> None:
     scripts: List[str] = []
     files: List[str] = []
     rest = list(args)
-    explicit = any(a in ("-e", "--expression", "-f", "--file") for a in rest)
+    explicit = any(
+        a in ("-e", "--expression", "-f", "--file")
+        or a.startswith(("--expression=", "--file="))
+        or (a.startswith(("-e", "-f")) and len(a) > 2 and not a.startswith("--"))
+        for a in rest
+    )
     while rest:
         a = rest.pop(0)
         if a in ("-e", "--expression") and rest:
             scripts.append(rest.pop(0))
+        elif a.startswith("--expression="):
+            scripts.append(a.split("=", 1)[1])
+        elif a.startswith("-e") and len(a) > 2 and not a.startswith("--"):
+            scripts.append(a[2:])
         elif a in ("-f", "--file") and rest:
             _check_path(ctx, rest.pop(0), "read")
+        elif a.startswith("--file="):
+            _check_path(ctx, a.split("=", 1)[1], "read")
+        elif a.startswith("-f") and len(a) > 2 and not a.startswith("--"):
+            _check_path(ctx, a[2:], "read")
         elif _is_option(a):
             continue
         elif not explicit and not scripts:
@@ -1972,6 +2282,12 @@ def _awk(args: List[str], ctx: _Ctx) -> None:
         if a in ("-f", "--file") and rest:
             _check_path(ctx, rest.pop(0), "read")
             program = ""
+        elif a.startswith("--file="):
+            _check_path(ctx, a.split("=", 1)[1], "read")
+            program = ""
+        elif a.startswith("-f") and len(a) > 2 and not a.startswith("--"):
+            _check_path(ctx, a[2:], "read")
+            program = ""
         elif a in ("-v", "-F", "--assign", "--field-separator") and rest:
             rest.pop(0)
         elif _is_option(a):
@@ -1983,7 +2299,7 @@ def _awk(args: List[str], ctx: _Ctx) -> None:
     if program and re.search(r"system\s*\(|\|\s*getline|getline\s*<|print[f]?\b[^;}]*[>|]", program):
         _inline_code(ctx, "awk", program)
     for f in files:
-        if "=" in f and not ("/" in f.split("=", 1)[0]):
+        if "=" in f and not ("/" in f.split("=", 1)[0] or "\\" in f.split("=", 1)[0]):
             continue
         _check_path(ctx, f, "read")
 
@@ -2098,6 +2414,9 @@ def _copy_like(name: str, args: List[str], ctx: _Ctx) -> None:
         if low in ("-t", "--target-directory", "-destination") and rest:
             dest = rest.pop(0)
             continue
+        if a.startswith("-t") and len(a) > 2 and not a.startswith("--"):
+            dest = a[2:]
+            continue
         if low.startswith("--target-directory="):
             dest = a.split("=", 1)[1]
             continue
@@ -2164,6 +2483,18 @@ def _tar(args: List[str], ctx: _Ctx) -> None:
             continue
         if a.startswith("--directory=") or a.startswith("--file="):
             _check_path(ctx, a.split("=", 1)[1], "write")
+            continue
+        if a.startswith(("--files-from=", "--exclude-from=")):
+            _check_path(ctx, a.split("=", 1)[1], "read")
+            continue
+        if a.startswith("-C") and len(a) > 2 and not a.startswith("--"):
+            _check_path(ctx, a[2:], "write")
+            continue
+        if a.startswith("-f") and len(a) > 2 and not a.startswith("--"):
+            _check_path(ctx, a[2:], "write")
+            continue
+        if a.startswith(("-T", "-X")) and len(a) > 2 and not a.startswith("--"):
+            _check_path(ctx, a[2:], "read")
             continue
         if _is_option(a) or (i == 0 and re.match(r"^[cxtrufzjJvpPkO]+$", a)):
             continue
@@ -2283,7 +2614,7 @@ def _git_in_directory(args: List[str], ctx: _Ctx) -> None:
                 host = a.split("@", 1)[1].split(":", 1)[0]
                 if not ctx.policy.host_allowed(host):
                     _add(ctx, L.ASK, f"git over SSH to a host outside the allowlist: {host}")
-            elif sub == "clone" and ("/" in a or a.startswith((".", "~"))):
+            elif sub == "clone" and _looks_like_path_token(a):
                 _check_path(ctx, a, "write")
         return
     lost = _git_discards_work(sub, sargs)
@@ -2298,8 +2629,10 @@ def _git_in_directory(args: List[str], ctx: _Ctx) -> None:
         for i, a in enumerate(sargs):
             if a in ("-o", "--output", "-F", "--file") and i + 1 < len(sargs):
                 _check_path(ctx, sargs[i + 1], "write")
-            elif a.startswith("--output="):
+            elif a.startswith(("--output=", "--file=")):
                 _check_path(ctx, a.split("=", 1)[1], "write")
+            elif a.startswith(("-o", "-F")) and len(a) > 2 and not a.startswith("--"):
+                _check_path(ctx, a[2:], "write")
             elif not a.startswith("-") and (a.startswith(("/", "~", "$", "..", "\\")) or looks_windows_path(a)):
                 _check_path(ctx, a, "read")
         return
@@ -2389,8 +2722,13 @@ def _fetch(name: str, args: List[str], ctx: _Ctx) -> None:
         if a.startswith("--") and "=" in a:
             key, val = a.split("=", 1)
         low = key.lower() if ps else key
-        if not ps and val is None and re.match(r"^-[A-Za-z]{2,}$", a) and ("-" + a[-1]) in value_opts:
-            key = low = "-" + a[-1]
+        if not ps and val is None and a.startswith("-") and not a.startswith("--") and len(a) > 2:
+            for k, ch in enumerate(a[1:]):
+                if ("-" + ch) in value_opts:
+                    key = low = "-" + ch
+                    if k + 1 < len(a[1:]):
+                        val = a[1 + k + 1:]
+                    break
         if (low in value_opts) and val is None:
             val = rest.pop(0) if rest else ""
         if low in value_opts:
@@ -2416,7 +2754,7 @@ def _fetch(name: str, args: List[str], ctx: _Ctx) -> None:
                          "-E", "--cert", "--key", "--cacert", "--private-key", "--certificate", "--ca-certificate"):
                 if low in ("-i", "--input-file", "-K", "--config"):
                     _add(ctx, L.ASK, f"{name} reads URLs/options from a file ({val})")
-                if low not in ("-b", "--cookie") or ("/" in val or val.startswith(".")):
+                if low not in ("-b", "--cookie") or _looks_like_path_token(val):
                     reads.append(val)
             elif low in ("-x", "--proxy", "-proxy"):
                 _check_url(ctx, val, allowlist=False)

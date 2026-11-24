@@ -389,4 +389,173 @@ def test_r3_m2_verify_reply_rejects_schemaless_forged_report_nonnumeric_count_an
     assert wrong_key["decision"] == "block"
 
 
+# ---------------------------------------------------------------------------
+# Round-4 Audit Fixes: C-1 (python -m paths & json.tool write),
+#                      C-2 (attached -oPATH & output flags/positions),
+#                      H-1 (python -m CWD shadowing & linter plugins)
+# ---------------------------------------------------------------------------
+
+def test_r4_c1_python_module_checks_windows_paths_and_json_tool_write(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_file = protected / "config.json"
+    cfg_file.write_text('{"aegisMode":"enforce"}', encoding="utf-8")
+
+    # Even if protected dir is inside extra_roots, writing protected_paths must LOCK
+    pol = AegisPolicy(
+        extra_roots=[str(tmp_path)],
+        protected_paths=[str(protected)],
+        project_exec="allow",
+    )
+
+    # 1. Exact Claude C-1 PoC: json.tool writing protected Windows config.json
+    win_cfg = str(cfg_file)
+    for cmd in (
+        f'python -m json.tool x.json "{win_cfg}"',
+        f'python -I -m json.tool x.json "{win_cfg}"',
+        f'python -I -m json.tool --indent 2 x.json "{win_cfg}"',
+        f'python -I -m py_compile "{win_cfg}"',
+        f'python -I -m compileall "{protected}"',
+        f'python -I -m venv "{protected}"',
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol, windows=True)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    # 2. Reading out-of-workspace / credential store via Windows path
+    pol_confined = AegisPolicy(project_exec="allow")
+    v_ssh = analyze_command(
+        r'python -I -m json.tool "C:\Users\alice\.ssh\id_rsa"',
+        base_dir=str(ws), cwd=str(ws), policy=pol_confined, windows=True,
+    )
+    assert v_ssh.level == L.LOCK, (v_ssh.level.name, v_ssh.reasons)
+
+    v_escape = analyze_command(
+        f'python -I -m json.tool "{cfg_file}"',
+        base_dir=str(ws), cwd=str(ws), policy=pol_confined, windows=True,
+    )
+    assert v_escape.level >= L.DENY, (v_escape.level.name, v_escape.reasons)
+
+    # 3. Benign in-workspace isolated json.tool still passes
+    (ws / "x.json").write_text("{}", encoding="utf-8")
+    v_ok = analyze_command(
+        "python -I -m json.tool x.json",
+        base_dir=str(ws), cwd=str(ws), policy=AegisPolicy(project_exec="ask"), windows=True,
+    )
+    assert v_ok.level == L.PASS, (v_ok.level.name, v_ok.reasons)
+
+
+def test_r4_c2_attached_output_flags_and_positional_outputs_checked_as_write(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    protected = tmp_path / "TektonExe"
+    protected.mkdir()
+    cfg_file = protected / "config.json"
+    cfg_posix = str(cfg_file).replace("\\", "/")
+
+    # Even when protected dir is inside an allowed root, write-mode must LOCK
+    pol_shared = AegisPolicy(extra_roots=[str(tmp_path)], protected_paths=[str(protected)])
+    for cmd in (
+        f"sort x.json -o'{cfg_posix}'",
+        f"sort -o'{cfg_posix}' x.json",
+        f"sort -uo'{cfg_posix}' x.json",
+        f"sort -o '{cfg_posix}' x.json",
+        f"sort --output='{cfg_posix}' x.json",
+        f"sort --output '{cfg_posix}' x.json",
+        f"iconv -o'{cfg_posix}' x.json",
+        f"tree -o'{cfg_posix}' .",
+        f"base64 -d -o'{cfg_posix}' x.json",
+        f"less -o'{cfg_posix}' x.json",
+        f"uniq x.json '{cfg_posix}'",
+        f"uniq -c x.json '{cfg_posix}'",
+        f"xxd -r x.json '{cfg_posix}'",
+        f"xxd x.json '{cfg_posix}'",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_shared)
+        assert v.level == L.LOCK, (cmd, v.level.name, v.reasons)
+
+    # Out-of-workspace attached outputs must DENY
+    pol_ws = AegisPolicy()
+    for cmd in (
+        "sort -o/etc/passwd x",
+        "sort -o~/.bashrc x",
+        "iconv -o/etc/passwd x",
+        "tree -o/etc/passwd",
+        "base64 -d -o/etc/passwd x",
+        "uniq x /etc/passwd",
+        "xxd -r x /etc/passwd",
+        "curl -o/etc/passwd https://github.com/a/b",
+        "wget -qO/etc/passwd https://github.com/a/b",
+        "git archive -o/etc/passwd HEAD",
+    ):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_ws)
+        assert v.level >= L.DENY, (cmd, v.level.name, v.reasons)
+
+    # Program-executing flags on sort / fd must ASK
+    for cmd in ("sort --compress-program=sh x", "fd . -x sh -c id"):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_ws)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Benign read-only tool usage still passes (including sort -t/ field separator)
+    for cmd in ("sort -u data.txt", "sort -t/ -k2 data.txt", "uniq -c data.txt", "tree -L 2 ."):
+        v = analyze_command(cmd, base_dir=str(ws), cwd=str(ws), policy=pol_ws)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+
+def test_r4_h1_python_module_cwd_shadowing_and_plugin_linters_require_ask(tmp_path):
+    from aegis.policy import AegisPolicy
+
+    pol = AegisPolicy(project_exec="ask", inline_exec="ask")
+    # Without -I or -P, EVERY python -m can be shadowed by workspace <module>.py
+    for cmd in (
+        "python -m platform",
+        "python3 -m black",
+        "py -3 -m this",
+        "python -m json.tool x.json",
+        "python -m pip --version",
+        "python -mplatform",
+        "python -Bm platform",
+        "python -XI -m platform",
+        "python -W ignore -m platform",
+        "timeout 5 python -m platform",
+        "bash -c 'python -m platform'",
+        "cmd /c python -m platform",
+        "powershell -Command 'python -m platform'",
+    ):
+        v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Linters whose config files load workspace plugins/hooks must ASK even with -I / -P
+    for cmd in (
+        "python -I -m mypy .",
+        "python -P -m pylint .",
+        "python -I -m flake8 .",
+        "python -IB -m pytest -q",
+    ):
+        v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Bundled -Bc / -Ic inline code must still hit inline_exec ASK
+    for cmd in ("python -Bc 'import os'", "python -Ic 'print(1)'"):
+        v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol)
+        assert v.level >= L.ASK, (cmd, v.level.name, v.reasons)
+
+    # Isolated (-I) or safe-path (-P) safe stdlib inspection still passes cleanly
+    for cmd in (
+        "python -I -m platform",
+        "python -P -m platform",
+        "python -IB -m sysconfig",
+        "py -3.11 -I -m this",
+        "python -Im platform",
+    ):
+        v = analyze_command(cmd, base_dir=str(tmp_path), cwd=str(tmp_path), policy=pol)
+        assert v.level == L.PASS, (cmd, v.level.name, v.reasons)
+
+
+
 
