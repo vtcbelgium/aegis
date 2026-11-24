@@ -3,13 +3,13 @@ import pytest
 from aegis.dojo import run_dojo
 
 
-def test_all_six_packs_run_without_executing_attack_strings(monkeypatch):
+def test_all_seven_packs_run_without_executing_attack_strings(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("Dojo must not execute attack strings")
     monkeypatch.setattr(subprocess, "run", forbidden)
     report = run_dojo(mission="local regression")
     assert report["passed"], [r for r in report["cases"] if not r["passed"]]
-    assert {r["pack"] for r in report["cases"]} == {"01", "02", "03", "04", "05", "06"}
+    assert {r["pack"] for r in report["cases"]} == {"01", "02", "03", "04", "05", "06", "07"}
     assert report["cleanup"] == "temporary fixtures removed"
 
 

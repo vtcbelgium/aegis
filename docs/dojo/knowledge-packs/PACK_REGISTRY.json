@@ -41,6 +41,12 @@
       "file": "06-APPLICATION-INFRASTRUCTURE-ATTACKS.md",
       "consumer": "aegis-dojo/self-test",
       "status": "HARVESTED_OVERVIEW"
+    },
+    {
+      "id": "LYNCEUS-AEGIS-07",
+      "file": "07-EPISTEMIC-DECEPTION-AND-DRIFT.md",
+      "consumer": "aegis-detective/dojo",
+      "status": "ACTIVE_REGRESSION_PACK"
     }
   ]
 }

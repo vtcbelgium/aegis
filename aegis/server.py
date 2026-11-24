@@ -318,6 +318,25 @@ def _build_handler(state: AegisAppState, port: int):
                 self._send_json(200, {"hosts": detect_hosts()})
                 return
 
+            if path == "/api/detective":
+                from . import session as session_store
+                from .detective import get_tips, git_snapshot, latest_turn_id, load_detective_config
+
+                sid = (qs.get("session") or ["default"])[0]
+                cfg = load_detective_config()
+                sdata = session_store.load(sid)
+                det = sdata.get("detective") if isinstance(sdata.get("detective"), dict) else {}
+                snap = git_snapshot(state.base_dir)
+                self._send_json(200, {
+                    "config": cfg,
+                    "session": sid,
+                    "telemetry": det,
+                    "latestTurnId": det.get("turnId") or latest_turn_id(sid),
+                    "git": snap,
+                    "tips": get_tips(det),
+                })
+                return
+
             self._send_json(404, {"error": "Not found"})
 
         def do_POST(self) -> None:
@@ -462,6 +481,58 @@ def _build_handler(state: AegisAppState, port: int):
                     self._send_json(200, {"ok": True, "result": res, "hosts": detect_hosts()})
                 except Exception as exc:
                     self._send_json(400, {"error": str(exc)})
+                return
+
+            if path == "/api/detective/verify-reply":
+                from . import session as session_store
+                from .detective import verify_reply
+
+                reply_text = str(payload.get("text") or "")
+                sid = str(payload.get("session") or "default")
+                mode = payload.get("mode")
+                sdata = session_store.load(sid)
+                det = sdata.get("detective") if isinstance(sdata.get("detective"), dict) else {}
+                v = state.ledger.verify()
+                warrant = verify_reply(
+                    reply_text,
+                    cwd=str(payload.get("cwd") or state.base_dir),
+                    detective_state=det,
+                    mode=str(mode) if mode else None,
+                    ledger_tip=v.tip if v.ok else None,
+                )
+                self._send_json(200, warrant)
+                return
+
+            if path == "/api/detective/scan-diff":
+                import subprocess
+                from .detective import inspect_unified_diff
+
+                target_cwd = str(payload.get("cwd") or state.base_dir)
+                diff = subprocess.run(["git", "-C", target_cwd, "diff", "HEAD"], capture_output=True, text=True, check=False)
+                findings = inspect_unified_diff(diff.stdout or "")
+                self._send_json(200, {
+                    "cwd": target_cwd,
+                    "passed": not findings,
+                    "findingCount": len(findings),
+                    "findings": findings,
+                })
+                return
+
+            if path == "/api/detective/config":
+                from .detective import save_detective_config
+
+                try:
+                    cfg = save_detective_config(payload)
+                    self._send_json(200, {"ok": True, "config": cfg})
+                except Exception as exc:
+                    self._send_json(400, {"error": str(exc)})
+                return
+
+            if path == "/api/detective/undo":
+                from .detective import undo_turn
+
+                res = undo_turn(payload.get("turnId"), dry_run=bool(payload.get("dryRun", False)))
+                self._send_json(200 if res.get("ok") else 404, res)
                 return
 
             self._send_json(404, {"error": "Not found"})

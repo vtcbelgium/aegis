@@ -82,3 +82,36 @@ class HecatoncheiresClan:
                 )
 
             return Verdict(DecisionLevel.PASS, ["Execution cadence normal"], self.NAME)
+
+    def export_state(self) -> Dict[str, object]:
+        """Export bounded window state so hook subprocesses retain loop and violation history."""
+        with self._lock:
+            now = time.time()
+            while self._violation_timestamps and (now - self._violation_timestamps[0] > self.window_seconds):
+                self._violation_timestamps.popleft()
+            while self._action_history and (now - self._action_history[0][1] > self.window_seconds):
+                self._action_history.popleft()
+            return {
+                "violations": list(self._violation_timestamps)[-64:],
+                "actions": [[sig, ts] for sig, ts in list(self._action_history)[-128:]],
+            }
+
+    def import_state(self, state: Optional[Dict[str, object]]) -> None:
+        """Restore persisted loop and violation history (monotonically bounded to active window)."""
+        if not isinstance(state, dict):
+            return
+        now = time.time()
+        with self._lock:
+            raw_v = state.get("violations")
+            if isinstance(raw_v, list):
+                valid_v = [float(t) for t in raw_v if isinstance(t, (int, float)) and (now - float(t) <= self.window_seconds)]
+                self._violation_timestamps = collections.deque(valid_v[-64:])
+            raw_a = state.get("actions")
+            if isinstance(raw_a, list):
+                valid_a = []
+                for item in raw_a:
+                    if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], (int, float)):
+                        ts = float(item[1])
+                        if now - ts <= self.window_seconds:
+                            valid_a.append((item[0], ts))
+                self._action_history = collections.deque(valid_a[-128:])

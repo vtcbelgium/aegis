@@ -2,181 +2,145 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Aegis AI Shield</title>
+  <title>Aegis Shield</title>
   <style>
+    :root {
+      --bg: #0b0d11;
+      --border: rgba(255, 255, 255, 0.09);
+      --fg: #f3f5f8;
+      --muted: #8b94a5;
+      --ok: #34d399;
+      --danger: #f87171;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      width: 340px;
-      margin: 0;
-      padding: 16px;
-      background: #0b1220;
-      color: #f8fafc;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    .header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-      padding-bottom: 10px;
-      margin-bottom: 12px;
-    }
-    .title {
-      font-weight: 800;
-      font-size: 15px;
-      color: #38bdf8;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .toggle-btn {
-      font-size: 11px;
-      font-weight: 700;
-      padding: 4px 10px;
-      border-radius: 999px;
-      cursor: pointer;
-      border: 1px solid rgba(74, 222, 128, 0.4);
-      background: rgba(74, 222, 128, 0.16);
-      color: #4ade80;
-    }
-    .toggle-btn.paused {
-      border-color: rgba(148, 163, 184, 0.4);
-      background: rgba(148, 163, 184, 0.14);
-      color: #cbd5e1;
-    }
-    .site-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      border-radius: 8px;
-      padding: 8px 10px;
-      margin-bottom: 12px;
+      width: 320px;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--sans);
       font-size: 12px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
-    .site-host {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      color: #cbd5e1;
+    .bar {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
       font-weight: 600;
+      letter-spacing: -0.02em;
     }
-    .mini-btn {
-      background: rgba(56, 189, 248, 0.14);
-      color: #38bdf8;
-      border: 1px solid rgba(56, 189, 248, 0.35);
-      border-radius: 6px;
-      padding: 4px 8px;
-      font-size: 11px;
-      font-weight: 700;
+    .switch {
+      width: 34px;
+      height: 19px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #1a1f2b;
+      padding: 2px;
+      display: inline-flex;
+      align-items: center;
+      cursor: pointer;
+      transition: background 140ms ease;
+    }
+    .switch[data-on="true"] { background: var(--ok); border-color: var(--ok); }
+    .switch span {
+      width: 13px;
+      height: 13px;
+      border-radius: 999px;
+      background: #fff;
+      display: block;
+      transition: transform 140ms ease;
+    }
+    .switch[data-on="true"] span { transform: translateX(15px); }
+    .mono { font-family: var(--mono); }
+    .tabular { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .muted { color: var(--muted); }
+    .trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    .link-btn {
+      background: none;
+      border: none;
+      color: var(--muted);
+      font: inherit;
+      text-decoration: underline;
+      text-underline-offset: 4px;
       cursor: pointer;
       flex-shrink: 0;
     }
-    .mini-btn.muted {
-      background: rgba(148, 163, 184, 0.12);
-      color: #94a3b8;
-      border-color: rgba(148, 163, 184, 0.25);
+    .link-btn:hover { color: var(--fg); }
+    .activity {
+      padding: 12px 16px 14px;
     }
-    .stats {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-bottom: 12px;
-    }
-    .stat-box {
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.09);
-      border-radius: 8px;
-      padding: 10px;
-      text-align: center;
-    }
-    .stat-number {
-      font-size: 24px;
-      font-weight: 800;
-      color: #38bdf8;
-      line-height: 1.1;
-    }
-    .stat-label {
-      font-size: 10px;
-      color: #94a3b8;
-      margin-top: 4px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    .law {
-      font-size: 11px;
-      font-style: italic;
-      color: #94a3b8;
-      border-left: 2px solid #38bdf8;
-      padding-left: 8px;
-      margin-bottom: 12px;
-    }
-    .section-head {
+    .activity-head {
       display: flex;
-      align-items: center;
       justify-content: space-between;
-      margin-bottom: 6px;
-      font-size: 11px;
-      color: #cbd5e1;
-      font-weight: 700;
+      align-items: center;
+      margin-bottom: 8px;
+      font-weight: 500;
     }
     .threat-list {
-      max-height: 150px;
-      overflow-y: auto;
-      font-size: 11px;
-      margin: 0;
-      padding: 0;
       list-style: none;
+      max-height: 170px;
+      overflow-y: auto;
+      border-top: 1px solid var(--border);
     }
     .threat-item {
-      padding: 6px 8px;
-      background: rgba(239, 68, 68, 0.1);
-      border: 1px solid rgba(239, 68, 68, 0.22);
-      border-radius: 6px;
-      margin-bottom: 6px;
-      color: #fca5a5;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--danger);
       word-break: break-word;
     }
-    .empty { color: #64748b; font-style: italic; padding: 4px 0; }
+    .empty {
+      padding: 10px 0;
+      color: var(--muted);
+    }
   </style>
 </head>
 <body>
-  <div class="header">
-    <div class="title">
-      <img src="icons/icon48.png" width="20" height="20" alt="">
-      Aegis AI Shield
+  <div class="bar">
+    <div class="brand">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true">
+        <path d="M12 2.5L4.5 5.5v6.2c0 4.9 3.1 8.8 7.5 10.3 4.4-1.5 7.5-5.4 7.5-10.3V5.5L12 2.5z"/>
+        <path d="M9 12.2l2.1 2.1L15.4 10"/>
+      </svg>
+      <span>Aegis Shield</span>
     </div>
-    <button class="toggle-btn" id="toggleProtection">SHIELD ON</button>
+    <button class="switch" id="toggleProtection" data-on="true" aria-label="Toggle shield"><span></span></button>
   </div>
 
-  <div class="site-bar" id="siteBar" style="display:none;">
-    <span class="site-host" id="siteHost">—</span>
-    <button class="mini-btn" id="toggleSiteBtn">Trust Site</button>
+  <div class="bar" id="siteBar" style="display:none;">
+    <span class="mono trunc" id="siteHost">-</span>
+    <button class="link-btn" id="toggleSiteBtn">Trust site</button>
   </div>
 
-  <div class="stats">
-    <div class="stat-box">
-      <div class="stat-number" id="tabThreatCount">0</div>
-      <div class="stat-label">This Tab</div>
+  <div class="bar">
+    <span class="muted">Blocked on this tab</span>
+    <span class="mono tabular" id="tabThreatCount">0</span>
+  </div>
+
+  <div class="bar">
+    <span class="muted">Total blocked</span>
+    <span class="mono tabular" id="totalThreatCount">0</span>
+  </div>
+
+  <div class="activity">
+    <div class="activity-head">
+      <span id="listTitle">Activity</span>
+      <button class="link-btn" id="clearHistoryBtn">Clear</button>
     </div>
-    <div class="stat-box">
-      <div class="stat-number" id="totalThreatCount">0</div>
-      <div class="stat-label">All-Time Blocked</div>
-    </div>
+    <ul class="threat-list" id="threatList">
+      <li class="empty">No hidden prompt traps or tracking beacons found.</li>
+    </ul>
   </div>
-
-  <div class="law">
-    &ldquo;Aegis may subtract authority. Aegis may never create it.&rdquo;
-  </div>
-
-  <div class="section-head">
-    <span id="listTitle">Recent Blocked Traps</span>
-    <button class="mini-btn muted" id="clearHistoryBtn">Clear</button>
-  </div>
-  <ul class="threat-list" id="threatList">
-    <li class="empty">No hidden traps detected yet.</li>
-  </ul>
 
   <script src="popup.js"></script>
 </body>

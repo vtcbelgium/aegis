@@ -60,10 +60,12 @@ def run_pretooluse(event: Dict[str, Any]) -> int:
 
 
 def run_posttooluse(event: Dict[str, Any], fmt: str = "claude") -> int:
-    """Scan tool output for a decoy canary; if found, tell the model the session is compromised."""
+    """Scan tool output for decoy canaries and record PostToolUse execution outcomes."""
     from ..core import AegisGate
     from .. import session as session_store
     from ..ledger import DecisionLedger, default_ledger_path
+    from .generic import evaluate_post
+
     text = json.dumps(event.get("tool_response") or event.get("tool_output") or "")
     gate = AegisGate(ledger=DecisionLedger(default_ledger_path()))
     sid = event.get("session_id") or "default"
@@ -84,6 +86,55 @@ def run_posttooluse(event: Dict[str, Any], fmt: str = "claude") -> int:
         print(json.dumps({"decision": "block",
                           "reason": "Aegis Minotaur: a decoy credential appeared in this tool's output. "
                                     "The session is compromised; stop and tell the owner."}))
+        return 0
+
+    try:
+        evaluate_post(
+            event.get("tool_name") or "",
+            event.get("tool_input") or {},
+            event.get("tool_response") if "tool_response" in event else event.get("tool_output"),
+            cwd=event.get("cwd"),
+            session_id=sid,
+            exit_code=event.get("exit_code") if isinstance(event.get("exit_code"), int) else None,
+            call_id=event.get("tool_use_id") or event.get("call_id"),
+        )
+    except Exception:
+        pass
+    return 0
+
+
+def run_stop(event: Dict[str, Any], fmt: str = "claude") -> int:
+    """Cross-examine a draft final reply against recorded execution telemetry (Detective Mode)."""
+    from .generic import evaluate_stop
+
+    reply_text = str(
+        event.get("last_assistant_message")
+        or event.get("assistant_message")
+        or event.get("reply")
+        or event.get("text")
+        or ""
+    )
+    sid = event.get("session_id") or "default"
+    cwd = event.get("cwd")
+    mode = event.get("mode")
+    warrant = evaluate_stop(reply_text, cwd=cwd, session_id=sid, mode=mode)
+
+    if fmt == "json":
+        print(json.dumps(warrant))
+        return 0 if warrant["decision"] != "block" else 2
+    if fmt == "exit":
+        if warrant["decision"] == "block":
+            reasons = "; ".join(f["detail"] for f in warrant["findings"][:3])
+            sys.stderr.write(f"Aegis Detective BLOCKED reply: {reasons}\n")
+            return 2
+        return 0
+    if warrant["decision"] == "block":
+        reasons = "; ".join(f"[{f['class']}/{f['code']}] {f['detail']}" for f in warrant["findings"][:4])
+        print(json.dumps({
+            "decision": "block",
+            "reason": f"Aegis Detective Warrant ({warrant['findingCount']} finding(s)): {reasons}",
+        }))
+        return 2
     return 0
 
 

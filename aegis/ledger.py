@@ -255,13 +255,18 @@ class DecisionLedger:
             return body
 
     def record(self, verdict: Verdict, *, tool: Optional[str] = None, arguments: Any = None,
-               approved: bool = False, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+               approved: bool = False, source: Optional[str] = None,
+               call_id: Optional[str] = None, turn_id: Optional[str] = None,
+               phase: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Write a verdict. Logging failures must stop an enforcing caller."""
         try:
             if verdict.level < self.min_level and not approved:
                 return None
             meta = verdict.metadata or {}
             entry: Dict[str, Any] = {
+                "phase": phase or meta.get("phase"),
+                "callId": call_id or meta.get("callId"),
+                "turnId": turn_id or meta.get("turnId"),
                 "tool": tool,
                 "level": verdict.level.name,
                 "clan": verdict.clan,
@@ -286,10 +291,49 @@ class DecisionLedger:
                 if isinstance(value, (list, tuple)):
                     return [scrub(v) for v in value]
                 return value
-            entry = {key: (value if key == "argsDigest" else scrub(value)) for key, value in entry.items()}
+            entry = {key: (value if key in ("argsDigest", "callId", "turnId") else scrub(value)) for key, value in entry.items()}
             return self.append(entry)
         except Exception as exc:
             raise OSError("Aegis decision could not be recorded") from exc
+
+    def record_outcome(
+        self,
+        *,
+        tool: str,
+        call_id: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        exit_code: Optional[int] = None,
+        stdout_digest: Optional[str] = None,
+        stderr_digest: Optional[str] = None,
+        verifier_summary: Optional[Dict[str, Any]] = None,
+        files_read: Optional[List[str]] = None,
+        files_mutated: Optional[List[str]] = None,
+        git_tree_digest: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        command: Optional[str] = None,
+        source: str = "post-outcome",
+    ) -> Dict[str, Any]:
+        """Append a paired PostToolUse execution outcome into the hash-chained ledger."""
+        entry: Dict[str, Any] = {
+            "schema": "aegis.decision.v2",
+            "phase": "post",
+            "callId": call_id,
+            "turnId": turn_id,
+            "tool": tool,
+            "level": "PASS" if (exit_code is None or exit_code == 0) else "WARN",
+            "clan": "Lynceus",
+            "exitCode": exit_code,
+            "stdoutDigest": stdout_digest,
+            "stderrDigest": stderr_digest,
+            "verifierSummary": verifier_summary,
+            "filesRead": files_read or None,
+            "filesMutated": files_mutated or None,
+            "gitTreeDigest": git_tree_digest,
+            "durationMs": duration_ms,
+            "summary": redact(command, MAX_REASON) if command else None,
+            "source": source,
+        }
+        return self.append(entry)
 
     # -- reading -------------------------------------------------------------
 

@@ -65,6 +65,12 @@ fools the judge. Aegis never negotiates with a model:
   uploads to anonymous exfiltration sinks.
 - **Hecatoncheires** — brakes runaway loops and repeated violations.
 - **Minotaur** — the stateful sensor (see below). It may only raise a verdict, never lower one.
+- **Lynceus (Detective Mode)** — the deterministic epistemic lookout (`aegis.detective`). Pairs
+  `PreToolUse`/`PostToolUse` outcomes in `aegis.decision.v2`, cross-examines draft replies at
+  `Stop` (`aegis hook --stop`) against exit codes and live git state, detects test tampering
+  (`sys.exit(0)`, `@skip`, assertion drops, Rashomon red-to-test edits) and synthetic green
+  theater, and resolves caught lies via clean-room diff re-testing, AST mutation probes, and
+  surgical turn rollback.
 
 ## What 1.0 adds
 

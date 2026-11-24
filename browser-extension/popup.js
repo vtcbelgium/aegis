@@ -15,16 +15,15 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function render(state) {
     protectionActive = state.protectionActive !== false;
-    toggleBtn.textContent = protectionActive ? "SHIELD ON" : "PAUSED";
-    toggleBtn.classList.toggle("paused", !protectionActive);
+    toggleBtn.setAttribute("data-on", protectionActive ? "true" : "false");
+    toggleBtn.setAttribute("aria-pressed", protectionActive ? "true" : "false");
 
     const allowlist = Array.isArray(state.allowlist) ? state.allowlist : [];
     if (currentHostname) {
       siteBar.style.display = "flex";
       const trusted = allowlist.includes(currentHostname);
-      siteHostEl.textContent = trusted ? `${currentHostname} (Trusted)` : currentHostname;
-      toggleSiteBtn.textContent = trusted ? "Re-enable Here" : "Trust This Site";
-      toggleSiteBtn.classList.toggle("muted", trusted);
+      siteHostEl.textContent = trusted ? `${currentHostname} (trusted)` : currentHostname;
+      toggleSiteBtn.textContent = trusted ? "Re-enable here" : "Trust site";
     }
 
     const tabItems = Array.isArray(state.tabThreats) ? state.tabThreats : [];
@@ -33,15 +32,15 @@ document.addEventListener("DOMContentLoaded", () => {
     totalCountEl.textContent = String(state.blockedCount || 0);
 
     const items = tabItems.length > 0 ? tabItems : globalItems;
-    listTitleEl.textContent = tabItems.length > 0 ? "Blocked on This Tab" : "Recent Blocked Traps (All Tabs)";
+    listTitleEl.textContent = tabItems.length > 0 ? "Blocked on this tab" : "Activity";
     listEl.textContent = "";
 
     if (items.length === 0) {
       const li = document.createElement("li");
       li.className = "empty";
       li.textContent = protectionActive
-        ? "No hidden traps detected yet."
-        : "Shield is paused — click PAUSED above to re-enable.";
+        ? "No hidden prompt traps or tracking beacons found."
+        : "Shield is paused. Switch it back on above to resume.";
       listEl.appendChild(li);
       return;
     }
@@ -49,7 +48,7 @@ document.addEventListener("DOMContentLoaded", () => {
     items.slice(0, 8).forEach((t) => {
       const li = document.createElement("li");
       li.className = "threat-item";
-      const prefix = t.kind === "beacon" ? "[Beacon] " : "[Prompt Trap] ";
+      const prefix = t.kind === "beacon" ? "Beacon: " : "Prompt trap: ";
       li.textContent = prefix + (t.reason || "Blocked suspicious element");
       listEl.appendChild(li);
     });

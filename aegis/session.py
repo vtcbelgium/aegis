@@ -59,14 +59,29 @@ def load(session_id: str, *, directory: Optional[str] = None) -> Dict[str, Any]:
 
 
 def save(session_id: str, level: DecisionLevel, minotaur_state: Optional[Dict[str, Any]], *,
+         hecatoncheires_state: Optional[Dict[str, Any]] = None,
+         detective_state: Optional[Dict[str, Any]] = None,
          directory: Optional[str] = None) -> None:
     path = _path(session_id, directory)
     import tempfile
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    # Preserve existing hecatoncheires / detective blocks when callers omit them (e.g. legacy gate-only saves).
+    existing = {}
+    try:
+        existing = load(session_id, directory=directory)
+    except Exception:
+        existing = {}
+    payload: Dict[str, Any] = {
+        "at": time.time(),
+        "level": int(level),
+        "minotaur": minotaur_state or {},
+        "hecatoncheires": hecatoncheires_state if hecatoncheires_state is not None else (existing.get("hecatoncheires") or {}),
+        "detective": detective_state if detective_state is not None else (existing.get("detective") or {}),
+    }
     fd, tmp = tempfile.mkstemp(prefix=".session-", dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"at": time.time(), "level": int(level), "minotaur": minotaur_state or {}}, fh)
+            json.dump(payload, fh)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -92,6 +107,35 @@ def apply_to_gate(gate, session_id: str, *, directory: Optional[str] = None) -> 
         gate.minotaur.import_state(data["minotaur"])
 
 
-def persist_from_gate(gate, session_id: str, *, directory: Optional[str] = None) -> None:
+def apply_to_harness(harness, session_id: str, *, directory: Optional[str] = None) -> Dict[str, Any]:
+    """Rehydrate gate, Hecatoncheires loop/violation memory, and return detective turn state."""
+    data = load(session_id, directory=directory)
+    if not data:
+        return {}
+    harness.gate.escalate(DecisionLevel(data["level"]))
+    if harness.gate.minotaur is not None and data.get("minotaur"):
+        harness.gate.minotaur.import_state(data["minotaur"])
+    if getattr(harness, "hecatoncheires", None) is not None and data.get("hecatoncheires"):
+        harness.hecatoncheires.import_state(data["hecatoncheires"])
+    det = data.get("detective")
+    return dict(det) if isinstance(det, dict) else {}
+
+
+def persist_from_gate(gate, session_id: str, *, directory: Optional[str] = None,
+                      detective_state: Optional[Dict[str, Any]] = None) -> None:
     minotaur_state = gate.minotaur.export_state() if gate.minotaur is not None else None
-    save(session_id, gate.current_level, minotaur_state, directory=directory)
+    save(session_id, gate.current_level, minotaur_state, detective_state=detective_state, directory=directory)
+
+
+def persist_from_harness(harness, session_id: str, *, directory: Optional[str] = None,
+                         detective_state: Optional[Dict[str, Any]] = None) -> None:
+    minotaur_state = harness.gate.minotaur.export_state() if harness.gate.minotaur is not None else None
+    heca_state = harness.hecatoncheires.export_state() if getattr(harness, "hecatoncheires", None) is not None else None
+    save(
+        session_id,
+        harness.gate.current_level,
+        minotaur_state,
+        hecatoncheires_state=heca_state,
+        detective_state=detective_state,
+        directory=directory,
+    )

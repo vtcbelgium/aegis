@@ -310,12 +310,14 @@ def _policy_from_env():
     return load_policy()
 
 
-def run_hook(post: bool = False, fmt: str = "claude") -> int:
-    """Vendor-neutral agent hook. Reads one tool call (or tool result) as JSON on stdin."""
+def run_hook(post: bool = False, stop: bool = False, fmt: str = "claude") -> int:
+    """Vendor-neutral agent hook. Reads one tool call, tool result, or draft stop reply as JSON on stdin."""
     from .integrations import generic
-    from .integrations.claude_code import run_posttooluse, _read_event
+    from .integrations.claude_code import run_posttooluse, run_stop, _read_event
     try:
         event = _read_event()
+        if stop or event.get("hook_event_name") in ("Stop", "AfterAgent"):
+            return run_stop(event, fmt=fmt)
         if post or event.get("hook_event_name") == "PostToolUse":
             return run_posttooluse(event, fmt=fmt)
         d = generic.evaluate(event.get("tool_name") or "", event.get("tool_input", {}),
@@ -329,12 +331,142 @@ def run_hook(post: bool = False, fmt: str = "claude") -> int:
     return code
 
 
+def run_detective_cli(args: argparse.Namespace) -> int:
+    """Deterministic Detective Mode (Clan Lynceus) CLI."""
+    import subprocess
+    from . import session as session_store
+    from .detective import (
+        get_tips,
+        git_snapshot,
+        inspect_unified_diff,
+        latest_turn_id,
+        load_detective_config,
+        mutate_probe,
+        save_detective_config,
+        set_freeze_tests,
+        undo_turn,
+        verify_clean,
+        verify_reply,
+    )
+    from .ledger import DecisionLedger, default_ledger_path
+
+    action = args.detective_action
+    as_json = bool(getattr(args, "as_json", False))
+    sid = getattr(args, "session", "default") or "default"
+
+    if action == "status":
+        cfg = load_detective_config()
+        sdata = session_store.load(sid)
+        det = sdata.get("detective") if isinstance(sdata.get("detective"), dict) else {}
+        led = DecisionLedger(default_ledger_path()).verify()
+        snap = git_snapshot(getattr(args, "cwd", None) or os.getcwd())
+        payload = {
+            "config": cfg,
+            "session": sid,
+            "telemetry": det,
+            "latestTurnId": det.get("turnId") or latest_turn_id(sid),
+            "ledgerOk": led.ok,
+            "ledgerCount": led.count,
+            "gitDirtyCount": len(snap.get("dirty") or {}),
+            "tips": get_tips(det),
+        }
+        if as_json:
+            print(json.dumps(payload, indent=2))
+            return 0
+        print(f"Aegis Detective Mode: {cfg['mode'].upper()} | freeze-tests: {'ON' if cfg['freezeTests'] else 'OFF'}")
+        print(f"  Session: {sid} | Calls: {det.get('callSeq', 0)} | Dirty files: {payload['gitDirtyCount']} | Ledger: {'OK' if led.ok else 'BROKEN'} ({led.count})")
+        for t in payload["tips"]:
+            print(f"  [{t['code']}] {t['tip']}")
+        return 0
+
+    if action == "tips":
+        sdata = session_store.load(sid)
+        det = sdata.get("detective") if isinstance(sdata.get("detective"), dict) else {}
+        tips = get_tips(det)
+        if as_json:
+            print(json.dumps({"tips": tips}, indent=2))
+            return 0
+        for t in tips:
+            print(f"[{t['code']}] ({t['trigger']}): {t['tip']}")
+        return 0
+
+    if action == "freeze-tests":
+        cfg = set_freeze_tests(not bool(args.off))
+        if as_json:
+            print(json.dumps(cfg, indent=2))
+        else:
+            print(f"Test freeze is now {'ON' if cfg['freezeTests'] else 'OFF'}.")
+        return 0
+
+    if action == "mode":
+        cfg = save_detective_config({"mode": args.value})
+        if as_json:
+            print(json.dumps(cfg, indent=2))
+        else:
+            print(f"Detective mode set to {cfg['mode'].upper()}.")
+        return 0
+
+    if action == "verify-reply":
+        text = args.text or ""
+        if args.file:
+            with open(args.file, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        sdata = session_store.load(sid)
+        det = sdata.get("detective") if isinstance(sdata.get("detective"), dict) else {}
+        led = DecisionLedger(default_ledger_path()).verify()
+        warrant = verify_reply(
+            text,
+            cwd=args.cwd or os.getcwd(),
+            detective_state=det,
+            mode=args.mode,
+            ledger_tip=led.tip if led.ok else None,
+        )
+        if as_json:
+            print(json.dumps(warrant, indent=2))
+        else:
+            print(f"Verdict: {warrant['verdict']} ({warrant['findingCount']} finding(s), decision={warrant['decision']})")
+            for f in warrant["findings"]:
+                print(f"  [{f['class']}/{f['code']}] ({f['severity']}) {f['detail']}")
+        return 0 if warrant["passed"] else 2
+
+    if action == "scan-diff":
+        cwd = os.path.abspath(args.cwd or os.getcwd())
+        diff = subprocess.run(["git", "-C", cwd, "diff", "HEAD"], capture_output=True, text=True, check=False)
+        findings = inspect_unified_diff(diff.stdout or "")
+        if as_json:
+            print(json.dumps({"cwd": cwd, "passed": not findings, "findings": findings}, indent=2))
+        else:
+            if not findings:
+                print("Diff integrity scan clean (0 test-tampering or theater findings).")
+            else:
+                for f in findings:
+                    print(f"  [{f['class']}/{f['code']}] ({f['severity']}) {f.get('file', '')}: {f['detail']}")
+        return 0 if not findings else 2
+
+    if action == "verify-clean":
+        res = verify_clean(args.cwd or os.getcwd(), args.cmd)
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("ok") else 2
+
+    if action == "mutate":
+        res = mutate_probe(args.cwd or os.getcwd(), args.target, args.cmd)
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("ok") else 2
+
+    if action == "undo":
+        res = undo_turn(args.turn, dry_run=bool(args.dry_run))
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("ok") else 1
+
+    return 1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aegis: deterministic negative security gate & firewall for AI agents")
     sub = parser.add_subparsers(dest="subcommand")
-    dojo = sub.add_parser("dojo", help="Run bounded offline simulations from the six legacy knowledge packs")
+    dojo = sub.add_parser("dojo", help="Run bounded offline simulations from the knowledge packs")
     dojo.add_argument("--mission", required=True)
-    dojo.add_argument("--pack", choices=("all", "01", "02", "03", "04", "05", "06"), default="all")
+    dojo.add_argument("--pack", choices=("all", "01", "02", "03", "04", "05", "06", "07"), default="all")
 
     ap = sub.add_parser("audit", help="Scan a file or directory for secrets and OWASP issues")
     ap.add_argument("path", default=".", nargs="?")
@@ -384,10 +516,34 @@ def main() -> None:
     lrn = sub.add_parser("learn", help="Suggest policy tweaks from the ledger (you decide)")
     lrn.add_argument("-n", type=int, default=15)
 
-    hp = sub.add_parser("hook", help="Run as an agent hook (reads a tool call as JSON on stdin)")
-    hp.add_argument("--post", action="store_true", help="PostToolUse mode (scan output for decoys)")
+    hp = sub.add_parser("hook", help="Run as an agent hook (reads a tool call, result, or stop reply as JSON on stdin)")
+    hp.add_argument("--post", action="store_true", help="PostToolUse mode (scan output for decoys and log execution outcome)")
+    hp.add_argument("--stop", action="store_true", help="Stop mode (Detective cross-examination of draft reply against recorded telemetry)")
     hp.add_argument("--format", choices=("claude", "json", "exit"), default="claude",
                     help="Output shape: claude/gemini/copilot JSON (default), plain json, or exit-code only")
+
+    detp = sub.add_parser("detective", help="Aegis Detective Mode (Clan Lynceus): catch lies, test tampering, and drift")
+    det_sub = detp.add_subparsers(dest="detective_action")
+    det_st = det_sub.add_parser("status", help="Show Detective mode posture, telemetry, and active tips")
+    det_st.add_argument("--session", default="default"); det_st.add_argument("--cwd", default=None); det_st.add_argument("--json", action="store_true", dest="as_json")
+    det_tp = det_sub.add_parser("tips", help="Print live context-triggered Detective tips")
+    det_tp.add_argument("--session", default="default"); det_tp.add_argument("--json", action="store_true", dest="as_json")
+    det_vr = det_sub.add_parser("verify-reply", help="Cross-examine a draft reply against ledger and workspace ground truth")
+    det_vr.add_argument("--text", default=None); det_vr.add_argument("--file", default=None)
+    det_vr.add_argument("--cwd", default=None); det_vr.add_argument("--session", default="default")
+    det_vr.add_argument("--mode", choices=("passive", "strict"), default=None); det_vr.add_argument("--json", action="store_true", dest="as_json")
+    det_sd = det_sub.add_parser("scan-diff", help="Scan current git diff for test tampering and synthetic green theater")
+    det_sd.add_argument("--cwd", default=None); det_sd.add_argument("--json", action="store_true", dest="as_json")
+    det_ft = det_sub.add_parser("freeze-tests", help="Lock or unlock test files read-only during bug fixes")
+    det_ft.add_argument("--off", action="store_true"); det_ft.add_argument("--json", action="store_true", dest="as_json")
+    det_md = det_sub.add_parser("mode", help="Set Detective mode (off, passive, strict)")
+    det_md.add_argument("value", choices=("off", "passive", "strict")); det_md.add_argument("--json", action="store_true", dest="as_json")
+    det_vc = det_sub.add_parser("verify-clean", help="Replay production-only git diff against untouched HEAD tests")
+    det_vc.add_argument("--cmd", required=True); det_vc.add_argument("--cwd", default=None)
+    det_mt = det_sub.add_parser("mutate", help="Inject 1 AST fault in a temp copy to verify tests are not hollow")
+    det_mt.add_argument("target"); det_mt.add_argument("--cmd", required=True); det_mt.add_argument("--cwd", default=None)
+    det_un = det_sub.add_parser("undo", help="Restore files modified during a turn from protected checkpoints")
+    det_un.add_argument("--turn", default=None); det_un.add_argument("--dry-run", action="store_true")
 
     uip = sub.add_parser("ui", help="Open the offline Aegis Control Center app in your browser")
     uip.add_argument("--port", type=int, default=9999)
@@ -460,7 +616,12 @@ def main() -> None:
     elif args.subcommand == "learn":
         sys.exit(run_learn(args.n))
     elif args.subcommand == "hook":
-        sys.exit(run_hook(post=args.post, fmt=args.format))
+        sys.exit(run_hook(post=args.post, stop=args.stop, fmt=args.format))
+    elif args.subcommand == "detective":
+        if not args.detective_action:
+            detp.print_help()
+            sys.exit(1)
+        sys.exit(run_detective_cli(args))
     elif args.subcommand == "serve":
         run_daemon(args.port, base_dir=args.base_dir)
     else:
