@@ -118,7 +118,20 @@ def test_server_tekton_endpoints_and_ui_presence(monkeypatch, tmp_path: Path):
         assert "Open Tekton GUI" in html
         assert 'data-view="help"' in html
         assert "Help and quick manual" in html
+        assert "Interactive architecture blueprints" in html
+        assert "/ui/diagrams/master.jpg" in html
         assert "Stop server" in html
+
+        for name in ("master.jpg", "guard.jpg", "detective.jpg", "tekton.jpg"):
+            with urllib.request.urlopen(f"{base}/ui/diagrams/{name}", timeout=5) as img_resp:
+                assert img_resp.status == 200
+                assert img_resp.headers.get("Content-Type") == "image/jpeg"
+                raw_img = img_resp.read(16)
+                assert raw_img[:3] == b"\xff\xd8\xff"
+
+        for bad in ("../index.html", "unknown.jpg"):
+            code_bad, _ = _http_json(f"{base}/ui/diagrams/{bad}")
+            assert code_bad == 404
 
         code, body = _http_json(base + "/api/tekton")
         assert code == 200

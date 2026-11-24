@@ -392,6 +392,124 @@
       z-index: 40;
     }
     .toast.show { opacity: 1; transform: translateY(0); }
+
+    #view-help { max-width: 820px; }
+    .bp-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .bp-stage {
+      position: relative;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #ffffff;
+    }
+    .bp-stage img {
+      display: block;
+      width: 100%;
+      height: auto;
+      user-select: none;
+    }
+    .bp-spots {
+      position: absolute;
+      inset: 0;
+    }
+    .bp-spot {
+      position: absolute;
+      background: transparent;
+      border: 1.5px solid transparent;
+      border-radius: 6px;
+      cursor: pointer;
+      padding: 0;
+      transition: background 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+    }
+    .bp-stage.show-outlines .bp-spot {
+      border-color: rgba(15, 23, 42, 0.32);
+      border-style: dashed;
+      background: rgba(15, 23, 42, 0.04);
+    }
+    .bp-spot:hover,
+    .bp-spot:focus-visible,
+    .bp-spot.active {
+      outline: none;
+      border: 2px solid #0b0d11;
+      border-style: solid;
+      background: rgba(11, 13, 17, 0.11);
+      box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9);
+      z-index: 4;
+    }
+    .bp-popover {
+      position: absolute;
+      z-index: 12;
+      width: min(300px, calc(100% - 24px));
+      background: rgba(16, 19, 25, 0.97);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      padding: 11px 13px;
+      color: var(--fg);
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(4px);
+      transition: opacity 110ms ease, transform 110ms ease;
+    }
+    .bp-popover.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .bp-pop-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 5px;
+    }
+    .bp-pop-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    .bp-pop-tag {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--ok);
+      white-space: nowrap;
+    }
+    .bp-pop-body {
+      font-size: 11.5px;
+      line-height: 1.5;
+      color: #c8d0dc;
+    }
+    .bp-pop-meta {
+      margin-top: 7px;
+      padding-top: 6px;
+      border-top: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--muted);
+      word-break: break-all;
+    }
+    .bp-inspector {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--sidebar);
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .bp-inspector-main {
+      flex: 1 1 360px;
+      min-width: 0;
+    }
   </style>
 </head>
 <body>
@@ -715,6 +833,49 @@
           <div class="inline-actions" style="margin-top:0;">
             <button class="btn" id="copyDiagHelpBtn">Copy diagnostics</button>
             <a class="btn" style="text-decoration:none;" href="/api/ledger/export" download="aegis-decision-diary.json">Export diary</a>
+          </div>
+        </div>
+
+        <div class="section">
+          <h2>Interactive architecture blueprints</h2>
+          <p class="sub" style="margin-bottom:12px;">Hover over any part of a diagram for extra details, or click a region to pin it below.</p>
+          <div class="bp-toolbar">
+            <div class="seg" role="group" aria-label="Select architecture blueprint">
+              <button data-bp="master" class="active">Overview</button>
+              <button data-bp="guard">1. Guard</button>
+              <button data-bp="detective">2. Detective</button>
+              <button data-bp="tekton">3. Tekton</button>
+            </div>
+            <div class="inline-actions" style="margin-top:0;">
+              <button class="btn" id="bpOutlineBtn">Outline regions</button>
+              <a class="btn" id="bpFullLink" href="/ui/diagrams/master.jpg" target="_blank" rel="noopener">Open full size</a>
+            </div>
+          </div>
+          <div class="bp-stage" id="bpStage">
+            <img id="bpImage" src="/ui/diagrams/master.jpg" alt="Aegis and Tekton Master Architecture Blueprint">
+            <div class="bp-spots" id="bpSpots"></div>
+            <div class="bp-popover" id="bpPopover" role="tooltip" aria-hidden="true">
+              <div class="bp-pop-head">
+                <span class="bp-pop-title" id="bpPopTitle"></span>
+                <span class="bp-pop-tag" id="bpPopTag"></span>
+              </div>
+              <div class="bp-pop-body" id="bpPopBody"></div>
+              <div class="bp-pop-meta hidden" id="bpPopMeta"></div>
+            </div>
+          </div>
+          <div class="bp-inspector" id="bpInspector">
+            <div class="bp-inspector-main">
+              <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;">
+                <span class="fg" style="font-weight:600;" id="bpInsTitle">Hover any section on the blueprint</span>
+                <span class="mono muted" style="font-size:11px;" id="bpInsTag"></span>
+              </div>
+              <div class="muted" style="margin-top:4px;font-size:12px;" id="bpInsBody">Move your pointer over any box, clan, or pipeline stage above to inspect how it works under the hood. Click a region to pin its details here.</div>
+              <div class="mono muted hidden" style="margin-top:6px;font-size:11px;" id="bpInsMeta"></div>
+            </div>
+            <div class="inline-actions" style="margin-top:0;">
+              <button class="btn hidden" id="bpInsCopyBtn">Copy command</button>
+              <button class="btn primary hidden" id="bpInsJumpBtn">Open tab</button>
+            </div>
           </div>
         </div>
 
@@ -1739,6 +1900,445 @@
       else loadOverview();
     }, 15000);
 
+    // INTERACTIVE ARCHITECTURE BLUEPRINTS (HOVER + PIN INSPECTOR)
+    const BLUEPRINTS = {
+      master: {
+        src: "/ui/diagrams/master.jpg",
+        alt: "Aegis and Tekton Master Architecture Blueprint",
+        spots: [
+          {
+            id: "m-callers", x: 2, y: 2, w: 49, h: 25,
+            title: "AI Callers and 4 Local Entry Points", tag: "Entry Layer",
+            body: "Aegis never talks to cloud LLM APIs. It plugs locally into Claude Code and Gemini CLI via hooks, wraps Cursor/VS Code/Antigravity MCP plugins with SHA-256 schema pinning, cleans hidden web traps via the Browser Extension, and embeds natively inside Tekton or custom Python/HTTP agents.",
+            meta: "aegis setup | aegis mcp wrap --server <name> -- <cmd>", cmd: "aegis doctor", tab: "apps"
+          },
+          {
+            id: "m-phone", x: 78, y: 10, w: 20, h: 19,
+            title: "Approve Once Mobile and Remote Flow", tag: "Owner Gate",
+            body: "When an AI attempts a risky or destructive action, execution pauses cleanly and waits for an explicit owner approval via the Phone Companion PWA or the Aegis Desktop window. Every approval is single-use and bound to exact arguments.",
+            meta: "Tekton Phone Companion PWA + Aegis Approvals", tab: "approvals"
+          },
+          {
+            id: "m-labyrinth", x: 4, y: 34, w: 18, h: 16,
+            title: "Labyrinth Clan", tag: "Workspace Fence",
+            body: "Confines file reads and writes inside your active workspace. Blocks symlink escapes, Windows NTFS junctions, Alternate Data Streams, SSH keys (~/.ssh), cloud credentials (~/.aws), browser stores, and .env files.",
+            meta: "aegis/clans/labyrinth.py", tab: "guard"
+          },
+          {
+            id: "m-tartarus", x: 23, y: 34, w: 18, h: 16,
+            title: "Tartarus Clan", tag: "Multi-Shell Guard",
+            body: "Parses POSIX sh, Windows cmd.exe, and PowerShell commands offline (decoding ANSI-C escapes, carets, and backticks). Calculates delete blast radius (>100 items or >500 MB) and binds raw .git state without spawning git.",
+            meta: "aegis/clans/tartarus.py + aegis/shell.py", cmd: 'aegis explain "git reset --hard"', tab: "guard"
+          },
+          {
+            id: "m-custody", x: 41, y: 34, w: 18, h: 16,
+            title: "Custody Clan", tag: "Zero-DNS SSRF & Keys",
+            body: "Inspects URLs and payloads completely offline with live OS DNS disabled by default (preventing DNS exfiltration). Blocks cloud metadata endpoints (169.254.169.254, .sslip.io, .nip.io), paste sites, and live API keys.",
+            meta: "aegis/clans/custody.py + aegis/canonicalizer.py", cmd: "aegis audit .", tab: "guard"
+          },
+          {
+            id: "m-heca", x: 60, y: 34, w: 19, h: 16,
+            title: "Hecatoncheires Clan", tag: "Loop Brake",
+            body: "Tracks repetitive calls and repeated rule violations across subprocess invocations via persisted session state. Automatically escalates runaway loops to DENY or LOCK before an agent can burn tokens or brute-force rules.",
+            meta: "aegis/clans/hecatoncheires.py + aegis/session.py", tab: "guard"
+          },
+          {
+            id: "m-minotaur", x: 79, y: 34, w: 18, h: 16,
+            title: "Minotaur Clan", tag: "Tripwires & Leak Guard",
+            body: "Plants harmless fake credential decoy files in places normal work never touches; touching one locks the session immediately. Also flags the 3-step data-theft combo: private data read + untrusted content read + outbound egress.",
+            meta: "aegis/clans/minotaur.py", cmd: "aegis minotaur status", tab: "settings"
+          },
+          {
+            id: "m-verdicts", x: 4, y: 50, w: 92, h: 7,
+            title: "Monotonic Verdict Pipeline", tag: "Supreme Law",
+            body: "Verdicts can only escalate upward: PASS (run) to WARN (log) to ASK (pause for exact phrase confirmation) to DENY (block action) to LOCK (freeze session until the owner manually unlocks). Aegis can never grant extra authority.",
+            meta: "aegis/core.py (DecisionLevel)", tab: "guard"
+          },
+          {
+            id: "m-detective", x: 2, y: 58, w: 40, h: 24,
+            title: "Detective Mode (Clan Lynceus)", tag: "After Reply",
+            body: "Verifies what an agent claims against real recorded tool exits, files on disk, and git diffs. Catches phantom test runs, fake file/line citations, AST test tampering, and supports Freeze Test Files plus surgical Turn Undo.",
+            meta: "aegis/detective/ + aegis hook --stop", cmd: "aegis detective status", tab: "detective"
+          },
+          {
+            id: "m-tekton-fleet", x: 43, y: 58, w: 55, h: 16,
+            title: "Tekton Zero-Port Fleet", tag: "Remote Mesh",
+            body: "Connects your machines (Laptop, Desktop PC, Linux sentinel, NAS) behind NAT/firewalls with zero open inbound ports. Workers poll outbound only using Ed25519 Proof-of-Possession signatures.",
+            meta: "tekton relay-status --json", cmd: "tekton relay-status --json", tab: "tekton"
+          },
+          {
+            id: "m-tekton-gate", x: 44, y: 74, w: 53, h: 8,
+            title: "Pinned aegis-gate and 24-Tool Commander", tag: "Interlock",
+            body: "Tekton v1.5.0 imports pinned aegis-gate directly in enforce mode and merges your ~/.aegis/policy.json floor monotonically (Aegis can only make Tekton stricter). Approved jobs run inside allowed folders only.",
+            meta: "tekton doctor --json", cmd: "tekton doctor --json", tab: "tekton"
+          },
+          {
+            id: "m-replay", x: 2, y: 83, w: 47, h: 15,
+            title: "Dual-Gate Owner Approval Replay", tag: "Single-Use",
+            body: "Risky remote actions pause as ASK, await owner sign-off in the Phone PWA or Aegis Tekton tab, and replay once with an Ed25519 security_context token. Granular diagnostics catch expired, reused, or untrusted replays.",
+            meta: "tekton approvals --json", cmd: "tekton approvals --json", tab: "tekton"
+          },
+          {
+            id: "m-vault", x: 51, y: 83, w: 47, h: 15,
+            title: "Tamper-Proof Audit, Policy Vault and Desktop App", tag: "Local Proof",
+            body: "Every decision is SHA-256 hash-chained in ~/.aegis/ledger.jsonl with secrets redacted. Policy rules live in ~/.aegis/policy.json (off-limits to AI agents), and this Desktop Control Center runs strictly on 127.0.0.1:9999.",
+            meta: "~/.aegis/ledger.jsonl | ~/.aegis/policy.json", cmd: "aegis ledger verify", tab: "settings"
+          }
+        ]
+      },
+      guard: {
+        src: "/ui/diagrams/guard.jpg",
+        alt: "Part 1: Aegis Guard Blueprint",
+        spots: [
+          {
+            id: "g-entry", x: 2, y: 2, w: 51, h: 26,
+            title: "AI Apps and 4 Local Entry Points", tag: "Connectors",
+            body: "Connect Claude Code and Gemini CLI with 1-click hooks, wrap Cursor/VS Code/Antigravity MCP servers with SHA-256 schema pinning, clean web pages with the MV3 Browser Extension, or call Aegis directly from Python/HTTP.",
+            meta: "Open Apps tab to toggle protection (auto-backups configs)", cmd: "aegis setup", tab: "apps"
+          },
+          {
+            id: "g-labyrinth", x: 20, y: 34, w: 25, h: 17,
+            title: "Labyrinth — Workspace and Secret Fence", tag: "Clan 1",
+            body: "Enforces strict workspace confinement and blocks credential stores (~/.ssh, ~/.aws, .env, keychains) as well as symlink, Windows reparse/junction, and Alternate Data Stream escape tricks.",
+            meta: "aegis/clans/labyrinth.py", tab: "guard"
+          },
+          {
+            id: "g-tartarus", x: 57, y: 34, w: 25, h: 17,
+            title: "Tartarus — Multi-Shell and Blast Radius", tag: "Clan 2",
+            body: "Zero-dependency parser for sh, cmd.exe, and PowerShell that tracks chained directory changes, decodes hidden escapes ($'...', carets, backticks), and counts delete impact before asking for confirmation.",
+            meta: "aegis/clans/tartarus.py + aegis/impact.py", cmd: 'aegis explain "rm -rf /"', tab: "guard"
+          },
+          {
+            id: "g-custody", x: 10, y: 51, w: 24, h: 17,
+            title: "Custody — Zero-DNS SSRF and Key Shield", tag: "Clan 3",
+            body: "Canonicalizes URLs purely offline (allow_live_dns=False) to stop DNS exfiltration and cloud IMDS rebinding (169.254.169.254, hex/octal IPv4, .sslip.io, .nip.io), while scanning for live API keys and private keys.",
+            meta: "aegis/clans/custody.py + aegis/canonicalizer.py", cmd: "aegis audit .", tab: "guard"
+          },
+          {
+            id: "g-heca", x: 38, y: 51, w: 24, h: 17,
+            title: "Hecatoncheires — Loop and Rate Brake", tag: "Clan 4",
+            body: "Persists call counters across separate hook invocations so an AI stuck retrying the exact same command or probing blocked rules trips an automatic brake instead of looping indefinitely.",
+            meta: "aegis/clans/hecatoncheires.py", tab: "guard"
+          },
+          {
+            id: "g-minotaur", x: 66, y: 51, w: 25, h: 17,
+            title: "Minotaur — Decoy Tripwires and Leak Guard", tag: "Clan 5",
+            body: "Planted decoy files trigger an instant LOCK if read by a snooping agent. The 3-step Leak Guard pauses outbound egress whenever private data and untrusted external text were both touched in the same session.",
+            meta: "aegis/clans/minotaur.py", cmd: "aegis minotaur init", tab: "settings"
+          },
+          {
+            id: "g-verdicts", x: 3, y: 68, w: 94, h: 14,
+            title: "Monotonic Verdict Escalation and TOCTOU Binding", tag: "Confirmation",
+            body: "Destructive approvals compute a SHA-256 digest over exact target files and raw .git state on disk (without executing git). If HEAD, index, or files change before execution, the confirmation token automatically invalidates.",
+            meta: "docs/specs/destructive-confirmation-v1.schema.json", tab: "approvals"
+          },
+          {
+            id: "g-dojo", x: 2, y: 83, w: 47, h: 15,
+            title: "42 Offline Safety Drills (aegis dojo)", tag: "Self-Test",
+            body: "Runs 42 bounded offline red-team and deception simulations across Knowledge Packs 01 through 07 without ever running real shell commands or touching your real files. Temporary fixtures are cleaned up automatically.",
+            meta: "aegis dojo --mission verify", cmd: 'aegis dojo --mission "verify"', tab: "guard"
+          },
+          {
+            id: "g-vault", x: 51, y: 83, w: 47, h: 15,
+            title: "Tamper-Proof Audit and Policy Vault", tag: "Persistence",
+            body: "All gate verdicts are linked in a SHA-256 hash chain (~/.aegis/ledger.jsonl) so deleted or altered entries break verification. Rules in ~/.aegis/policy.json are protected from agent edits.",
+            meta: "aegis ledger verify", cmd: "aegis ledger verify", tab: "settings"
+          }
+        ]
+      },
+      detective: {
+        src: "/ui/diagrams/detective.jpg",
+        alt: "Part 2: Aegis Detective Blueprint (Clan Lynceus)",
+        spots: [
+          {
+            id: "d-theater", x: 2, y: 2, w: 49, h: 25,
+            title: "Agent Theater and Stop Hook Modes", tag: "Stop Gate",
+            body: "Intercepts draft replies before an agent finishes. Run in OFF (disabled), PASSIVE (log warnings and tips without blocking), or STRICT (block replies containing verified contradictions until corrected).",
+            meta: "aegis hook --stop | aegis detective mode strict", cmd: "aegis detective status", tab: "detective"
+          },
+          {
+            id: "d-telemetry", x: 4, y: 33, w: 29, h: 17,
+            title: "PostToolUse Telemetry", tag: "Evidence 1",
+            body: "Every tool completion records real exit codes, command fingerprints, and timestamps in the upgraded ledger v2 format so Detective knows whether pytest, vitest, or build commands actually ran and passed.",
+            meta: "aegis/detective/outcomes.py + aegis/ledger.py", tab: "detective"
+          },
+          {
+            id: "d-snapshot", x: 35, y: 33, w: 30, h: 17,
+            title: "Git and Disk Snapshot", tag: "Evidence 2",
+            body: "Captures real tracked and untracked dirty files, HEAD commit SHAs, and workspace file paths on disk so Detective can catch undisclosed edits, phantom file references, and edits made after tests ran.",
+            meta: "aegis/detective/baseline.py", tab: "detective"
+          },
+          {
+            id: "d-checkpoint", x: 67, y: 33, w: 29, h: 17,
+            title: "Turn Checkpoints", tag: "Evidence 3",
+            body: "Snapshots pre-turn file contents in protected storage under ~/.aegis/detective/checkpoints so a bad or deceptive agent turn can be rolled back surgically without wiping unrelated work.",
+            meta: "aegis/detective/resolver.py", cmd: "aegis detective undo --dry-run", tab: "detective"
+          },
+          {
+            id: "d-d01", x: 4, y: 56, w: 45, h: 11,
+            title: "Verification Lies (D01 to D03)", tag: "Detectors",
+            body: "D01 catches phantom verification (claiming tests passed when no test ran). D02 catches outcome inversion (claiming pass after exit code 1). D03 catches edit-after-verify (changing code after the last green run).",
+            meta: "aegis/detective/claims.py", tab: "detective"
+          },
+          {
+            id: "d-d04", x: 51, y: 56, w: 45, h: 11,
+            title: "Test Tampering (D04 to D05)", tag: "AST Check",
+            body: "Parses Python and JS diffs at the AST level to detect deleted assertions, newly added @skip/xfail markers, Rashomon red-to-test-edit patterns, and config state-swap gaming.",
+            meta: "aegis/detective/ast_integrity.py", cmd: "aegis detective scan-diff", tab: "detective"
+          },
+          {
+            id: "d-d06", x: 4, y: 68, w: 45, h: 11,
+            title: "Ghost Citations and Theater (D06 to D10)", tag: "Ground Truth",
+            body: "Checks Truth Box counts against real edits (D06), flags synthetic green fallback stubs (D07), catches undisclosed dirty files (D08), verifies every cited file/line/SHA exists (D09), and spots slopsquatting imports (D10).",
+            meta: "aegis/detective/claims.py + drift.py", tab: "detective"
+          },
+          {
+            id: "d-d11", x: 51, y: 68, w: 45, h: 11,
+            title: "Impossibility and Drift (D11 to D12)", tag: "Epistemic",
+            body: "Flags impossible technical claims contradicted by recorded telemetry (D11) and detects scope/spin drift where an agent hides failures behind optimistic summaries (D12).",
+            meta: "aegis/detective/drift.py", tab: "detective"
+          },
+          {
+            id: "d-freeze", x: 3, y: 83, w: 23, h: 12,
+            title: "Freeze Test Files", tag: "Countermeasure",
+            body: "Locks test directories and test_* files read-only during bug-fix runs so passing requires fixing the real production code instead of weakening assertions.",
+            meta: "aegis detective freeze-tests", cmd: "aegis detective freeze-tests", tab: "detective"
+          },
+          {
+            id: "d-clean", x: 27, y: 83, w: 23, h: 12,
+            title: "Clean-Room Re-Test", tag: "Countermeasure",
+            body: "Copies HEAD into an isolated temp directory, applies ONLY production source diffs (discarding test edits), and runs your real test command against untouched tests.",
+            meta: 'aegis detective verify-clean --cmd "pytest -q"', cmd: 'aegis detective verify-clean --cmd "pytest -q"', tab: "detective"
+          },
+          {
+            id: "d-mutate", x: 51, y: 83, w: 23, h: 12,
+            title: "AST Mutation Probe", tag: "Countermeasure",
+            body: "Injects one deliberate AST fault into a temporary copy of your target file and runs tests to prove your test suite actually fails on broken code (not hollow mocks).",
+            meta: 'aegis detective mutate <file> --cmd "pytest -q"', tab: "detective"
+          },
+          {
+            id: "d-undo", x: 75, y: 83, w: 23, h: 12,
+            title: "Surgical Turn Undo", tag: "Recovery",
+            body: "Restores files modified during the latest agent turn and deletes newly created files from that turn using Aegis protected checkpoints.",
+            meta: "aegis detective undo", cmd: "aegis detective undo --dry-run", tab: "detective"
+          }
+        ]
+      },
+      tekton: {
+        src: "/ui/diagrams/tekton.jpg",
+        alt: "Part 3: Tekton Fleet Blueprint",
+        spots: [
+          {
+            id: "t-phone", x: 3, y: 6, w: 23, h: 21,
+            title: "Phone Companion PWA", tag: "Mobile Client",
+            body: "Zero App Store install required. Pair in 5 minutes via single-use QR ticket over LAN, Tailscale, or tunnel with HttpOnly SameSite=Strict cookies, constant-time CSRF tokens, and 64 KiB body caps.",
+            meta: "tekton phone --allow-dir C:\\OTHRYS", cmd: "tekton phone --allow-dir C:\\OTHRYS", tab: "tekton"
+          },
+          {
+            id: "t-cloud-clients", x: 27, y: 6, w: 24, h: 21,
+            title: "Cloud AI and MCP Clients", tag: "Remote MCP",
+            body: "Connect Claude, ChatGPT, or desktop IDEs over HTTPS + OAuth to execute safe, Aegis-gated file, search, and shell tools on your home/office machines from anywhere.",
+            meta: "24-tool Desktop Commander parity MCP schema", tab: "tekton"
+          },
+          {
+            id: "t-relay", x: 3, y: 29, w: 94, h: 20,
+            title: "Cloud Relay Plane (tekton-mcp + tekton-relay)", tag: "Zero Open Ports",
+            body: "Queues jobs bound with tekton.aegis-session.v1 security_context, authenticates every fleet worker via Ed25519 Proof-of-Possession signatures, and coordinates single-use owner approval replays.",
+            meta: "tekton-mcp v7 + tekton-relay v14 (aegis_protocol: 2)", cmd: "tekton relay-status --json", tab: "tekton"
+          },
+          {
+            id: "t-firewall", x: 2, y: 52, w: 96, h: 5,
+            title: "NAT / Firewall — Zero Inbound Ports Open", tag: "Network Boundary",
+            body: "Your home or office router never opens an inbound port and needs zero port forwarding. Every Tekton node initiates outbound HTTPS polling every 5 seconds with signed Ed25519 headers.",
+            meta: "Zero attack surface on home/office LAN", tab: "tekton"
+          },
+          {
+            id: "t-nodes", x: 4, y: 61, w: 92, h: 10,
+            title: "Local Tekton Fleet Nodes", tag: "Multi-OS Mesh",
+            body: "Windows, Linux, and macOS machines (Laptop Legion, Desktop PC, Linux T590 sentinel, NAS) run identical v1.5.0 workers behind your firewall, each with its own Ed25519 node identity.",
+            meta: "tekton relay-status --json", cmd: "tekton relay-status --json", tab: "tekton"
+          },
+          {
+            id: "t-supervisor", x: 4, y: 72, w: 28, h: 10,
+            title: "Relay Supervisor and Worker", tag: "Resilient Daemon",
+            body: "Lightweight supervisor monitors the relay worker, restarts it cleanly on transient network drops, and respects the local relay-stop OFF latch so you can halt remote execution anytime.",
+            meta: "tekton relay-supervisor | tekton relay-stop", tab: "tekton"
+          },
+          {
+            id: "t-aegis-gate", x: 34, y: 72, w: 34, h: 10,
+            title: "Pinned aegis-gate and Monotonic Policy Floor", tag: "Core Interlock",
+            body: "Tekton v1.5.0 depends directly on pinned public aegis-gate (>=1.1.0,<2) in enforce mode and merges ~/.aegis/policy.json monotonically: Aegis can only tighten Tekton boundaries, never loosen them.",
+            meta: "Click Sync policy floor in the Tekton tab", cmd: "tekton doctor --json", tab: "tekton"
+          },
+          {
+            id: "t-commander", x: 69, y: 72, w: 27, h: 10,
+            title: "24-Tool Desktop Commander", tag: "Sandboxed Exec",
+            body: "Executes approved file reads/writes, regex searches, git/shell commands, and bounded process sessions strictly inside your configured allowed workspace folders.",
+            meta: "tekton allow-dir <path> | tekton remove-dir <path>", tab: "tekton"
+          },
+          {
+            id: "t-approval", x: 2, y: 83, w: 48, h: 15,
+            title: "Dual-Gate Owner Approval Replay", tag: "Replay Safe",
+            body: "When an action hits ASK, Tekton refuses to run it until you approve in the Phone PWA or Aegis Tekton tab. Replays verify single-use consumption and report exact diagnostics (expired, already_used, untrusted_relay_context).",
+            meta: "tekton approvals --json", cmd: "tekton approvals --json", tab: "tekton"
+          },
+          {
+            id: "t-desktop", x: 52, y: 83, w: 46, h: 15,
+            title: "Unified Desktop Control and Local SHA-256 Ledger", tag: "Control Plane",
+            body: "Manage live fleet status, allowed folders, policy floor sync, and approvals directly inside this Aegis Desktop app (127.0.0.1:9999) or launch the native Tekton Control Center window with one click.",
+            meta: "Aegis Tekton Tab + Local SHA-256 Ledger", tab: "tekton"
+          }
+        ]
+      }
+    };
+
+    let currentBpKey = "master";
+    let pinnedSpot = null;
+
+    function updateBpInspector(spot) {
+      const title = document.getElementById("bpInsTitle");
+      const tag = document.getElementById("bpInsTag");
+      const body = document.getElementById("bpInsBody");
+      const meta = document.getElementById("bpInsMeta");
+      const copyBtn = document.getElementById("bpInsCopyBtn");
+      const jumpBtn = document.getElementById("bpInsJumpBtn");
+      if (!spot) {
+        title.textContent = "Hover any section on the blueprint";
+        tag.textContent = "";
+        body.textContent = "Move your pointer over any box, clan, or pipeline stage above to inspect how it works under the hood. Click a region to pin its details here.";
+        meta.classList.add("hidden");
+        copyBtn.classList.add("hidden");
+        jumpBtn.classList.add("hidden");
+        return;
+      }
+      title.textContent = spot.title;
+      tag.textContent = spot.tag || "";
+      body.textContent = spot.body;
+      if (spot.meta) {
+        meta.textContent = spot.meta;
+        meta.classList.remove("hidden");
+      } else {
+        meta.classList.add("hidden");
+      }
+      if (spot.cmd) {
+        copyBtn.dataset.cmd = spot.cmd;
+        copyBtn.classList.remove("hidden");
+      } else {
+        copyBtn.classList.add("hidden");
+      }
+      if (spot.tab) {
+        jumpBtn.dataset.tab = spot.tab;
+        jumpBtn.textContent = "Open " + spot.tab.charAt(0).toUpperCase() + spot.tab.slice(1);
+        jumpBtn.classList.remove("hidden");
+      } else {
+        jumpBtn.classList.add("hidden");
+      }
+    }
+
+    function showBpPopover(spot, btnEl) {
+      const stage = document.getElementById("bpStage");
+      const pop = document.getElementById("bpPopover");
+      document.getElementById("bpPopTitle").textContent = spot.title;
+      document.getElementById("bpPopTag").textContent = spot.tag || "";
+      document.getElementById("bpPopBody").textContent = spot.body;
+      const metaEl = document.getElementById("bpPopMeta");
+      if (spot.meta) {
+        metaEl.textContent = spot.meta;
+        metaEl.classList.remove("hidden");
+      } else {
+        metaEl.classList.add("hidden");
+      }
+      pop.setAttribute("aria-hidden", "false");
+      pop.classList.add("visible");
+
+      const stageRect = stage.getBoundingClientRect();
+      const btnRect = btnEl.getBoundingClientRect();
+      const popW = pop.offsetWidth || 280;
+      const popH = pop.offsetHeight || 120;
+
+      let left = (btnRect.left - stageRect.left) + (btnRect.width / 2) - (popW / 2);
+      left = Math.max(10, Math.min(left, stageRect.width - popW - 10));
+
+      let top = (btnRect.bottom - stageRect.top) + 8;
+      if (top + popH > stageRect.height - 10) {
+        top = Math.max(10, (btnRect.top - stageRect.top) - popH - 8);
+      }
+      pop.style.left = left + "px";
+      pop.style.top = top + "px";
+    }
+
+    function hideBpPopover() {
+      const pop = document.getElementById("bpPopover");
+      pop.classList.remove("visible");
+      pop.setAttribute("aria-hidden", "true");
+    }
+
+    function renderBlueprint(key) {
+      const bp = BLUEPRINTS[key] || BLUEPRINTS.master;
+      currentBpKey = key;
+      pinnedSpot = null;
+      hideBpPopover();
+      updateBpInspector(null);
+
+      document.querySelectorAll("[data-bp]").forEach((b) => b.classList.toggle("active", b.dataset.bp === key));
+      const img = document.getElementById("bpImage");
+      img.src = bp.src;
+      img.alt = bp.alt;
+      document.getElementById("bpFullLink").href = bp.src;
+
+      const spotsWrap = document.getElementById("bpSpots");
+      spotsWrap.textContent = "";
+      bp.spots.forEach((spot) => {
+        const el = document.createElement("button");
+        el.type = "button";
+        el.className = "bp-spot";
+        el.style.left = spot.x + "%";
+        el.style.top = spot.y + "%";
+        el.style.width = spot.w + "%";
+        el.style.height = spot.h + "%";
+        el.setAttribute("aria-label", spot.title + " (" + spot.tag + ")");
+        el.addEventListener("mouseenter", () => {
+          showBpPopover(spot, el);
+          updateBpInspector(spot);
+        });
+        el.addEventListener("focus", () => {
+          showBpPopover(spot, el);
+          updateBpInspector(spot);
+        });
+        el.addEventListener("mouseleave", () => {
+          hideBpPopover();
+          if (pinnedSpot) updateBpInspector(pinnedSpot);
+        });
+        el.addEventListener("blur", () => {
+          hideBpPopover();
+          if (pinnedSpot) updateBpInspector(pinnedSpot);
+        });
+        el.addEventListener("click", () => {
+          pinnedSpot = spot;
+          spotsWrap.querySelectorAll(".bp-spot").forEach((s) => s.classList.toggle("active", s === el));
+          updateBpInspector(spot);
+          showBpPopover(spot, el);
+        });
+        spotsWrap.appendChild(el);
+      });
+    }
+
+    document.querySelectorAll("[data-bp]").forEach((btn) => {
+      btn.addEventListener("click", () => renderBlueprint(btn.dataset.bp));
+    });
+    document.getElementById("bpOutlineBtn").addEventListener("click", (e) => {
+      const st = document.getElementById("bpStage");
+      const on = st.classList.toggle("show-outlines");
+      e.currentTarget.textContent = on ? "Hide outlines" : "Outline regions";
+    });
+    document.getElementById("bpInsCopyBtn").addEventListener("click", (e) => {
+      copyText(e.currentTarget.dataset.cmd || "", "Copied command.");
+    });
+    document.getElementById("bpInsJumpBtn").addEventListener("click", (e) => {
+      if (e.currentTarget.dataset.tab) activateView(e.currentTarget.dataset.tab);
+    });
+
+    renderBlueprint("master");
     loadOverview();
     loadDetective();
     loadTekton();

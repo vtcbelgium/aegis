@@ -53,6 +53,8 @@ from . import tekton_bridge
 
 MAX_BODY_BYTES = 1024 * 1024
 _UI_INDEX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
+_UI_DIAGRAMS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "diagrams")
+_ALLOWED_DIAGRAMS = frozenset({"master.jpg", "guard.jpg", "detective.jpg", "tekton.jpg"})
 
 
 class AegisAppState:
@@ -331,6 +333,26 @@ def _build_handler(state: AegisAppState, port: int):
                     self.wfile.write(html.encode("utf-8"))
                 except OSError as exc:
                     self._send_json(500, {"error": f"UI asset missing: {exc}"})
+                return
+
+            if path.startswith("/ui/diagrams/"):
+                fname = path[len("/ui/diagrams/"):]
+                if fname not in _ALLOWED_DIAGRAMS:
+                    self._send_json(404, {"error": "Diagram not found"})
+                    return
+                fpath = os.path.join(_UI_DIAGRAMS_DIR, fname)
+                try:
+                    with open(fpath, "rb") as fh:
+                        raw = fh.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except OSError as exc:
+                    self._send_json(404, {"error": f"Diagram missing: {exc}"})
                 return
 
             if path in ("/status", "/api/status"):

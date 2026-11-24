@@ -68,7 +68,7 @@ jobs:
       - run: python -m pip install -e . pyinstaller
       - name: Build single-file Aegis Control Center launcher
         run: |
-          pyinstaller --onefile --name aegis-desktop ${{ matrix.extra_flags }} --add-data "aegis/ui/index.html${{ matrix.add_data_sep }}aegis/ui" --add-data "aegis/ui/aegis.ico${{ matrix.add_data_sep }}aegis/ui" scripts/aegis_launcher.py
+          pyinstaller --onefile --name aegis-desktop ${{ matrix.extra_flags }} --add-data "aegis/ui/index.html${{ matrix.add_data_sep }}aegis/ui" --add-data "aegis/ui/aegis.ico${{ matrix.add_data_sep }}aegis/ui" --add-data "aegis/ui/diagrams${{ matrix.add_data_sep }}aegis/ui/diagrams" scripts/aegis_launcher.py
       - name: Stage desktop binary
         shell: bash
         run: |
