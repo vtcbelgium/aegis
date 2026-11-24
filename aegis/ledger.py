@@ -20,13 +20,14 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import hmac
 import json
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from .core import DecisionLevel, Verdict
 
@@ -34,16 +35,32 @@ SCHEMA = "aegis.decision.v1"
 ZERO_DIGEST = "0" * 64
 MAX_SUMMARY = 240
 MAX_REASON = 300
+LEDGER_HMAC_ENV = "AEGIS_LEDGER_HMAC_KEY"
 
 _GENERIC_TOKEN = re.compile(r"[A-Za-z0-9_\-+/=]{32,}")
+
+
+def _coerce_signing_key(signing_key: Optional[Union[str, bytes]]) -> Optional[bytes]:
+    if signing_key is None:
+        env_key = os.environ.get(LEDGER_HMAC_ENV, "")
+        return env_key.encode("utf-8") if env_key else None
+    if isinstance(signing_key, str):
+        return signing_key.encode("utf-8") if signing_key else None
+    if isinstance(signing_key, (bytes, bytearray)):
+        return bytes(signing_key) if signing_key else None
+    raise TypeError("signing_key must be str, bytes, or None")
 
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
-def body_digest(body: Dict[str, Any]) -> str:
-    return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+def body_digest(body: Dict[str, Any], *, signing_key: Optional[Union[str, bytes]] = None) -> str:
+    raw = canonical_json(body).encode("utf-8")
+    if signing_key is not None:
+        key = signing_key.encode("utf-8") if isinstance(signing_key, str) else bytes(signing_key)
+        return hmac.new(key, raw, hashlib.sha256).hexdigest()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def redact(text: Any, limit: int = MAX_SUMMARY) -> str:
@@ -193,12 +210,14 @@ class DecisionLedger:
 
     def __init__(self, path: str, *, min_level: DecisionLevel = DecisionLevel.PASS,
                  max_bytes: int = 20 * 1024 * 1024, session: Optional[str] = None,
-                 rotate_on_damage: bool = False) -> None:
+                 rotate_on_damage: bool = False,
+                 signing_key: Optional[Union[str, bytes]] = None) -> None:
         self.path = os.path.abspath(os.path.expanduser(path))
         self.min_level = min_level
         self.max_bytes = max_bytes
         self.session = session
         self.rotate_on_damage = bool(rotate_on_damage)
+        self._signing_key = _coerce_signing_key(signing_key)
         self._lock = threading.Lock()
 
     # -- writing -------------------------------------------------------------
@@ -243,7 +262,11 @@ class DecisionLedger:
             if continues:
                 body["continues"] = continues
             body["previousDigest"] = previous
-            body["eventDigest"] = body_digest(body)
+            if self._signing_key is not None:
+                body["digestAlg"] = "hmac-sha256"
+                body["eventDigest"] = body_digest(body, signing_key=self._signing_key)
+            else:
+                body["eventDigest"] = body_digest(body)
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(canonical_json(body) + "\n")
@@ -348,8 +371,10 @@ class DecisionLedger:
                 out.pop(0)
         return out
 
-    def verify(self, *, expected_tip: Optional[str] = None) -> VerifyResult:
-        return verify(self.path, expected_tip=expected_tip)
+    def verify(self, *, expected_tip: Optional[str] = None,
+               signing_key: Optional[Union[str, bytes]] = None) -> VerifyResult:
+        key = self._signing_key if signing_key is None else _coerce_signing_key(signing_key)
+        return verify(self.path, expected_tip=expected_tip, signing_key=key)
 
 
 def _binary_of(arguments: Any) -> Optional[str]:
@@ -374,12 +399,17 @@ def iter_entries(path: str) -> Iterator[Dict[str, Any]]:
         return
 
 
-def verify(path: str, expect_previous: Optional[str] = None, *, expected_tip: Optional[str] = None) -> VerifyResult:
+def verify(path: str, expect_previous: Optional[str] = None, *,
+           expected_tip: Optional[str] = None,
+           signing_key: Optional[Union[str, bytes]] = None) -> VerifyResult:
     """Check that every line's digest is right and points at the line before it.
 
     A rotated-in file starts from the previous file's tip; pass that as expect_previous to
     check the link, or leave it out to accept whatever the first line claims.
+    When signing_key (or AEGIS_LEDGER_HMAC_KEY) is set, every entry must carry a valid
+    HMAC-SHA256 digest; unkeyed downgrades fail closed.
     """
+    key = _coerce_signing_key(signing_key)
     previous = expect_previous
     count = 0
     for count, ev in enumerate(iter_entries(path), start=1):
@@ -389,8 +419,18 @@ def verify(path: str, expect_previous: Optional[str] = None, *, expected_tip: Op
             return VerifyResult(False, count, "line is not valid JSON", count)
         claimed = ev.get("eventDigest")
         body = {k: v for k, v in ev.items() if k != "eventDigest"}
-        if body_digest(body) != claimed:
-            return VerifyResult(False, count, "line was changed after it was written", count)
+        alg = ev.get("digestAlg")
+        if alg == "hmac-sha256":
+            if key is None:
+                return VerifyResult(False, count, "ledger entry requires HMAC signing key to verify", count)
+            expected = body_digest(body, signing_key=key)
+            if not isinstance(claimed, str) or not hmac.compare_digest(expected, claimed):
+                return VerifyResult(False, count, "HMAC digest mismatch (line was changed or key is wrong)", count)
+        elif key is not None:
+            return VerifyResult(False, count, "entry is missing required HMAC signature (possible downgrade)", count)
+        else:
+            if body_digest(body) != claimed:
+                return VerifyResult(False, count, "line was changed after it was written", count)
         if previous is None and count == 1 and not ev.get("continues"):
             if ev.get("seq") != 1 or ev.get("previousDigest") != ZERO_DIGEST:
                 return VerifyResult(False, count, "lines are missing at the start of the ledger", count)

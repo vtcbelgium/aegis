@@ -92,6 +92,8 @@ class AegisGate:
 
     MAX_AUDIT_LOG = 10_000
     MAX_PENDING = 200
+    RESET_MAX_ATTEMPTS = 5
+    RESET_MAX_BACKOFF_SECONDS = 300.0
 
     def __init__(
         self,
@@ -144,6 +146,8 @@ class AegisGate:
         self._pending_approvals: Deque[Verdict] = collections.deque(maxlen=self.MAX_PENDING)
         self._violation_timestamps: Deque[float] = collections.deque()
         self._lock = threading.Lock()
+        self._reset_failures = 0
+        self._reset_locked_until = 0.0
         self._owner_token_hash = (
             hashlib.sha256(owner_secret.encode("utf-8")).hexdigest()
             if owner_secret
@@ -164,17 +168,33 @@ class AegisGate:
             return self._current_level
 
     def reset_session(self, owner_token: str) -> bool:
-        """Only an explicit, verified owner secret may reset the session."""
-        if not owner_token or not self._owner_token_hash:
+        """Only an explicit, verified owner secret may reset the session.
+
+        Applies exponential backoff lockout after RESET_MAX_ATTEMPTS consecutive
+        failures so a weak AEGIS_OWNER_SECRET cannot be brute-forced.
+        """
+        if not isinstance(owner_token, str) or not owner_token or not self._owner_token_hash:
             return False
-        provided_hash = hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
-        if hmac.compare_digest(provided_hash, self._owner_token_hash):
-            with self._lock:
+        with self._lock:
+            now = time.monotonic()
+            if now < self._reset_locked_until:
+                return False
+            provided_hash = hashlib.sha256(owner_token.encode("utf-8")).hexdigest()
+            if hmac.compare_digest(provided_hash, self._owner_token_hash):
+                self._reset_failures = 0
+                self._reset_locked_until = 0.0
                 self._current_level = DecisionLevel.PASS
                 self._violation_timestamps.clear()
                 self._pending_approvals.clear()
-            return True
-        return False
+                return True
+            self._reset_failures += 1
+            if self._reset_failures >= self.RESET_MAX_ATTEMPTS:
+                backoff = min(
+                    self.RESET_MAX_BACKOFF_SECONDS,
+                    float(2 ** (self._reset_failures - self.RESET_MAX_ATTEMPTS)),
+                )
+                self._reset_locked_until = now + backoff
+            return False
 
     def get_pending_approvals(self) -> List[Dict[str, Any]]:
         """List sensitive actions currently awaiting human owner approval."""

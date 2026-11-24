@@ -203,16 +203,25 @@ def _norm_for_match(path: str) -> str:
 
 
 _WIN32_TRAILING_RE = re.compile(r"[. ]+(?=/|$)")
+_WIN32_DRIVE_COMP_RE = re.compile(r"^[A-Za-z]:$")
 
 
 def _win32_alias(path: str) -> str:
-    """The name Win32 actually opens: trailing dots and spaces of every component are dropped.
+    """The name Win32 actually opens: trailing dots/spaces and NTFS ADS ':stream' are dropped.
 
-    'conftest.py.' and '.envrc . ' create 'conftest.py' and '.envrc' on Windows, so the
-    sensitive classes must see that spelling too ('.' and '..' components are kept).
+    'conftest.py.', '.envrc . ', and '.env:hidden' map to 'conftest.py', '.envrc', and '.env'
+    on Windows NTFS, so the sensitive classes must see that spelling too ('.' and '..' kept).
     """
     parts = path.replace("\\", "/").split("/")
-    return "/".join(p if p in (".", "..") else (_WIN32_TRAILING_RE.sub("", p) or p) for p in parts)
+    out: List[str] = []
+    for idx, p in enumerate(parts):
+        if p in (".", "..") or (idx == 0 and _WIN32_DRIVE_COMP_RE.match(p)):
+            out.append(p)
+            continue
+        base = p.split(":", 1)[0] if ":" in p else p
+        cleaned = _WIN32_TRAILING_RE.sub("", base) or base or p
+        out.append(cleaned)
+    return "/".join(out)
 
 
 def classify_sensitive(*paths: str) -> Optional[str]:

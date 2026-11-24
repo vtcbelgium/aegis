@@ -64,6 +64,10 @@ if (chrome.tabs?.onUpdated) {
   });
 }
 
+function isTrustedExtensionUi(sender) {
+  return Boolean(sender && sender.id === chrome.runtime.id && !sender.tab);
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== "object") return;
 
@@ -107,6 +111,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "AEGIS_SET_PROTECTION") {
+    if (!isTrustedExtensionUi(sender)) {
+      sendResponse({ ok: false, error: "Unauthorized sender" });
+      return;
+    }
     const active = Boolean(message.active);
     chrome.storage.local.set({ protectionActive: active }, () => {
       syncRuleset(active);
@@ -117,6 +125,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "AEGIS_TOGGLE_ALLOWLIST") {
+    if (!isTrustedExtensionUi(sender)) {
+      sendResponse({ ok: false, error: "Unauthorized sender" });
+      return;
+    }
     const host = String(message.hostname || "").toLowerCase().trim();
     if (!host) {
       sendResponse({ ok: false, error: "Invalid hostname" });
@@ -140,6 +152,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "AEGIS_CLEAR_HISTORY") {
+    if (!isTrustedExtensionUi(sender)) {
+      sendResponse({ ok: false, error: "Unauthorized sender" });
+      return;
+    }
     tabThreats.clear();
     chrome.storage.local.set({ blockedCount: 0, threatHistory: [] }, () => {
       chrome.storage.local.get(["protectionActive"], (data) => {
