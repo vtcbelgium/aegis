@@ -19,7 +19,7 @@ import re
 import sys
 import tempfile
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from . import boundaries
 from .canonicalizer import is_inside, looks_windows_path, resolve_path
@@ -134,6 +134,16 @@ def resolve_trusted_executable(
     return None
 
 
+def _is_git_command_token(tokens: Sequence[Tuple[str, bool]], *, windows: bool) -> bool:
+    if not tokens:
+        return False
+    raw_bin, quoted = tokens[0]
+    if quoted:
+        return False
+    low = raw_bin.lower()
+    return low == "git" or ((windows or sys.platform == "win32") and low == "git.exe")
+
+
 def _tokenize_literal_argv(
     command: str,
     *,
@@ -178,9 +188,13 @@ def _tokenize_literal_argv(
             tokens.append((val, True))
         else:
             start = i
+            allow_git_tilde = _is_git_command_token(tokens, windows=windows)
             while i < n and command[i] not in " \t":
                 c = command[i]
                 if c in _UNQUOTED_FORBIDDEN:
+                    if c == "~" and allow_git_tilde and i > start:
+                        i += 1
+                        continue
                     return None, f"shell metacharacter {c!r} requires shell execution"
                 if c == "\\" and not windows:
                     return None, "backslash escape requires shell execution"
@@ -188,6 +202,8 @@ def _tokenize_literal_argv(
                     return None, "'%' expansion requires shell execution"
                 i += 1
             val = command[start:i]
+            if "~" in val and not (allow_git_tilde and not val.startswith("~") and _SAFE_GIT_REV_RE.fullmatch(val)):
+                return None, "shell metacharacter '~' requires shell execution"
             if val.startswith("\\\\") or val.startswith("//"):
                 return None, "UNC/network share path not allowed for direct execution"
             if windows and ":" in val and re.match(r"^[A-Za-z]+:$", val):
@@ -249,18 +265,27 @@ def _validate_read_path(
         in_roots = confined is True or any(is_inside(abs_path, r) for r in roots)
         if not in_roots:
             return f"path escapes admitted workspace '{raw}'"
-        if os.path.lexists(abs_path):
-            try:
-                real = os.path.realpath(abs_path)
-            except OSError:
-                return f"cannot resolve path '{raw}'"
+        try:
+            real = os.path.realpath(abs_path)
             real_roots = [os.path.realpath(r) for r in roots if r]
-            if not any(is_inside(real, rr) for rr in real_roots):
-                return f"symlink resolves outside workspace '{raw}'"
-            if classify_sensitive(real, write_mode=False) is not None:
-                return f"symlink target is sensitive '{raw}'"
-            if boundaries.check_path(real, "read", policy) is not None:
-                return f"symlink target hits hard boundary '{raw}'"
+        except OSError:
+            return f"cannot resolve path '{raw}'"
+        matched_roots = [rr for rr in real_roots if is_inside(real, rr)]
+        if not matched_roots:
+            return f"symlink resolves outside workspace '{raw}'"
+        for rr in matched_roots:
+            try:
+                rel = os.path.relpath(real, rr)
+            except ValueError:
+                rel = real
+            if rel != "." and _is_sensitive_control_component(rel):
+                return f"symlink target enters sensitive control directory '{raw}'"
+        if classify_sensitive(real, write_mode=False) is not None:
+            return f"symlink target is sensitive '{raw}'"
+        if boundaries.check_path(real, "read", policy) is not None:
+            return f"symlink target hits hard boundary '{raw}'"
+        if trip is not None and trip.match_path(real):
+            return f"symlink target hits Minotaur tripwire '{raw}'"
     return None
 
 
@@ -497,19 +522,379 @@ def _validate_stat(
     return DirectCommand(binary, (binary, *args), tuple(paths), True), None
 
 
+_RG_SENSITIVE_EXCLUDES: Tuple[str, ...] = (
+    "!.git/**",
+    "!.git",
+    "!.githooks/**",
+    "!.husky/**",
+    "!.vscode/**",
+    "!.github/**",
+    "!.devcontainer/**",
+    "!.idea/**",
+    "!.env",
+    "!.env.*",
+    "!.npmrc",
+    "!.pypirc",
+    "!.netrc",
+    "!.git-credentials",
+    "!.gitconfig",
+    "!.envrc",
+    "!.ssh/**",
+    "!.aws/**",
+    "!.gnupg/**",
+    "!.kube/**",
+    "!.docker/**",
+    "!.azure/**",
+    "!.password-store/**",
+    "!.aegis/**",
+    "!id_rsa",
+    "!id_rsa.*",
+    "!id_dsa",
+    "!id_dsa.*",
+    "!id_ecdsa",
+    "!id_ecdsa.*",
+    "!id_ed25519",
+    "!id_ed25519.*",
+    "!credentials.json",
+    "!service-account*.json",
+    "!service_account*.json",
+    "!serviceaccount*.json",
+    "!secret.json",
+    "!secrets.json",
+    "!secret.yaml",
+    "!secrets.yaml",
+    "!secret.yml",
+    "!secrets.yml",
+    "!secret.toml",
+    "!secrets.toml",
+    "!secret.env",
+    "!secrets.env",
+    "!*.pem",
+    "!*.key",
+    "!*.p12",
+    "!*.pfx",
+    "!*.jks",
+    "!*.kdbx",
+    "!sitecustomize.py",
+    "!usercustomize.py",
+    "!conftest.py",
+)
+
+_GIT_MAX_POINTER_BYTES = 4096
+_GIT_MAX_CONFIG_BYTES = 262_144
+_GIT_SECTION_HEAD_RE = re.compile(r"^([^\s\"]+)(.*)$")
+_GIT_SECTION_TOKEN_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$")
+_GIT_KEY_RE = re.compile(r"^[A-Za-z0-9-]+$")
+_GIT_BLOCKED_SECTIONS = frozenset({
+    "filter",
+    "gpg",
+    "include",
+    "includeif",
+    "alias",
+    "pager",
+    "difftool",
+    "mergetool",
+    "fsmonitor",
+    "mailmap",
+})
+_GIT_BLOCKED_KEYS: Dict[str, FrozenSet[str]] = {
+    "core": frozenset({
+        "fsmonitor",
+        "pager",
+        "sshcommand",
+        "hookspath",
+        "editor",
+        "askpass",
+        "alternaterefscommand",
+        "attributesfile",
+        "worktree",
+        "gitproxy",
+    }),
+    "diff": frozenset({"external", "command", "textconv", "tool", "cachetextconv"}),
+    "merge": frozenset({"driver", "tool"}),
+    "credential": frozenset({"helper", "askpass"}),
+    "log": frozenset({"showsignature"}),
+    "status": frozenset({"submodulesummary"}),
+    "protocol": frozenset({"allow"}),
+    "submodule": frozenset({"update"}),
+}
+
+
+def _rg_exclude_flags(base_dir: Optional[str], policy: AegisPolicy) -> Tuple[str, ...]:
+    patterns: List[str] = list(_RG_SENSITIVE_EXCLUDES)
+    seen = set(patterns)
+    if base_dir is not None:
+        trip = getattr(policy, "tripwires", None)
+        candidates: List[str] = []
+        if trip is not None:
+            candidates.extend(getattr(trip, "decoy_paths", ()) or ())
+        candidates.extend(getattr(policy, "secret_paths", ()) or ())
+        candidates.extend(getattr(policy, "protected_paths", ()) or ())
+        try:
+            real_roots = [os.path.realpath(r) for r in policy.roots(base_dir) if r]
+        except OSError:
+            real_roots = []
+        for raw_p in candidates:
+            if not raw_p:
+                continue
+            try:
+                p_real = os.path.realpath(os.path.abspath(os.path.expanduser(str(raw_p))))
+            except OSError:
+                continue
+            for rr in real_roots:
+                if not is_inside(p_real, rr):
+                    continue
+                try:
+                    rel = os.path.relpath(p_real, rr).replace("\\", "/")
+                except ValueError:
+                    continue
+                if not rel or rel == "." or rel.startswith(".."):
+                    continue
+                base_name = os.path.basename(rel)
+                for pat in (f"!{rel}", f"!{rel}/**", f"!{base_name}" if base_name else ""):
+                    if pat and pat not in seen:
+                        seen.add(pat)
+                        patterns.append(pat)
+    return tuple(f"--iglob={pat}" for pat in patterns)
+
+
+def _read_bounded_text(path: str, max_bytes: int) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if not os.path.isfile(path):
+            return None, f"git metadata path '{path}' is not a regular file"
+        if os.path.getsize(path) > max_bytes:
+            return None, f"git metadata file exceeds {max_bytes} bytes"
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None, f"git metadata file exceeds {max_bytes} bytes"
+        return data.decode("utf-8", errors="strict"), None
+    except (OSError, UnicodeDecodeError):
+        return None, f"cannot safely read git metadata file '{path}'"
+
+
+def _parse_git_config_safe(cfg_path: str) -> Optional[str]:
+    try:
+        real_cfg = os.path.realpath(cfg_path)
+    except OSError:
+        return "cannot resolve git config path"
+    text, err = _read_bounded_text(real_cfg, _GIT_MAX_CONFIG_BYTES)
+    if err or text is None:
+        return err or "cannot read git config"
+    if text.startswith("\ufeff"):
+        text = text[1:]
+
+    logical_lines: List[str] = []
+    buf = ""
+    for phys in text.splitlines():
+        if not buf:
+            stripped = phys.lstrip()
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
+        bs = 0
+        while bs < len(phys) and phys[len(phys) - 1 - bs] == "\\":
+            bs += 1
+        if bs % 2 == 1:
+            buf += phys[:-1]
+            continue
+        logical_lines.append(buf + phys)
+        buf = ""
+    if buf:
+        return "unterminated continuation in git config requires owner approval"
+
+    current_section: Optional[str] = None
+
+    def _consume_segment(seg: str) -> Optional[str]:
+        nonlocal current_section
+        s = seg.strip()
+        if not s or s.startswith(("#", ";")):
+            return None
+        if s.startswith("["):
+            in_quote = False
+            escaped = False
+            close_idx: Optional[int] = None
+            for idx in range(1, len(s)):
+                c = s[idx]
+                if escaped:
+                    escaped = False
+                    continue
+                if in_quote:
+                    if c == "\\":
+                        escaped = True
+                    elif c == '"':
+                        in_quote = False
+                else:
+                    if c == '"':
+                        in_quote = True
+                    elif c == "]":
+                        close_idx = idx
+                        break
+            if close_idx is None:
+                return "malformed section header in git config requires owner approval"
+            header = s[1:close_idx].strip()
+            if not header:
+                return "empty section header in git config requires owner approval"
+            m = _GIT_SECTION_HEAD_RE.match(header)
+            if not m:
+                return "invalid section header in git config requires owner approval"
+            sec_head, sub_rest = m.group(1), m.group(2).strip()
+            if not _GIT_SECTION_TOKEN_RE.fullmatch(sec_head):
+                return "invalid section name in git config requires owner approval"
+            if sub_rest and not (len(sub_rest) >= 2 and sub_rest.startswith('"') and sub_rest.endswith('"')):
+                return "invalid subsection header in git config requires owner approval"
+            section_base = sec_head.split(".", 1)[0].lower()
+            current_section = section_base
+            if current_section in _GIT_BLOCKED_SECTIONS:
+                return f"git config section '[{current_section}]' requires owner approval"
+            tail = s[close_idx + 1:].strip()
+            if tail and not tail.startswith(("#", ";")):
+                return _consume_segment(tail)
+            return None
+
+        if current_section is None:
+            return "git config entry before section requires owner approval"
+        if "=" in s:
+            raw_key = s.split("=", 1)[0].strip()
+        else:
+            raw_key = re.split(r"[#;]", s, maxsplit=1)[0].strip()
+        if not _GIT_KEY_RE.fullmatch(raw_key):
+            return "unrecognized git config key syntax requires owner approval"
+        key_low = raw_key.lower()
+        if key_low in _GIT_BLOCKED_KEYS.get(current_section, frozenset()):
+            return f"git config '{current_section}.{key_low}' requires owner approval"
+        return None
+
+    for line in logical_lines:
+        seg_err = _consume_segment(line)
+        if seg_err:
+            return seg_err
+    return None
+
+
+def _check_git_repo_config_safe(
+    start_dir: Optional[str],
+    *,
+    base_dir: Optional[str],
+    policy: AegisPolicy,
+) -> Optional[str]:
+    if not start_dir or not os.path.isdir(start_dir):
+        return None
+    try:
+        cur = os.path.realpath(start_dir)
+    except OSError:
+        return "cannot resolve git working directory"
+
+    git_entry: Optional[str] = None
+    git_parent: Optional[str] = None
+    for _ in range(64):
+        cand = os.path.join(cur, ".git")
+        if os.path.lexists(cand):
+            git_entry = cand
+            git_parent = cur
+            break
+        parent = os.path.dirname(cur)
+        if not parent or parent == cur:
+            break
+        cur = parent
+
+    if git_entry is None or git_parent is None:
+        return None
+
+    try:
+        real_git = os.path.realpath(git_entry)
+    except OSError:
+        return "cannot resolve .git entry"
+
+    is_link_or_junction = os.path.islink(git_entry) or (
+        os.path.normcase(real_git) != os.path.normcase(os.path.abspath(git_entry))
+    )
+    if base_dir is not None and is_link_or_junction:
+        try:
+            real_roots = [os.path.realpath(r) for r in policy.roots(base_dir) if r]
+        except OSError:
+            return "cannot resolve workspace roots for .git check"
+        if not any(is_inside(real_git, rr) for rr in real_roots):
+            return ".git symlink/junction resolves outside admitted workspace"
+
+    cfg_candidates: List[str] = []
+    if os.path.isdir(real_git):
+        cfg_candidates.append(os.path.join(real_git, "config"))
+        cfg_candidates.append(os.path.join(real_git, "config.worktree"))
+    elif os.path.isfile(real_git):
+        ptr_text, ptr_err = _read_bounded_text(real_git, _GIT_MAX_POINTER_BYTES)
+        if ptr_err or ptr_text is None:
+            return ptr_err or "cannot read .git pointer file"
+        stripped = ptr_text.strip()
+        if not stripped.startswith("gitdir:") or "\n" in stripped or "\r" in stripped or "\x00" in stripped:
+            return "malformed .git pointer file requires owner approval"
+        target = stripped[len("gitdir:"):].strip()
+        if not target:
+            return "empty gitdir pointer requires owner approval"
+        joined = target if os.path.isabs(target) else os.path.join(git_parent, target)
+        try:
+            git_dir = os.path.realpath(joined)
+        except OSError:
+            return "cannot resolve gitdir target"
+        if not os.path.isdir(git_dir):
+            return "gitdir pointer target does not exist"
+        cfg_candidates.append(os.path.join(git_dir, "config"))
+        cfg_candidates.append(os.path.join(git_dir, "config.worktree"))
+        commondir_file = os.path.join(git_dir, "commondir")
+        if os.path.lexists(commondir_file):
+            try:
+                real_cd_file = os.path.realpath(commondir_file)
+            except OSError:
+                return "cannot resolve git commondir"
+            cd_text, cd_err = _read_bounded_text(real_cd_file, _GIT_MAX_POINTER_BYTES)
+            if cd_err or cd_text is None:
+                return cd_err or "cannot read git commondir"
+            cd_target = cd_text.strip()
+            if not cd_target or "\n" in cd_target or "\r" in cd_target or "\x00" in cd_target:
+                return "malformed git commondir requires owner approval"
+            cd_joined = cd_target if os.path.isabs(cd_target) else os.path.join(git_dir, cd_target)
+            try:
+                common_dir = os.path.realpath(cd_joined)
+            except OSError:
+                return "cannot resolve git commondir path"
+            if not os.path.isdir(common_dir):
+                return "git commondir target does not exist"
+            cfg_candidates.append(os.path.join(common_dir, "config"))
+            cfg_candidates.append(os.path.join(common_dir, "config.worktree"))
+    else:
+        return "unrecognized .git entry requires owner approval"
+
+    seen_cfgs = set()
+    for cfg in cfg_candidates:
+        norm_cfg = os.path.normcase(os.path.abspath(cfg))
+        if norm_cfg in seen_cfgs:
+            continue
+        seen_cfgs.add(norm_cfg)
+        if os.path.lexists(cfg):
+            err = _parse_git_config_safe(cfg)
+            if err:
+                return err
+    return None
+
+
 def _validate_diff(
     binary: str, args: List[str], *, base_dir: Optional[str], cwd: Optional[str], policy: AegisPolicy
 ) -> Tuple[Optional[DirectCommand], Optional[str]]:
     long_flags = {"--brief", "--unified", "--stat"}
     paths: List[str] = []
     for a in args:
-        if a in long_flags or _short_bundle_ok(a, "uqrwb i".replace(" ", "")):
+        if a in long_flags or _short_bundle_ok(a, "uqwbi"):
             continue
         if a.startswith("-"):
             return None, f"diff option '{a}' not allowed for direct PASS"
         err = _validate_read_path(a, base_dir=base_dir, cwd=cwd, policy=policy)
         if err:
             return None, err
+        cand_abs, _, _ = resolve_path(a, base_dir=base_dir, cwd=cwd or base_dir)
+        try:
+            if os.path.isdir(os.path.realpath(cand_abs)):
+                return None, f"diff directory target '{a}' requires owner approval"
+        except OSError:
+            return None, f"cannot inspect diff target '{a}'"
         paths.append(a)
     if len(paths) != 2:
         return None, "diff requires exactly two file paths for direct PASS"
@@ -521,7 +906,7 @@ def _validate_rg(
 ) -> Tuple[Optional[DirectCommand], Optional[str]]:
     if args in (["--version"], ["-V"]):
         return DirectCommand(binary, (binary, *args), (), False), None
-    bool_long = {"--files", "--json", "--hidden", "--no-ignore", "--line-number", "--ignore-case",
+    bool_long = {"--files", "--json", "--line-number", "--ignore-case",
                  "--smart-case", "--fixed-strings", "--files-with-matches", "--count"}
     int_opts = {"-C", "-A", "-B", "-m", "--max-count", "--max-depth"}
     type_opts = {"-t", "-T", "--type", "--type-not"}
@@ -567,7 +952,8 @@ def _validate_rg(
         err = _validate_read_path(p, base_dir=base_dir, cwd=cwd, policy=policy)
         if err:
             return None, err
-    return DirectCommand(binary, (binary, *args), tuple(path_candidates), True), None
+    glob_flags = _rg_exclude_flags(base_dir, policy)
+    return DirectCommand(binary, (binary, "--no-follow", "--no-hidden", *glob_flags, *args), tuple(path_candidates), True), None
 
 
 def _validate_git(
@@ -610,8 +996,8 @@ def _validate_git(
         if sargs and sargs not in (["-l"], ["--list"]):
             return None, "git tag with arguments requires owner approval"
     elif sub == "remote":
-        if sargs and sargs not in (["-v"], ["--verbose"]):
-            return None, "git remote modification/inspection with args requires owner approval"
+        if sargs:
+            return None, "git remote with arguments requires owner approval"
     elif sub == "status":
         allowed_status = {
             "-s", "--short", "-b", "--branch", "--porcelain", "--porcelain=v1", "--porcelain=v2",
@@ -639,7 +1025,7 @@ def _validate_git(
             "--summary", "--reverse", "--full-index", "--short", "--abbrev-ref",
             "--show-toplevel", "--is-inside-work-tree", "--verify", "--tags",
             "--exact-match", "--always", "--others", "--exclude-standard", "--modified",
-            "--deleted", "--cached", "--full-name", "--relative", "-s", "-q", "-n",
+            "--deleted", "--cached", "--full-name", "--relative", "-s", "-q",
         }
         after_dd = False
         expect_count = False
@@ -654,8 +1040,7 @@ def _validate_git(
                 continue
             if not after_dd and a.startswith("-"):
                 if a in ("-n", "--max-count") and sub in ("log", "shortlog", "show"):
-                    if a == "-n":
-                        expect_count = True
+                    expect_count = True
                     continue
                 if sub in ("log", "shortlog") and _SHORT_NUM_FLAG_RE.fullmatch(a):
                     continue
@@ -690,7 +1075,15 @@ def _validate_git(
                         return None, err
                     paths.append(a)
         if expect_count:
-            return None, "git -n missing count"
+            return None, f"git {sub} flag missing count"
+
+    cfg_err = _check_git_repo_config_safe(
+        c_dir_abs or cwd or base_dir,
+        base_dir=base_dir,
+        policy=policy,
+    )
+    if cfg_err:
+        return None, cfg_err
 
     hardened: List[str] = ["git"]
     if c_dir:
@@ -699,13 +1092,21 @@ def _validate_git(
         "-c", "core.pager=cat",
         "-c", "core.fsmonitor=false",
         "-c", "core.sshCommand=false",
+        "-c", "core.hooksPath=",
         "-c", "diff.external=",
         "-c", "credential.helper=",
+        "-c", "log.showSignature=false",
+        "-c", "gpg.program=false",
+        "-c", "gpg.ssh.program=false",
+        "-c", "gpg.x509.program=false",
+        "-c", "status.submoduleSummary=false",
         "--no-pager",
         sub,
     ])
     if sub in ("diff", "log", "show"):
         hardened.extend(["--no-ext-diff", "--no-textconv"])
+    elif sub == "blame":
+        hardened.append("--no-textconv")
     hardened.extend(sargs)
     return DirectCommand("git", tuple(hardened), tuple(paths), True), None
 
