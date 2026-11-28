@@ -19,6 +19,7 @@ POLICY_SCHEMA = "aegis.policy.v1"
 
 _ALLOWED_ENUMS = {
     "project_exec": ("allow", "ask"),
+    "pass_policy": ("strict", "critical_only"),
     "unknown_binary": ("ask", "deny"),
     "secret_level": ("lock", "ask"),
     "inline_exec": ("ask", "allow"),
@@ -73,6 +74,7 @@ def default_policy_dict() -> Dict[str, Any]:
     return {
         "schema": POLICY_SCHEMA,
         "project_exec": d.project_exec,
+        "pass_policy": d.pass_policy,
         "unknown_binary": d.unknown_binary,
         "secret_level": d.secret_level,
         "inline_exec": d.inline_exec,
@@ -214,6 +216,7 @@ def build_policy_from_sources(workspace: Optional[str] = None, path: Optional[st
     return AegisPolicy(
         allowed_domains=domains,
         project_exec=pick_enum("AEGIS_PROJECT_EXEC", "project_exec"),
+        pass_policy=pick_enum("AEGIS_PASS_POLICY", "pass_policy"),
         unknown_binary=pick_enum("AEGIS_UNKNOWN_BINARY", "unknown_binary"),
         extra_allowed_binaries=set(cfg["extra_allowed_binaries"]),
         strict_tools=strict_tools,

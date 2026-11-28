@@ -151,6 +151,8 @@ ASK_BINARIES = {
     "gh", "npx", "bunx", "pnpx", "uvx", "conda", "mamba", "brew", "apt", "apt-get", "dnf",
     "yum", "pacman", "snap", "choco", "winget", "scoop",
 }
+CRITICAL_ASK_BINARIES = ASK_BINARIES - {"docker", "podman", "gh", "npx", "bunx", "pnpx", "uvx"}
+_WORKSPACE_DEV_BINARIES = INTERPRETERS | PROJECT_TOOLS | READ_BINARIES | WRITE_BINARIES | {"git"}
 WRAPPERS = {"command", "builtin", "exec", "nohup", "time", "nice", "ionice", "stdbuf", "timeout",
             "watch", "unbuffer", "caffeinate", "call"}
 CMD_BUILTINS = {"dir", "type", "copy", "move", "del", "erase", "rd", "rmdir", "md", "mkdir",
@@ -312,6 +314,9 @@ def analyze_command(
             "needs_workspace": dc.needs_workspace,
         }
         return Verdict(L.PASS, [f"Direct read-only command: {dc.binary} (no shell)"], NAME, metadata=meta)
+
+    if getattr(pol, "pass_policy", "strict") == "critical_only":
+        return Verdict(L.PASS, ["Internal dev command passed Phase-1 critical threat shield"], NAME, metadata=_meta(ctx))
 
     return Verdict(
         L.ASK,
@@ -1149,10 +1154,23 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
 
     if "/" in raw_bin or "\\" in raw_bin or raw_bin.startswith("~"):
         if not raw_bin.replace("\\", "/").lower().startswith(SYSTEM_BIN_DIRS):
-            if _check_path(ctx, raw_bin, "exec") is not None:
+            resolved_bin = _check_path(ctx, raw_bin, "exec")
+            if resolved_bin is not None:
                 ctx.exec_after_download = True
-                _add(ctx, L.ASK, f"Executes workspace/local binary {raw_bin} (owner approval)")
-            return
+                if (
+                    getattr(ctx.policy, "pass_policy", "strict") == "critical_only"
+                    and ctx.policy.project_exec == "allow"
+                    and (
+                        name in _WORKSPACE_DEV_BINARIES
+                        or name in getattr(ctx.policy, "extra_allowed_binaries", ())
+                    )
+                ):
+                    pass
+                else:
+                    _add(ctx, L.ASK, f"Executes workspace/local binary {raw_bin} (owner approval)")
+                    return
+            else:
+                return
 
     if name in PRIVILEGE:
         _add(ctx, L.DENY, f"Privilege escalation via {name}")
@@ -1233,6 +1251,27 @@ def _dispatch(words: List[str], seg: Segment, ctx: _Ctx) -> None:
 
     if name in READ_BINARIES | WRITE_BINARIES | NO_PATH_BINARIES | PROJECT_TOOLS | ASK_BINARIES | CMD_BUILTINS \
             or name in getattr(ctx.policy, "extra_allowed_binaries", ()):
+        if getattr(ctx.policy, "pass_policy", "strict") == "critical_only":
+            if name in CRITICAL_ASK_BINARIES and name not in getattr(ctx.policy, "extra_allowed_binaries", ()):
+                _add(ctx, L.ASK, f"Critical system/admin command '{name}' requires owner approval")
+                _scan_arg_threats(name, args, ctx)
+                return
+            if name == "gh":
+                low_pos = [a.lower() for a in args if not a.startswith("-")]
+                if (
+                    (len(low_pos) >= 2 and (low_pos[0], low_pos[1]) in {("repo", "delete"), ("release", "delete"), ("ssh-key", "add"), ("gpg-key", "add"), ("auth", "token"), ("variable", "set")})
+                    or (low_pos and low_pos[0] == "secret")
+                ):
+                    _add(ctx, L.ASK, f"Critical GitHub CLI action requires owner approval: gh {' '.join(args[:2])}")
+            elif name in ("docker", "podman"):
+                for a in args:
+                    al = a.lower()
+                    if al == "--privileged" or al in {"--pid=host", "--net=host", "--network=host"} or re.match(r"^(?:-v|--volume)(?:=|$)(?:/(?::|$)|[A-Za-z]:[/\\]?(?::|$))", a):
+                        _add(ctx, L.ASK, f"Privileged container option requires owner approval: {name}")
+                        break
+                    if (a.startswith("-v=") or a.startswith("--volume=")) and (a.split("=", 1)[1].startswith("/:") or a.split("=", 1)[1] == "/"):
+                        _add(ctx, L.ASK, f"Privileged container option requires owner approval: {name}")
+                        break
         _scan_arg_threats(name, args, ctx)
         return
 
@@ -1531,7 +1570,11 @@ def _inline_code(ctx: _Ctx, interpreter: str, code: str) -> None:
     if DESTRUCTIVE_CODE_RE.search(code):
         _add(ctx, L.DENY, f"Destructive operation in inline {interpreter} code")
         return
-    _add(ctx, L.ASK, f"Inline interpreter code execution ({interpreter}) requires human owner approval")
+    if not (
+        getattr(ctx.policy, "pass_policy", "strict") == "critical_only"
+        and getattr(ctx.policy, "inline_exec", "ask") == "allow"
+    ):
+        _add(ctx, L.ASK, f"Inline interpreter code execution ({interpreter}) requires human owner approval")
 
 
 def _interpreter(name: str, args: List[str], seg: Segment, ctx: _Ctx) -> None:

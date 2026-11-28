@@ -47,6 +47,11 @@ class AegisPolicy:
     allowed_domains: Set[str] = field(default_factory=lambda: set(DEFAULT_ALLOWED_DOMAINS))
     # "allow" (default) or "ask": running project code (python app.py, npm test, pytest, make)
     project_exec: str = "allow"
+    # "strict" (default): strict no-shell PASS (non-read-only commands ASK even if Phase-1 threat scan is clean).
+    # "critical_only": internal development mode where Phase-1 threat shield (6 hard boundaries LOCK,
+    # destructive ops, secrets, exfil, untrusted URLs, path escapes, critical system/admin binaries) still
+    # blocks/asks, while clean routine dev commands (npm/pytest/git/node/python/gh/etc.) PASS.
+    pass_policy: str = "strict"
     # Verdict for binaries Aegis does not know: "ask" (default) or "deny"
     unknown_binary: str = "ask"
     # Extra binaries the owner trusts (treated like project tooling, paths still checked)
